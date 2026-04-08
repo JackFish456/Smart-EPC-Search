@@ -6,15 +6,20 @@ __pycache__/
 venv/
 .env
 .env.*
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec
 
 # Local test artifacts
 .tmp_test/
 
-# Rebuilt on first run
+# Rebuilt on first run (local index DB)
 .epc_smart_search/*.db
 .epc_smart_search/*.db-journal
 
-# Contract PDF — place locally (not in repo)
+# Contract PDF — supply your own copy in the project root; not committed
 /Clean Contract.pdf
 
 # OS / IDE
