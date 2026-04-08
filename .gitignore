@@ -14,6 +14,9 @@ venv/
 .epc_smart_search/*.db
 .epc_smart_search/*.db-journal
 
+# Contract PDF — place locally (not in repo)
+/Clean Contract.pdf
+
 # OS / IDE
 Thumbs.db
 .DS_Store
