@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+.env.*
+
+# Local test artifacts
+.tmp_test/
+
+# Rebuilt on first run
+.epc_smart_search/*.db
+.epc_smart_search/*.db-journal
+
+# OS / IDE
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
