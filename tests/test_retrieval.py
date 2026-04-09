@@ -1,5 +1,6 @@
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.ocr_support import PageText
+from epc_smart_search.query_planner import build_like_fallback, plan_query
 from epc_smart_search.retrieval import HashingEmbedder, HybridRetriever
 from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractStore, pack_vector
@@ -177,6 +178,93 @@ def test_direct_text_page_hits_find_exact_phrase() -> None:
     hits = retriever.find_exact_page_hits("show me permits and approvals")
     assert hits
     assert hits[0].page_num == 5
+
+
+def test_contract_say_about_queries_strip_boilerplate_for_focus_terms() -> None:
+    plan = plan_query("What does the contract say about electric motors?")
+
+    assert plan.intent == "direct_text"
+    assert plan.content_query == "electric motors"
+    assert plan.focus_terms == ("electric", "motors")
+    assert build_like_fallback(plan) == "electric motors"
+
+
+def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_qna",
+                "4",
+                "Q: What insulation or trace heating is provided on pipework to ensure water does not freeze",
+                "A generic appendix answer about tracing and water tubing.",
+                99,
+            ),
+            _chunk(
+                "motors",
+                "4.4.3",
+                "Electric Motors",
+                "Electric motors must meet the design requirements for the project.",
+                12,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What does the contract say about electric motors?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "motors"
+
+
+def test_focus_terms_beat_generic_responsibility_language_for_equipment_requests() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "qa_program",
+                "2.2.23",
+                "Quality Assurance Program",
+                "Contractor has sole responsibility for the quality assurance program and shall provide all required documentation.",
+                43,
+            ),
+            _chunk(
+                "lifting",
+                "4.1.3.1",
+                "Lifting Equipment",
+                "The following table summarizes the lifting equipment to be provided by Contractor for the Work.",
+                168,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What lifting equipment is Contractor required to provide?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "lifting"
+
+
+def test_date_like_schedule_noise_is_penalized_for_equipment_queries() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "schedule_line",
+                "0",
+                "30-Jun-28",
+                "GEV - ST #1 Steam Bypass Valves - Delivered to Site",
+                132,
+            ),
+            _chunk(
+                "steam_valves",
+                "11.1",
+                "Steam Turbine Bypass Valves, Dump devices",
+                "Steam turbine bypass valves include one set of HP bypass valve per HRSG.",
+                1952,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What does the contract say about steam bypass valves?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "steam_valves"
 
 
 def _seed_retriever(chunks: list[ChunkRecord]) -> HybridRetriever:

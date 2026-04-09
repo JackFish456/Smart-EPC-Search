@@ -117,6 +117,7 @@ class HybridRetriever:
         if not document_id:
             return []
         plan = plan_query(query)
+        semantic_query = plan.content_query or query
         combined: dict[str, SearchCandidate] = {}
 
         if plan.section_number:
@@ -127,7 +128,7 @@ class HybridRetriever:
         for match_query in build_match_queries(plan):
             for row in self.store.search_chunk_feature_fts(document_id, match_query, limit=24):
                 lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
-                semantic_score = self._semantic_for_row(query, row)
+                semantic_score = self._semantic_for_row(semantic_query, row)
                 candidate = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
                 self._merge_candidate(combined, candidate)
 
@@ -135,12 +136,12 @@ class HybridRetriever:
             fallback_query = build_like_fallback(plan)
             for row in self.store.keyword_like_search(document_id, fallback_query, limit=18):
                 lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
-                semantic_score = self._semantic_for_row(query, row)
+                semantic_score = self._semantic_for_row(semantic_query, row)
                 candidate = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
                 self._merge_candidate(combined, candidate)
 
         if not combined:
-            query_vector = self.embedder.embed(query)
+            query_vector = self.embedder.embed(semantic_query)
             for row, semantic_score in self._semantic_candidates(document_id, query_vector):
                 candidate = self._score_row(plan, row, lexical_score=0.0, semantic_score=semantic_score)
                 self._merge_candidate(combined, candidate)
@@ -354,10 +355,25 @@ class HybridRetriever:
         topic_tags = str(row["topic_tags"] or "")
         clause_type = str(row["clause_type"] or row["chunk_type"])
         combined_text = " ".join([heading, parent_heading, full_text, actor_tags, action_tags, topic_tags])
+        focus_phrases = self._focus_phrases(plan.focus_terms)
 
         score = lexical_score * 0.55 + semantic_score * 0.15 + bonus
         if row["section_number"] and row["section_number"] == plan.section_number:
             score += 1.2
+        if plan.content_query:
+            if has_term_overlap(heading, (plan.content_query,)):
+                score += 0.7
+            elif has_term_overlap(parent_heading, (plan.content_query,)):
+                score += 0.35
+        for phrase in focus_phrases:
+            if has_term_overlap(heading, (phrase,)):
+                score += 0.55
+            elif has_term_overlap(parent_heading, (phrase,)):
+                score += 0.35
+        if has_term_overlap(heading, plan.focus_terms):
+            score += 0.75
+        if has_term_overlap(parent_heading, plan.focus_terms):
+            score += 0.25
         if has_term_overlap(heading, plan.topic_terms + plan.action_terms):
             score += 0.8
         if has_term_overlap(parent_heading, plan.topic_terms):
@@ -370,6 +386,7 @@ class HybridRetriever:
             score += 0.8
         if has_term_overlap(combined_text, plan.expansion_terms):
             score += 0.9
+        score += 0.16 * self._term_hit_count(combined_text, plan.focus_terms)
         score += 0.12 * self._term_hit_count(combined_text, plan.actor_terms + plan.action_terms + plan.topic_terms + plan.expansion_terms)
         if plan.intent == "definition" and clause_type == "definition":
             score += 1.0
@@ -399,7 +416,7 @@ class HybridRetriever:
             score += 0.5
             if "weather" in plan.normalized_query and not has_term_overlap(combined_text, ("weather",)):
                 score -= 0.6
-        score -= self._toc_penalty(row)
+        score -= self._noise_penalty(row)
         return SearchCandidate(
             row=row,
             total_score=score,
@@ -413,11 +430,29 @@ class HybridRetriever:
         return sum(1 for term in terms if term and term.lower() in normalized)
 
     @staticmethod
-    def _toc_penalty(row: dict) -> float:
+    def _noise_penalty(row: dict) -> float:
+        penalty = 0.0
         heading = str(row["heading"])
         full_text = str(row["full_text"])
         if "...." in heading:
-            return 0.45
+            penalty += 0.45
         if full_text.count("....") >= 3 and int(row["page_start"]) <= 20:
-            return 0.45
-        return 0.0
+            penalty += 0.45
+        noise_flags = set(str(row["noise_flags"] or "").split())
+        if "date_heading" in noise_flags:
+            penalty += 0.75
+        if "thin" in noise_flags:
+            penalty += 0.2
+        if str(row["section_number"] or "").strip() == "0":
+            penalty += 0.55
+        return penalty
+
+    @staticmethod
+    def _focus_phrases(focus_terms: tuple[str, ...]) -> tuple[str, ...]:
+        if len(focus_terms) < 2:
+            return ()
+        phrases = [" ".join(focus_terms[index:index + 2]) for index in range(len(focus_terms) - 1)]
+        if len(focus_terms) >= 3:
+            phrases.append(" ".join(focus_terms[:3]))
+        seen: set[str] = set()
+        return tuple(phrase for phrase in phrases if phrase and not (phrase in seen or seen.add(phrase)))
