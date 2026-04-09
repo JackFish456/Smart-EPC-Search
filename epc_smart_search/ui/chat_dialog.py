@@ -95,6 +95,9 @@ class ContractChatDialog(QDialog):
         self._ask_worker: AskWorker | None = None
         self._pending_answer_label: QLabel | None = None
         self._has_announced_index_ready = False
+        self._message_cap = 50
+        self._message_count = 0
+        self._context_low_locked = False
         self._thinking_frame = 0
         self._thinking_timer = QTimer(self)
         self._thinking_timer.setInterval(350)
@@ -136,7 +139,7 @@ class ContractChatDialog(QDialog):
         input_row.addWidget(self._send_button)
         layout.addLayout(input_row)
 
-        self._append_message("assistant", GREETING)
+        self._append_message("assistant", GREETING, count_toward_cap=False)
         QTimer.singleShot(0, self._ensure_index_ready)
 
     def _ensure_index_ready(self) -> None:
@@ -181,11 +184,11 @@ class ContractChatDialog(QDialog):
 
     def _on_send(self) -> None:
         question = self._input.text().strip()
-        if not question or not self._assistant.is_index_ready():
+        if not question or not self._assistant.is_index_ready() or self._context_low_locked:
             return
         self._input.clear()
         self._append_message("user", question)
-        self._pending_answer_label = self._append_message("assistant", "")
+        self._pending_answer_label = self._append_message("assistant", "", count_toward_cap=False)
         self._start_thinking_indicator()
         self._set_input_enabled(False)
         self._ask_worker = AskWorker(self._assistant, question)
@@ -195,13 +198,15 @@ class ContractChatDialog(QDialog):
 
     def _on_answer_ready(self, answer: AssistantAnswer) -> None:
         self._replace_pending_answer(answer.text)
-        self._set_input_enabled(True)
+        if not self._context_low_locked:
+            self._set_input_enabled(True)
 
     def _on_answer_failed(self, error: str) -> None:
         self._replace_pending_answer(f"I hit an error while answering that question.\n\n{error}")
-        self._set_input_enabled(True)
+        if not self._context_low_locked:
+            self._set_input_enabled(True)
 
-    def _append_message(self, role: str, content: str) -> QLabel:
+    def _append_message(self, role: str, content: str, *, count_toward_cap: bool = True) -> QLabel:
         label = QLabel()
         label.setWordWrap(True)
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -216,6 +221,8 @@ class ContractChatDialog(QDialog):
         )
         self._set_message_content(label, role, content)
         self._content_layout.addWidget(label)
+        if count_toward_cap:
+            self._message_count += 1
         QTimer.singleShot(0, self._scroll_to_bottom)
         return label
 
@@ -224,9 +231,12 @@ class ContractChatDialog(QDialog):
             self._stop_thinking_indicator()
             self._set_message_content(self._pending_answer_label, "assistant", content)
             self._pending_answer_label = None
+            self._message_count += 1
+            self._enforce_message_cap()
             QTimer.singleShot(0, self._scroll_to_bottom)
             return
         self._append_message("assistant", content)
+        self._enforce_message_cap()
 
     def _scroll_to_bottom(self) -> None:
         bar = self._scroll.verticalScrollBar()
@@ -269,6 +279,13 @@ class ContractChatDialog(QDialog):
         self._pending_answer_label.setTextFormat(Qt.TextFormat.RichText)
         self._pending_answer_label.setText(f"<span>Thinking</span>&nbsp;{' '.join(dots)}")
         self._thinking_frame += 1
+
+    def _enforce_message_cap(self) -> None:
+        if self._context_low_locked or self._message_count < self._message_cap:
+            return
+        self._context_low_locked = True
+        self._append_message("assistant", "Context Low Please Open Another Chat Window", count_toward_cap=False)
+        self._set_input_enabled(False)
 
     def _set_message_content(self, label: QLabel, role: str, content: str) -> None:
         if role == "assistant":
