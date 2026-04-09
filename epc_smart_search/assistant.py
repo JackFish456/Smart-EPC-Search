@@ -276,17 +276,18 @@ class ContractAssistant:
     @staticmethod
     def _prefers_generated_answer(question: str) -> bool:
         normalized = " ".join(question.lower().split())
-        prompts = (
-            "summarize",
-            "summarise",
-            "explain",
-            "plain english",
-            "plain language",
-            "overview",
-            "compare",
-            "difference between",
+        explicit_prefixes = (
+            "summarize ",
+            "summarise ",
+            "explain ",
         )
-        return any(prompt in normalized for prompt in prompts)
+        explicit_phrases = (
+            " summarize ",
+            " summarise ",
+            " explain ",
+        )
+        wrapped = f" {normalized} "
+        return normalized.startswith(explicit_prefixes) or any(phrase in wrapped for phrase in explicit_phrases)
 
     @staticmethod
     def _format_page_range(page_start: int, page_end: int) -> str:

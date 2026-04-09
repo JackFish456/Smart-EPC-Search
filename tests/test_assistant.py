@@ -83,6 +83,9 @@ def test_build_extractive_answer_keeps_numeric_requirement_language() -> None:
 def test_prefers_generated_answer_only_for_summary_style_prompts() -> None:
     assert not ContractAssistant._prefers_generated_answer("What does the contract say about fuel gas supply?")
     assert ContractAssistant._prefers_generated_answer("Summarize the fuel gas supply requirements in plain English.")
+    assert ContractAssistant._prefers_generated_answer("Can you explain the fuel gas system?")
+    assert not ContractAssistant._prefers_generated_answer("Give me an overview of the fuel gas system.")
+    assert not ContractAssistant._prefers_generated_answer("Put the fuel gas system in plain English.")
 
 
 def test_build_extractive_answer_skips_thin_toc_style_blocks() -> None:

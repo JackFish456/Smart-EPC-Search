@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import html
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
@@ -21,7 +22,15 @@ from epc_smart_search.config import GREETING
 def _dialog_style() -> str:
     return """
     QDialog { background-color: #fff4cc; }
-    QScrollArea { background-color: #fff4cc; border: 1px solid #000; border-radius: 6px; }
+    QScrollArea#chatScroll {
+        background-color: #fff4cc;
+        border: 1px solid #000;
+        border-radius: 6px;
+    }
+    QWidget#chatContent {
+        background-color: #fff;
+        border-radius: 4px;
+    }
     QLineEdit {
         background-color: #fff;
         color: #000;
@@ -96,21 +105,29 @@ class ContractChatDialog(QDialog):
         self.setStyleSheet(_dialog_style())
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
         self._status = QLabel("Checking contract index...")
         layout.addWidget(self._status)
         self._status.hide()
 
         self._scroll = QScrollArea()
+        self._scroll.setObjectName("chatScroll")
         self._scroll.setWidgetResizable(True)
         self._content = QWidget()
+        self._content.setObjectName("chatContent")
+        self._scroll.viewport().setStyleSheet("background-color: #fff;")
         self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(16, 12, 16, 12)
+        self._content_layout.setSpacing(6)
         self._content_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self._scroll.setWidget(self._content)
         layout.addWidget(self._scroll)
 
         input_row = QHBoxLayout()
+        input_row.setSpacing(8)
         self._input = QLineEdit()
-        self._input.setPlaceholderText("Ask about project scope, obligations, definitions, clauses...")
+        self._input.setPlaceholderText("Ask Kiewey about the EPC contract...")
         self._input.returnPressed.connect(self._on_send)
         input_row.addWidget(self._input)
 
@@ -177,12 +194,7 @@ class ContractChatDialog(QDialog):
         self._ask_worker.start()
 
     def _on_answer_ready(self, answer: AssistantAnswer) -> None:
-        message = answer.text
-        if answer.citations:
-            pages = self._format_citation_pages(answer.citations)
-            if pages:
-                message = f"{message}\n\nSources:\n{pages}"
-        self._replace_pending_answer(message)
+        self._replace_pending_answer(answer.text)
         self._set_input_enabled(True)
 
     def _on_answer_failed(self, error: str) -> None:
@@ -190,7 +202,7 @@ class ContractChatDialog(QDialog):
         self._set_input_enabled(True)
 
     def _append_message(self, role: str, content: str) -> QLabel:
-        label = QLabel(content)
+        label = QLabel()
         label.setWordWrap(True)
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         base_style = (
@@ -202,6 +214,7 @@ class ContractChatDialog(QDialog):
             base_style
             + " color: #000; border: 1px solid #000; border-radius: 6px; padding: 8px; margin-top: 4px; margin-bottom: 4px;"
         )
+        self._set_message_content(label, role, content)
         self._content_layout.addWidget(label)
         QTimer.singleShot(0, self._scroll_to_bottom)
         return label
@@ -209,8 +222,7 @@ class ContractChatDialog(QDialog):
     def _replace_pending_answer(self, content: str) -> None:
         if self._pending_answer_label is not None:
             self._stop_thinking_indicator()
-            self._pending_answer_label.setTextFormat(Qt.TextFormat.PlainText)
-            self._pending_answer_label.setText(content)
+            self._set_message_content(self._pending_answer_label, "assistant", content)
             self._pending_answer_label = None
             QTimer.singleShot(0, self._scroll_to_bottom)
             return
@@ -235,7 +247,6 @@ class ContractChatDialog(QDialog):
     def _announce_index_ready(self) -> None:
         if self._has_announced_index_ready:
             return
-        self._append_message("assistant", "Contract index ready.")
         self._has_announced_index_ready = True
 
     def _start_thinking_indicator(self) -> None:
@@ -250,7 +261,7 @@ class ContractChatDialog(QDialog):
         if self._pending_answer_label is None:
             self._stop_thinking_indicator()
             return
-        dot_count = (self._thinking_frame % 3) + 1
+        dot_count = self._thinking_frame % 4
         dots = []
         for index in range(3):
             dot = "." if index < dot_count else "&nbsp;"
@@ -259,16 +270,88 @@ class ContractChatDialog(QDialog):
         self._pending_answer_label.setText(f"<span>Thinking</span>&nbsp;{' '.join(dots)}")
         self._thinking_frame += 1
 
+    def _set_message_content(self, label: QLabel, role: str, content: str) -> None:
+        if role == "assistant":
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setText(self._format_assistant_message(content))
+            return
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setText(content)
+
+    @classmethod
+    def _format_assistant_message(cls, content: str) -> str:
+        stripped = content.strip()
+        if not stripped:
+            return ""
+        paragraphs = [paragraph.strip() for paragraph in stripped.split("\n\n") if paragraph.strip()]
+        blocks: list[str] = []
+        for paragraph in paragraphs:
+            if paragraph.startswith("Section "):
+                blocks.append(cls._format_section_block(paragraph))
+            elif paragraph.startswith("Page "):
+                blocks.append(cls._format_page_block(paragraph))
+            elif paragraph.endswith(":"):
+                blocks.append(
+                    f"<div style='font-size:13px; font-weight:700; margin:2px 0 10px 0;'>{html.escape(paragraph)}</div>"
+                )
+            else:
+                escaped = html.escape(paragraph).replace("\n", "<br>")
+                blocks.append(f"<div style='font-size:13px; line-height:1.45; margin:2px 0 10px 0;'>{escaped}</div>")
+        return "".join(blocks)
+
+    @classmethod
+    def _format_section_block(cls, paragraph: str) -> str:
+        lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+        heading = html.escape(lines[0]) if lines else ""
+        page_line = ""
+        body = ""
+        for line in lines[1:]:
+            if line.startswith("Pages:"):
+                page_line = html.escape(line)
+            elif line.startswith("Contract text:"):
+                body = cls._format_contract_text(line.removeprefix("Contract text:").strip())
+            else:
+                addition = html.escape(line)
+                body = f"{body}<br>{addition}" if body else addition
+        page_html = (
+            f"<div style='font-size:11px; color:#6b5d00; font-style:italic; margin:1px 0 6px 0;'>{page_line}</div>"
+            if page_line
+            else ""
+        )
+        body_html = (
+            "<div style='font-size:13px; line-height:1.5;'>"
+            "<span style='font-weight:700;'>Contract text:</span> "
+            f"{body}</div>"
+            if body
+            else ""
+        )
+        return (
+            "<div style='margin:4px 0 14px 0; padding-left:10px; border-left:3px solid #ffcd23;'>"
+            f"<div style='font-size:14px; font-weight:700; margin:0 0 2px 0;'>{heading}</div>"
+            f"{page_html}"
+            f"{body_html}"
+            "</div>"
+        )
+
+    @classmethod
+    def _format_page_block(cls, paragraph: str) -> str:
+        lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+        header = html.escape(lines[0]) if lines else ""
+        remainder = " ".join(lines[1:]).strip()
+        if not remainder and lines:
+            page_label, _, excerpt = lines[0].partition(":")
+            header = html.escape(page_label + ":")
+            remainder = excerpt.strip()
+        excerpt_html = cls._format_contract_text(remainder)
+        return (
+            "<div style='margin:4px 0 14px 0; padding-left:10px; border-left:3px solid #ffcd23;'>"
+            f"<div style='font-size:12px; color:#6b5d00; font-style:italic; margin:0 0 6px 0;'>{header}</div>"
+            "<div style='font-size:13px; line-height:1.5;'>"
+            f"{excerpt_html}</div>"
+            "</div>"
+        )
+
     @staticmethod
-    def _format_citation_pages(citations) -> str:
-        page_numbers: list[int] = []
-        seen: set[int] = set()
-        for citation in citations:
-            for page in range(citation.page_start, citation.page_end + 1):
-                if page in seen:
-                    continue
-                seen.add(page)
-                page_numbers.append(page)
-                if len(page_numbers) >= 3:
-                    return "\n".join(f"- page {page}" for page in page_numbers)
-        return "\n".join(f"- page {page}" for page in page_numbers)
+    def _format_contract_text(text: str) -> str:
+        escaped = html.escape(text).replace("\n", "<br>")
+        return f"<span>{escaped}</span>"
