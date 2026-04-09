@@ -118,17 +118,18 @@ class ContractAssistant:
         citations = self.retriever.expand_with_context(ranked)
         if not citations:
             return AssistantAnswer("I can't verify that from the contract.", [], True)
+        citations = self._limit_citations(citations)
         best = ranked[0]
         if best.total_score < 0.16 and best.lexical_score < 0.05:
-            return AssistantAnswer("I can't verify that from the contract.", citations[:3], True)
-        prompt_context = self.retriever.build_evidence_pack(question, ranked, citations[:4])
+            return AssistantAnswer("I can't verify that from the contract.", citations, True)
+        prompt_context = self.retriever.build_evidence_pack(question, ranked, citations)
         try:
             answer_text = self.gemma.ask(question, prompt_context)
         except Exception:
             answer_text = "I can't verify that from the contract."
         answer_text = answer_text.strip() or "I can't verify that from the contract."
         refused = answer_text == "I can't verify that from the contract."
-        return AssistantAnswer(answer_text, citations[:4], refused)
+        return AssistantAnswer(answer_text, citations, refused)
 
     def _build_exact_answer(self, question: str, hits: list[ExactPageHit]) -> AssistantAnswer | None:
         if not hits:
@@ -205,6 +206,20 @@ class ContractAssistant:
         if self.store.get_feature_count(document_id) > 0 and self.store.get_metadata("search_schema_version") == str(SEARCH_SCHEMA_VERSION):
             return
         refresh_query_index(self.store, document_id, progress_callback=progress_callback)
+
+    @staticmethod
+    def _limit_citations(citations: list[Citation], limit: int = 2) -> list[Citation]:
+        limited: list[Citation] = []
+        seen_pages: set[int] = set()
+        for citation in citations:
+            pages = range(citation.page_start, citation.page_end + 1)
+            if all(page in seen_pages for page in pages):
+                continue
+            limited.append(citation)
+            seen_pages.update(pages)
+            if len(limited) >= limit:
+                break
+        return limited
 
     @staticmethod
     def _sha256(path: Path) -> str:

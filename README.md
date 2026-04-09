@@ -10,6 +10,25 @@ Windows-first local EPC contract assistant built around:
 
 The contract PDF is **not** stored in this repository (it is listed in `.gitignore`). After you clone or copy the project, place your own `Clean Contract.pdf` in the **project root** (same folder as `launch_epc_smart_search.ps1`) before the first index build.
 
+## Gemma Runtime
+
+The app now prefers a derived **text-only** Gemma checkpoint when one is available. This is useful because EPC Smart Search sends text prompts only, so a text-only checkpoint avoids carrying the image/audio towers in memory.
+
+- Default multimodal checkpoint: `~/.cache/kagglehub/models/google/gemma-4/transformers/gemma-4-e2b-it/1`
+- Default derived text-only checkpoint: `~/.cache/kagglehub/models/google/gemma-4/transformers/gemma-4-e2b-it-text-only/1`
+
+To export the text-only checkpoint locally from the existing Gemma weights, run this from the CUDA-enabled `Gemma Test` environment:
+
+```powershell
+& "..\Gemma Test\.venv\Scripts\python.exe" .\export_gemma_text_only.py
+```
+
+Optional environment variables:
+
+- `GEMMA_TEXT_ONLY_MODEL_PATH` to point at a specific text-only checkpoint
+- `GEMMA_MODEL_PATH` to point at a specific multimodal checkpoint
+- `GEMMA_PREFER_TEXT_ONLY=0` to force the runtime back to the multimodal checkpoint
+
 ## Run
 
 1. Make sure the desktop-level `Gemma Test` project still has its `.venv` and model files.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -8,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-DEFAULT_MODEL_PATH = (
+DEFAULT_MULTIMODAL_MODEL_PATH = (
     Path.home()
     / ".cache"
     / "kagglehub"
@@ -19,6 +20,12 @@ DEFAULT_MODEL_PATH = (
     / "gemma-4-e2b-it"
     / "1"
 )
+DEFAULT_TEXT_ONLY_MODEL_PATH = (
+    DEFAULT_MULTIMODAL_MODEL_PATH.parent.parent
+    / f"{DEFAULT_MULTIMODAL_MODEL_PATH.parent.name}-text-only"
+    / DEFAULT_MULTIMODAL_MODEL_PATH.name
+)
+DEFAULT_MODEL_PATH = DEFAULT_MULTIMODAL_MODEL_PATH
 DEFAULT_SYSTEM_PROMPT = "You are a helpful local assistant."
 DEFAULT_MAX_NEW_TOKENS = 256
 DEFAULT_TEMPERATURE = 0.65
@@ -30,6 +37,7 @@ DEFAULT_REASONING_PRESET = "normal"
 DEFAULT_TEMPERATURE_PRESET = "balanced"
 DEFAULT_PERSONALITY_PRESET = "default"
 DEFAULT_CONFIDENCE_PRESET = "medium"
+DEFAULT_PREFER_TEXT_ONLY = True
 CONFIDENCE_RESPONSE_HEADER_MARKER = "[[END_HEADER]]"
 CONFIDENCE_REFUSAL_MESSAGE = (
     "I can't answer that within the selected confidence setting. "
@@ -83,6 +91,7 @@ class GenerationError(GemmaRuntimeError):
 @dataclass(slots=True)
 class RuntimeInfo:
     model_path: Path
+    model_mode: str
     device_label: str
     dtype_label: str
     warnings: list[str] = field(default_factory=list)
@@ -115,6 +124,12 @@ class ParsedConfidenceResponse:
     confidence: int
     decision: str
     body: str
+
+
+@dataclass(slots=True, frozen=True)
+class ResolvedModelSpec:
+    model_path: Path
+    model_mode: str
 
 
 CONFIDENCE_RESPONSE_PATTERN = re.compile(
@@ -225,28 +240,85 @@ def is_confidence_response_allowed(
     )
 
 
-def resolve_model_path(model_path: str | os.PathLike[str] | None = None) -> Path:
-    candidate = Path(
-        model_path
-        or os.environ.get("GEMMA_QUANTIZED_MODEL_PATH")
-        or os.environ.get("GEMMA_MODEL_PATH")
-        or DEFAULT_MODEL_PATH
-    ).expanduser()
+def derive_text_only_model_path(model_path: str | os.PathLike[str]) -> Path:
+    candidate = Path(model_path).expanduser()
+    return candidate.parent.parent / f"{candidate.parent.name}-text-only" / candidate.name
 
+
+def infer_model_mode_from_config(config_payload: dict[str, Any]) -> str:
+    architectures = [str(item).lower() for item in config_payload.get("architectures", [])]
+    if any("causallm" in architecture for architecture in architectures):
+        return "text_only"
+    if "vision_config" not in config_payload and "audio_config" not in config_payload:
+        return "text_only"
+    return "multimodal"
+
+
+def resolve_model_spec(
+    model_path: str | os.PathLike[str] | None = None,
+    *,
+    prefer_text_only: bool | None = None,
+) -> ResolvedModelSpec:
+    if model_path is not None:
+        return _resolve_model_candidate(Path(model_path).expanduser())
+
+    explicit_text_only = os.environ.get("GEMMA_TEXT_ONLY_MODEL_PATH", "").strip()
+    if explicit_text_only:
+        return _resolve_model_candidate(Path(explicit_text_only).expanduser())
+
+    prefer_text = _resolve_prefer_text_only(prefer_text_only)
+    explicit_base = os.environ.get("GEMMA_QUANTIZED_MODEL_PATH") or os.environ.get("GEMMA_MODEL_PATH")
+    if explicit_base:
+        base_candidate = Path(explicit_base).expanduser()
+        if prefer_text:
+            derived_candidate = derive_text_only_model_path(base_candidate)
+            if derived_candidate.exists():
+                return _resolve_model_candidate(derived_candidate)
+        return _resolve_model_candidate(base_candidate)
+
+    if prefer_text and DEFAULT_TEXT_ONLY_MODEL_PATH.exists():
+        return _resolve_model_candidate(DEFAULT_TEXT_ONLY_MODEL_PATH)
+    return _resolve_model_candidate(DEFAULT_MULTIMODAL_MODEL_PATH)
+
+
+def resolve_model_path(model_path: str | os.PathLike[str] | None = None) -> Path:
+    return resolve_model_spec(model_path).model_path
+
+
+def _resolve_prefer_text_only(prefer_text_only: bool | None) -> bool:
+    if prefer_text_only is not None:
+        return prefer_text_only
+    raw = os.environ.get("GEMMA_PREFER_TEXT_ONLY", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    return DEFAULT_PREFER_TEXT_ONLY
+
+
+def _resolve_model_candidate(candidate: Path) -> ResolvedModelSpec:
     if not candidate.exists():
         raise ModelLoadError(
             f"Model path does not exist: {candidate}\n"
-            "Set GEMMA_MODEL_PATH to your Gemma 4 folder or rerun download_model.py."
+            "Set GEMMA_MODEL_PATH or GEMMA_TEXT_ONLY_MODEL_PATH to your Gemma folder."
         )
 
     config_path = candidate / "config.json"
     if not config_path.exists():
         raise ModelLoadError(
             f"Model path is missing config.json: {candidate}\n"
-            "Point GEMMA_MODEL_PATH at the final checkpoint folder."
+            "Point the Gemma model path at the final checkpoint folder."
         )
 
-    return candidate.resolve()
+    try:
+        config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ModelLoadError(f"Could not parse Gemma config.json at {candidate}.\n{exc}") from exc
+
+    return ResolvedModelSpec(
+        model_path=candidate.resolve(),
+        model_mode=infer_model_mode_from_config(config_payload),
+    )
 
 
 def build_messages(
@@ -254,72 +326,92 @@ def build_messages(
     user_text: str,
     image_path: str | os.PathLike[str] | None = None,
     system_prompt: str | None = None,
+    *,
+    supports_images: bool = True,
 ) -> list[dict[str, Any]]:
     cleaned_user_text = user_text.strip()
     if not cleaned_user_text and not image_path:
         raise ValueError("A prompt or image is required.")
+    if image_path and not supports_images:
+        raise ValueError("This Gemma checkpoint is text-only and does not support image input.")
 
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "system",
-            "content": [
-                {
-                    "type": "text",
-                    "text": (system_prompt or DEFAULT_SYSTEM_PROMPT).strip(),
-                }
-            ],
-        }
-    ]
+    if supports_images:
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (system_prompt or DEFAULT_SYSTEM_PROMPT).strip(),
+                    }
+                ],
+            }
+        ]
+    else:
+        messages = [{"role": "system", "content": (system_prompt or DEFAULT_SYSTEM_PROMPT).strip()}]
 
     for turn in history or []:
         role = turn.get("role", "").strip()
         content = str(turn.get("content", "")).strip()
         if role not in {"user", "assistant"} or not content:
             continue
-        messages.append(
-            {
-                "role": role,
-                "content": [{"type": "text", "text": content}],
-            }
-        )
+        if supports_images:
+            messages.append(
+                {
+                    "role": role,
+                    "content": [{"type": "text", "text": content}],
+                }
+            )
+        else:
+            messages.append({"role": role, "content": content})
 
-    user_content: list[dict[str, str]] = []
-    if image_path:
-        user_content.append({"type": "image", "path": str(Path(image_path).expanduser())})
-    if cleaned_user_text:
-        user_content.append({"type": "text", "text": cleaned_user_text})
-
-    messages.append({"role": "user", "content": user_content})
+    if supports_images:
+        user_content: list[dict[str, str]] = []
+        if image_path:
+            user_content.append({"type": "image", "path": str(Path(image_path).expanduser())})
+        if cleaned_user_text:
+            user_content.append({"type": "text", "text": cleaned_user_text})
+        messages.append({"role": "user", "content": user_content})
+    else:
+        messages.append({"role": "user", "content": cleaned_user_text})
     return messages
 
 
 def build_history_messages(
     history: Sequence[dict[str, str]] | None,
     system_prompt: str | None = None,
+    *,
+    supports_images: bool = True,
 ) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "system",
-            "content": [
-                {
-                    "type": "text",
-                    "text": (system_prompt or DEFAULT_SYSTEM_PROMPT).strip(),
-                }
-            ],
-        }
-    ]
+    if supports_images:
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (system_prompt or DEFAULT_SYSTEM_PROMPT).strip(),
+                    }
+                ],
+            }
+        ]
+    else:
+        messages = [{"role": "system", "content": (system_prompt or DEFAULT_SYSTEM_PROMPT).strip()}]
 
     for turn in history or []:
         role = turn.get("role", "").strip()
         content = str(turn.get("content", "")).strip()
         if role not in {"user", "assistant"} or not content:
             continue
-        messages.append(
-            {
-                "role": role,
-                "content": [{"type": "text", "text": content}],
-            }
-        )
+        if supports_images:
+            messages.append(
+                {
+                    "role": role,
+                    "content": [{"type": "text", "text": content}],
+                }
+            )
+        else:
+            messages.append({"role": role, "content": content})
 
     return messages
 
@@ -349,22 +441,27 @@ def clean_response_text(text: str) -> str:
     return cleaned.strip()
 
 
-def decode_generated_response(processor: Any, output_ids: Any, input_length: int) -> str:
+def decode_generated_response(decoder: Any, output_ids: Any, input_length: int) -> str:
     generated_ids = extract_generated_token_ids(output_ids, input_length)
-    text = processor.decode(generated_ids, skip_special_tokens=False)
+    text = decoder.decode(generated_ids, skip_special_tokens=False)
     return clean_response_text(text)
 
 
-def _import_runtime_dependencies() -> tuple[Any, Any, Any]:
+def _import_runtime_dependencies() -> tuple[Any, Any, Any, Any, Any]:
     try:
         import torch
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+        from transformers import (
+            AutoModelForImageTextToText,
+            AutoProcessor,
+            AutoTokenizer,
+            Gemma4ForCausalLM,
+        )
     except ImportError as exc:
         raise DependencyError(
             "Missing Gemma runtime dependencies. Run .\\setup_venv.ps1 and start the app from .venv."
         ) from exc
 
-    return torch, AutoProcessor, AutoModelForImageTextToText
+    return torch, AutoProcessor, AutoModelForImageTextToText, AutoTokenizer, Gemma4ForCausalLM
 
 
 def _yield_text_chunks(text: str, chunk_size: int = 48) -> Iterator[str]:
@@ -442,8 +539,11 @@ class GemmaChatRuntime:
         top_p: float = DEFAULT_TOP_P,
         top_k: int = DEFAULT_TOP_K,
         enable_thinking: bool = DEFAULT_ENABLE_THINKING,
+        prefer_text_only: bool | None = None,
     ) -> None:
-        self.model_path = resolve_model_path(model_path)
+        self.model_spec = resolve_model_spec(model_path, prefer_text_only=prefer_text_only)
+        self.model_path = self.model_spec.model_path
+        self.model_mode = self.model_spec.model_mode
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
@@ -452,6 +552,7 @@ class GemmaChatRuntime:
 
         self.model: Any | None = None
         self.processor: Any | None = None
+        self.tokenizer: Any | None = None
         self.runtime_info: RuntimeInfo | None = None
         self._torch: Any | None = None
 
@@ -460,27 +561,39 @@ class GemmaChatRuntime:
         return list(self.runtime_info.warnings if self.runtime_info else [])
 
     def load(self) -> RuntimeInfo:
-        if self.model is not None and self.processor is not None and self.runtime_info is not None:
+        if self.model is not None and self.runtime_info is not None and (self.processor is not None or self.tokenizer is not None):
             return self.runtime_info
 
-        torch, auto_processor_cls, auto_model_cls = _import_runtime_dependencies()
+        torch, auto_processor_cls, auto_model_cls, auto_tokenizer_cls, causal_model_cls = _import_runtime_dependencies()
         dtype, quantization_config, dtype_label, warnings = _resolve_model_load_options(torch)
 
         try:
-            processor = auto_processor_cls.from_pretrained(
-                str(self.model_path),
-                padding_side="left",
-            )
             load_kwargs: dict[str, Any] = {"device_map": "auto"}
             if quantization_config is not None:
                 load_kwargs["quantization_config"] = quantization_config
                 load_kwargs["device_map"] = {"": 0}
             else:
                 load_kwargs["dtype"] = dtype
-            model = auto_model_cls.from_pretrained(
-                str(self.model_path),
-                **load_kwargs,
-            )
+            if self.model_mode == "text_only":
+                tokenizer = auto_tokenizer_cls.from_pretrained(
+                    str(self.model_path),
+                    padding_side="left",
+                )
+                processor = None
+                model = causal_model_cls.from_pretrained(
+                    str(self.model_path),
+                    **load_kwargs,
+                )
+            else:
+                processor = auto_processor_cls.from_pretrained(
+                    str(self.model_path),
+                    padding_side="left",
+                )
+                tokenizer = getattr(processor, "tokenizer", None)
+                model = auto_model_cls.from_pretrained(
+                    str(self.model_path),
+                    **load_kwargs,
+                )
             if hasattr(model, "eval"):
                 model.eval()
         except Exception as exc:
@@ -489,9 +602,11 @@ class GemmaChatRuntime:
         device_label = self._describe_device(model, torch)
         self.model = model
         self.processor = processor
+        self.tokenizer = tokenizer
         self._torch = torch
         self.runtime_info = RuntimeInfo(
             model_path=self.model_path,
+            model_mode=self.model_mode,
             device_label=device_label,
             dtype_label=dtype_label,
             warnings=warnings,
@@ -513,24 +628,27 @@ class GemmaChatRuntime:
     ) -> ChatResult:
         runtime_info = self.load()
         assert self.model is not None
-        assert self.processor is not None
+        assert self.tokenizer is not None or self.processor is not None
         assert self._torch is not None
 
         if image_path:
             image_candidate = Path(image_path).expanduser()
             if not image_candidate.exists():
                 raise GenerationError(f"Image not found: {image_candidate}")
+            if self.model_mode != "multimodal":
+                raise GenerationError("This Gemma checkpoint is text-only and cannot accept image input.")
 
         messages = build_messages(
             history=history,
             user_text=user_text,
             image_path=image_path,
             system_prompt=system_prompt,
+            supports_images=self.model_mode == "multimodal",
         )
 
         try:
             with self._inference_context():
-                inputs = self.processor.apply_chat_template(
+                inputs = self._chat_template_target().apply_chat_template(
                     messages,
                     tokenize=True,
                     return_dict=True,
@@ -556,7 +674,7 @@ class GemmaChatRuntime:
             raise GenerationError(self._format_generation_error(exc)) from exc
 
         response_text = decode_generated_response(
-            self.processor,
+            self._chat_template_target(),
             outputs,
             input_length,
         )
@@ -580,13 +698,15 @@ class GemmaChatRuntime:
     ) -> Iterator[str]:
         self.load()
         assert self.model is not None
-        assert self.processor is not None
+        assert self.tokenizer is not None or self.processor is not None
         assert self._torch is not None
 
         if image_path:
             image_candidate = Path(image_path).expanduser()
             if not image_candidate.exists():
                 raise GenerationError(f"Image not found: {image_candidate}")
+            if self.model_mode != "multimodal":
+                raise GenerationError("This Gemma checkpoint is text-only and cannot accept image input.")
 
         try:
             from transformers import TextIteratorStreamer
@@ -610,10 +730,11 @@ class GemmaChatRuntime:
             user_text=user_text,
             image_path=image_path,
             system_prompt=system_prompt,
+            supports_images=self.model_mode == "multimodal",
         )
 
         try:
-            inputs = self.processor.apply_chat_template(
+            inputs = self._chat_template_target().apply_chat_template(
                 messages,
                 tokenize=True,
                 return_dict=True,
@@ -625,7 +746,7 @@ class GemmaChatRuntime:
             )
             inputs = inputs.to(self._input_device())
             streamer = TextIteratorStreamer(
-                self.processor.tokenizer,
+                self.tokenizer,
                 skip_prompt=True,
                 skip_special_tokens=False,
             )
@@ -716,13 +837,9 @@ class GemmaChatRuntime:
 
     def estimate_text_tokens(self, text: str) -> int:
         self.load()
-        assert self.processor is not None
+        assert self.tokenizer is not None
 
-        tokenizer = getattr(self.processor, "tokenizer", None)
-        if tokenizer is None:
-            raise GenerationError("Tokenizer is unavailable for token estimation.")
-
-        encoded = tokenizer(
+        encoded = self.tokenizer(
             text,
             add_special_tokens=False,
             return_attention_mask=False,
@@ -740,18 +857,27 @@ class GemmaChatRuntime:
         add_generation_prompt: bool = False,
     ) -> int:
         self.load()
-        assert self.processor is not None
+        assert self.tokenizer is not None or self.processor is not None
 
-        messages = build_history_messages(history, system_prompt=system_prompt)
+        messages = build_history_messages(
+            history,
+            system_prompt=system_prompt,
+            supports_images=self.model_mode == "multimodal",
+        )
         if pending_user_text.strip() or pending_image:
+            if pending_image and self.model_mode != "multimodal":
+                raise GenerationError("This Gemma checkpoint is text-only and cannot accept image input.")
             pending_content: list[dict[str, str]] = []
-            if pending_user_text.strip():
+            if pending_user_text.strip() and self.model_mode == "multimodal":
                 pending_content.append({"type": "text", "text": pending_user_text.strip()})
+            elif pending_user_text.strip():
+                messages.append({"role": "user", "content": pending_user_text.strip()})
             elif pending_image:
                 pending_content.append({"type": "text", "text": "[Pending image]"})
-            messages.append({"role": "user", "content": pending_content})
+            if pending_content:
+                messages.append({"role": "user", "content": pending_content})
 
-        tokens = self.processor.apply_chat_template(
+        tokens = self._chat_template_target().apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=add_generation_prompt,
@@ -777,6 +903,8 @@ class GemmaChatRuntime:
     @property
     def image_token_estimate(self) -> int:
         self.load()
+        if self.model_mode != "multimodal":
+            return 0
         assert self.processor is not None
 
         image_processor = getattr(self.processor, "image_processor", None)
@@ -817,6 +945,12 @@ class GemmaChatRuntime:
             return device
 
         return "unknown"
+
+    def _chat_template_target(self) -> Any:
+        target = self.processor if self.processor is not None else self.tokenizer
+        if target is None:
+            raise GenerationError("Gemma tokenizer/processor is unavailable.")
+        return target
 
     def _format_model_load_error(self, exc: Exception) -> str:
         message = str(exc).strip() or exc.__class__.__name__

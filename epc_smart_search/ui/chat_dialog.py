@@ -85,6 +85,11 @@ class ContractChatDialog(QDialog):
         self._index_worker: IndexWorker | None = None
         self._ask_worker: AskWorker | None = None
         self._pending_answer_label: QLabel | None = None
+        self._has_announced_index_ready = False
+        self._thinking_frame = 0
+        self._thinking_timer = QTimer(self)
+        self._thinking_timer.setInterval(350)
+        self._thinking_timer.timeout.connect(self._advance_thinking_indicator)
 
         self.setWindowTitle("Kiewey - EPC Contract Assistant")
         self.setMinimumSize(760, 600)
@@ -93,6 +98,7 @@ class ContractChatDialog(QDialog):
         layout = QVBoxLayout(self)
         self._status = QLabel("Checking contract index...")
         layout.addWidget(self._status)
+        self._status.hide()
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -118,7 +124,8 @@ class ContractChatDialog(QDialog):
 
     def _ensure_index_ready(self) -> None:
         if self._assistant.is_index_ready():
-            self._status.setText("Contract index ready.")
+            self._clear_status()
+            self._announce_index_ready()
             self._set_input_enabled(True)
             return
         self._append_message("assistant", "I’m getting the contract ready for search. This may take a little while on the first run.")
@@ -132,24 +139,26 @@ class ContractChatDialog(QDialog):
         if self._index_worker is not None and self._index_worker.isRunning():
             return
         self._set_input_enabled(False)
+        self._set_status_message("Building contract index...")
         self._index_worker = IndexWorker(self._assistant)
-        self._index_worker.progress.connect(self._status.setText)
+        self._index_worker.progress.connect(self._set_status_message)
         self._index_worker.finished.connect(self._on_index_finished)
         self._index_worker.failed.connect(self._on_index_failed)
         self._index_worker.start()
 
     def _on_index_finished(self, result: dict) -> None:
-        self._status.setText(
-            f"Contract index ready. Pages: {result.get('page_count', '?')} | Chunks: {result.get('chunk_count', '?')}"
-        )
-        self._append_message(
-            "assistant",
-            f"Contract index ready. I loaded {result.get('chunk_count', '?')} searchable chunks.",
-        )
+        self._clear_status()
+        if self._has_announced_index_ready:
+            self._append_message(
+                "assistant",
+                f"Index rebuild finished. I loaded {result.get('chunk_count', '?')} searchable chunks.",
+            )
+        else:
+            self._announce_index_ready()
         self._set_input_enabled(True)
 
     def _on_index_failed(self, error: str) -> None:
-        self._status.setText("Index build failed.")
+        self._set_status_message("Index build failed.")
         self._append_message("assistant", f"I couldn't finish building the contract index.\n\n{error}")
         self._set_input_enabled(True)
 
@@ -159,7 +168,8 @@ class ContractChatDialog(QDialog):
             return
         self._input.clear()
         self._append_message("user", question)
-        self._pending_answer_label = self._append_message("assistant", "...")
+        self._pending_answer_label = self._append_message("assistant", "")
+        self._start_thinking_indicator()
         self._set_input_enabled(False)
         self._ask_worker = AskWorker(self._assistant, question)
         self._ask_worker.finished.connect(self._on_answer_ready)
@@ -169,8 +179,9 @@ class ContractChatDialog(QDialog):
     def _on_answer_ready(self, answer: AssistantAnswer) -> None:
         message = answer.text
         if answer.citations:
-            citations = "\n".join(self._format_citation_line(citation) for citation in answer.citations)
-            message = f"{message}\n\nSources:\n{citations}"
+            pages = self._format_citation_pages(answer.citations)
+            if pages:
+                message = f"{message}\n\nSources:\n{pages}"
         self._replace_pending_answer(message)
         self._set_input_enabled(True)
 
@@ -197,6 +208,8 @@ class ContractChatDialog(QDialog):
 
     def _replace_pending_answer(self, content: str) -> None:
         if self._pending_answer_label is not None:
+            self._stop_thinking_indicator()
+            self._pending_answer_label.setTextFormat(Qt.TextFormat.PlainText)
             self._pending_answer_label.setText(content)
             self._pending_answer_label = None
             QTimer.singleShot(0, self._scroll_to_bottom)
@@ -211,19 +224,51 @@ class ContractChatDialog(QDialog):
         self._input.setEnabled(enabled)
         self._send_button.setEnabled(enabled)
 
+    def _set_status_message(self, message: str) -> None:
+        self._status.setText(message)
+        self._status.show()
+
+    def _clear_status(self) -> None:
+        self._status.clear()
+        self._status.hide()
+
+    def _announce_index_ready(self) -> None:
+        if self._has_announced_index_ready:
+            return
+        self._append_message("assistant", "Contract index ready.")
+        self._has_announced_index_ready = True
+
+    def _start_thinking_indicator(self) -> None:
+        self._thinking_frame = 0
+        self._advance_thinking_indicator()
+        self._thinking_timer.start()
+
+    def _stop_thinking_indicator(self) -> None:
+        self._thinking_timer.stop()
+
+    def _advance_thinking_indicator(self) -> None:
+        if self._pending_answer_label is None:
+            self._stop_thinking_indicator()
+            return
+        dot_count = (self._thinking_frame % 3) + 1
+        dots = []
+        for index in range(3):
+            dot = "." if index < dot_count else "&nbsp;"
+            dots.append(f"<span style=\"font-size: 18px; font-weight: 600;\">{dot}</span>")
+        self._pending_answer_label.setTextFormat(Qt.TextFormat.RichText)
+        self._pending_answer_label.setText(f"<span>Thinking</span>&nbsp;{' '.join(dots)}")
+        self._thinking_frame += 1
+
     @staticmethod
-    def _format_citation_line(citation) -> str:
-        parts = []
-        page_label = (
-            f"page {citation.page_start}"
-            if citation.page_start == citation.page_end
-            else f"pages {citation.page_start}-{citation.page_end}"
-        )
-        parts.append(page_label)
-        if citation.section_number:
-            parts.append(f"Section {citation.section_number}")
-        if citation.heading:
-            parts.append(citation.heading)
-        if citation.attachment:
-            parts.append(citation.attachment)
-        return "- " + " | ".join(parts)
+    def _format_citation_pages(citations) -> str:
+        page_numbers: list[int] = []
+        seen: set[int] = set()
+        for citation in citations:
+            for page in range(citation.page_start, citation.page_end + 1):
+                if page in seen:
+                    continue
+                seen.add(page)
+                page_numbers.append(page)
+                if len(page_numbers) >= 3:
+                    return "\n".join(f"- page {page}" for page in page_numbers)
+        return "\n".join(f"- page {page}" for page in page_numbers)

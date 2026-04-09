@@ -33,20 +33,19 @@ def main() -> int:
         tray_menu = QMenu()
         open_chat_action = QAction("Open Contract Chat", tray_menu)
         open_chat_action.triggered.connect(chat_dialog.show)
-        show_avatar_action = QAction("Show Kiewey", tray_menu)
-        show_avatar_action.triggered.connect(lambda: _show_avatar(avatar))
-        hide_avatar_action = QAction("Hide Kiewey", tray_menu)
-        hide_avatar_action.triggered.connect(avatar.hide)
+        toggle_avatar_action = QAction(tray_menu)
+        toggle_avatar_action.triggered.connect(lambda: _toggle_avatar(avatar))
         rebuild_action = QAction("Rebuild Contract Index", tray_menu)
         rebuild_action.triggered.connect(chat_dialog._rebuild_index)  # noqa: SLF001
         exit_action = QAction("Exit", tray_menu)
         exit_action.triggered.connect(app.quit)
         tray_menu.addAction(open_chat_action)
-        tray_menu.addAction(show_avatar_action)
-        tray_menu.addAction(hide_avatar_action)
+        tray_menu.addAction(toggle_avatar_action)
         tray_menu.addAction(rebuild_action)
         tray_menu.addSeparator()
         tray_menu.addAction(exit_action)
+        tray_menu.aboutToShow.connect(lambda: _sync_toggle_avatar_action(toggle_avatar_action, avatar))
+        _sync_toggle_avatar_action(toggle_avatar_action, avatar)
         tray_icon.setContextMenu(tray_menu)
         tray_icon.activated.connect(lambda reason: _handle_tray_activation(reason, avatar, chat_dialog))
         tray_icon.show()
@@ -63,6 +62,17 @@ def _show_avatar(avatar: AvatarWindow) -> None:
     avatar.show()
     avatar.raise_()
     avatar.activateWindow()
+
+
+def _toggle_avatar(avatar: AvatarWindow) -> None:
+    if avatar.isVisible():
+        avatar.hide()
+        return
+    _show_avatar(avatar)
+
+
+def _sync_toggle_avatar_action(action: QAction, avatar: AvatarWindow) -> None:
+    action.setText("Hide Kiewey" if avatar.isVisible() else "Show Kiewey")
 
 
 def _handle_tray_activation(reason: QSystemTrayIcon.ActivationReason, avatar: AvatarWindow, chat_dialog: ContractChatDialog) -> None:
