@@ -27,6 +27,7 @@ CONTRACT_DATA_UNAVAILABLE_MESSAGE = (
     "The bundled contract data is unavailable in this build. "
     "Please contact support to reinstall the app or replace the contract package."
 )
+ANSWER_ERROR_PREFIX = "I hit an error while answering that question."
 
 
 def _dialog_style() -> str:
@@ -110,7 +111,11 @@ class AskWorker(QThread):
 
     def run(self) -> None:
         try:
-            answer = self._assistant.ask(self._question, history=self._history, deep_think=self._deep_think)
+            answer = self._assistant.ask(
+                self._question,
+                history=self._history,
+                deep_think=self._deep_think,
+            )
             self.finished.emit(self._request_token, answer)
         except Exception as exc:
             self.failed.emit(self._request_token, str(exc))
@@ -131,6 +136,10 @@ class ContractChatDialog(QDialog):
         self._active_request_token: int | None = None
         self._thinking_frame = 0
         self._pending_thinking_label = "Thinking"
+        self._thinking_start_timer = QTimer(self)
+        self._thinking_start_timer.setSingleShot(True)
+        self._thinking_start_timer.setInterval(180)
+        self._thinking_start_timer.timeout.connect(self._show_thinking_indicator)
         self._thinking_timer = QTimer(self)
         self._thinking_timer.setInterval(350)
         self._thinking_timer.timeout.connect(self._advance_thinking_indicator)
@@ -238,7 +247,7 @@ class ContractChatDialog(QDialog):
             return
         self._active_request_token = None
         self._pending_question = None
-        self._replace_pending_answer(f"I hit an error while answering that question.\n\n{error}")
+        self._replace_pending_answer(f"{ANSWER_ERROR_PREFIX}\n\n{error}")
         if not self._context_low_locked:
             self._set_input_busy(False)
 
@@ -246,7 +255,13 @@ class ContractChatDialog(QDialog):
         self._reset_chat_session()
         super().closeEvent(event)
 
-    def _append_message(self, role: str, content: str, *, count_toward_cap: bool = True) -> QLabel:
+    def _append_message(
+        self,
+        role: str,
+        content: str,
+        *,
+        count_toward_cap: bool = True,
+    ) -> QLabel:
         label = QLabel()
         label.setWordWrap(True)
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -306,12 +321,20 @@ class ContractChatDialog(QDialog):
         self._status.hide()
 
     def _start_thinking_indicator(self) -> None:
+        self._thinking_start_timer.stop()
+        self._thinking_timer.stop()
         self._thinking_frame = 0
-        self._advance_thinking_indicator()
-        self._thinking_timer.start()
+        self._thinking_start_timer.start()
 
     def _stop_thinking_indicator(self) -> None:
+        self._thinking_start_timer.stop()
         self._thinking_timer.stop()
+
+    def _show_thinking_indicator(self) -> None:
+        if self._pending_answer_label is None:
+            return
+        self._advance_thinking_indicator()
+        self._thinking_timer.start()
 
     def _advance_thinking_indicator(self) -> None:
         if self._pending_answer_label is None:

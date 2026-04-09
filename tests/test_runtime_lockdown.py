@@ -146,7 +146,15 @@ def test_chat_dialog_deep_think_toggle_is_session_local(monkeypatch) -> None:
             return None
 
     class FakeWorker:
-        def __init__(self, assistant, question: str, request_token: int, history=None, *, deep_think: bool = False) -> None:
+        def __init__(
+            self,
+            assistant,
+            question: str,
+            request_token: int,
+            history=None,
+            *,
+            deep_think: bool = False,
+        ) -> None:
             captured["question"] = question
             captured["request_token"] = request_token
             captured["deep_think"] = deep_think
@@ -180,7 +188,7 @@ def test_chat_dialog_deep_think_toggle_is_session_local(monkeypatch) -> None:
     assert captured["started"] is True
     assert captured["deep_think"] is True
     assert dialog._deep_think_button.isEnabled() is False  # noqa: SLF001
-    assert "Deep Thinking" in dialog._pending_answer_label.text()  # noqa: SLF001
+    assert dialog._pending_thinking_label == "Deep Thinking"  # noqa: SLF001
 
     dialog.close()
     app.processEvents()

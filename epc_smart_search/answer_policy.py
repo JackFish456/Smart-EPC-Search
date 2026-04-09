@@ -20,6 +20,7 @@ SUMMARY_MAX_NEW_TOKENS = 768
 SUMMARY_ENABLE_THINKING = False
 SUMMARY_CONTEXT_MAX_SECTIONS = 6
 SUMMARY_EXCERPT_LIMIT = 760
+EXPAND_MAX_NEW_TOKENS = 896
 DEEP_MAX_NEW_TOKENS = 896
 DEEP_ENABLE_THINKING = True
 DEEP_CONTEXT_MAX_SECTIONS = 8
@@ -39,10 +40,12 @@ class AnswerPolicy:
         gemma_client,
         *,
         deep_think: bool = False,
+        expand_answer: bool = False,
+        previous_answer: str | None = None,
     ) -> AssistantAnswer:
         effective_question = self.resolve_question(question, history)
         exact_hits = self.retriever.find_exact_page_hits(effective_question)
-        exact_answer = self.build_exact_answer(effective_question, exact_hits)
+        exact_answer = None if expand_answer else self.build_exact_answer(effective_question, exact_hits)
         if exact_answer is not None and not deep_think:
             return exact_answer
 
@@ -66,11 +69,11 @@ class AnswerPolicy:
             return AssistantAnswer("I can't verify that from the contract.", citations, True)
 
         reference_answer = self.build_reference_answer(effective_question, ranked, citations)
-        if reference_answer is not None and not summary_request and not deep_think:
+        if reference_answer is not None and not summary_request and not deep_think and not expand_answer:
             return reference_answer
 
         extractive_answer = self.build_extractive_answer(effective_question, ranked, citations)
-        if extractive_answer is not None and not summary_request and not deep_think:
+        if extractive_answer is not None and not summary_request and not deep_think and not expand_answer:
             return extractive_answer
 
         if deep_think:
@@ -79,6 +82,12 @@ class AnswerPolicy:
                 if extractive_answer is not None:
                     return extractive_answer
                 return AssistantAnswer("I can't verify that from the contract.", citations, True)
+            if not prompt_context:
+                if extractive_answer is not None:
+                    return extractive_answer
+                return AssistantAnswer("I can't verify that from the contract.", citations, True)
+        elif expand_answer:
+            prompt_context = self.build_expand_prompt_context(effective_question, ranked, previous_answer)
             if not prompt_context:
                 if extractive_answer is not None:
                     return extractive_answer
@@ -94,14 +103,16 @@ class AnswerPolicy:
                     return extractive_answer
                 return AssistantAnswer("I can't verify that from the contract.", citations, True)
 
+        gemma_kwargs: dict[str, object] = {
+            "enable_thinking": DEEP_ENABLE_THINKING if deep_think else (SUMMARY_ENABLE_THINKING if summary_request else None),
+            "max_new_tokens": DEEP_MAX_NEW_TOKENS if deep_think else (EXPAND_MAX_NEW_TOKENS if expand_answer else (SUMMARY_MAX_NEW_TOKENS if summary_request else None)),
+            "response_style": "deep_answer" if deep_think else ("expand_answer" if expand_answer else ("detailed_summary" if summary_request else None)),
+        }
+        if expand_answer and previous_answer is not None:
+            gemma_kwargs["previous_answer"] = previous_answer
+
         try:
-            answer_text = gemma_client.ask(
-                question,
-                prompt_context,
-                enable_thinking=DEEP_ENABLE_THINKING if deep_think else (SUMMARY_ENABLE_THINKING if summary_request else None),
-                max_new_tokens=DEEP_MAX_NEW_TOKENS if deep_think else (SUMMARY_MAX_NEW_TOKENS if summary_request else None),
-                response_style="deep_answer" if deep_think else ("detailed_summary" if summary_request else None),
-            )
+            answer_text = gemma_client.ask(question, prompt_context, **gemma_kwargs)
         except Exception:
             if extractive_answer is not None:
                 return extractive_answer
@@ -109,7 +120,7 @@ class AnswerPolicy:
 
         answer_text = answer_text.strip() or "I can't verify that from the contract."
         refused = answer_text == "I can't verify that from the contract."
-        if (summary_request or deep_think) and (refused or not answer_text):
+        if (summary_request or deep_think or expand_answer) and (refused or not answer_text):
             if extractive_answer is not None:
                 return extractive_answer
         return AssistantAnswer(answer_text, citations, refused)
@@ -367,6 +378,24 @@ class AnswerPolicy:
             if len(blocks) >= max_sections:
                 break
         return "\n\n".join(blocks)
+
+    @classmethod
+    def build_expand_prompt_context(
+        cls,
+        question: str,
+        ranked: list[RankedChunk],
+        previous_answer: str | None,
+        *,
+        max_sections: int = SUMMARY_CONTEXT_MAX_SECTIONS,
+    ) -> str:
+        evidence = cls.build_summary_prompt_context(question, ranked, max_sections=max_sections)
+        sections: list[str] = []
+        prior = str(previous_answer or "").strip()
+        if prior:
+            sections.append("Previous answer shown to the user:\n" + prior)
+        if evidence:
+            sections.append("Contract evidence for the expanded answer:\n" + evidence)
+        return "\n\n".join(section for section in sections if section).strip()
 
     def build_deep_prompt_context(
         self,

@@ -14,14 +14,6 @@ import requests
 from epc_smart_search.answer_policy import (
     AssistantAnswer as PolicyAssistantAnswer,
     AnswerPolicy,
-    DEEP_CONTEXT_EXACT_HITS,
-    DEEP_CONTEXT_MAX_SECTIONS,
-    DEEP_ENABLE_THINKING,
-    DEEP_MAX_NEW_TOKENS,
-    DEEP_PAGE_CONTEXT_SECTIONS,
-    SUMMARY_CONTEXT_MAX_SECTIONS,
-    SUMMARY_ENABLE_THINKING,
-    SUMMARY_MAX_NEW_TOKENS,
 )
 from epc_smart_search.app_paths import DB_PATH, GEMMA_TEST_PYTHON, WORKSPACE_ROOT, seed_preloaded_db
 from epc_smart_search.config import GEMMA_SERVICE_HOST, GEMMA_SERVICE_PORT, SEARCH_SCHEMA_VERSION
@@ -117,6 +109,7 @@ class GemmaServiceClient:
         enable_thinking: bool | None = None,
         max_new_tokens: int | None = None,
         response_style: str | None = None,
+        previous_answer: str | None = None,
     ) -> str:
         self.ensure_running()
         payload: dict[str, object] = {"question": question, "context": context}
@@ -126,6 +119,8 @@ class GemmaServiceClient:
             payload["max_new_tokens"] = max_new_tokens
         if response_style is not None:
             payload["response_style"] = response_style
+        if previous_answer is not None:
+            payload["previous_answer"] = previous_answer
         response = requests.post(
             f"{self.base_url}/generate",
             json=payload,
@@ -184,8 +179,17 @@ class ContractAssistant:
         history: Sequence[dict[str, str]] | None = None,
         *,
         deep_think: bool = False,
+        expand_answer: bool = False,
+        previous_answer: str | None = None,
     ) -> AssistantAnswer:
-        return self._get_answer_policy().answer(question, history, self.gemma, deep_think=deep_think)
+        return self._get_answer_policy().answer(
+            question,
+            history,
+            self.gemma,
+            deep_think=deep_think,
+            expand_answer=expand_answer,
+            previous_answer=previous_answer,
+        )
 
     @classmethod
     def _resolve_question(cls, question: str, history: Sequence[dict[str, str]] | None = None) -> str:

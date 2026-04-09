@@ -99,6 +99,22 @@ For a Windows bundle (requires the dev requirements and an external prebuilt DB 
 .\package_epc_smart_search.ps1 -PrebuiltDbPath C:\secure\builds\contract_store.prebuilt.new.db
 ```
 
+The target customer packaging direction for Lite and AI portable bundles is documented in `PACKAGING_PLAN.md`.
+
+## Release profiles
+
+The current packaging flow supports one Windows app bundle plus two **Gemma runtime/model profiles**:
+
+- **GPU-capable profile** — ship the packaged app with the CUDA-enabled **Gemma Test** environment, a preferred **text-only** checkpoint, and the CUDA PyTorch + `bitsandbytes` stack so Gemma can run in 4-bit NF4 on a dedicated GPU.
+- **CPU / no dedicated GPU profile** — ship the same packaged app with a **text-only** checkpoint and a CPU-compatible Gemma environment. This works without a dedicated GPU, but responses will be slower.
+
+Recommended internal release naming:
+
+- `EPC Smart Search - GPU`
+- `EPC Smart Search - Standard`
+
+For now, the EXE and bundled contract database can stay the same across both releases. The practical difference is the accompanying Gemma environment and model payload, not the PyInstaller app itself.
+
 ## Notes
 
 - **Git:** Public repo shows code and schema only; **no** contract PDFs and **no** populated SQLite files (`*.db`); see `.gitignore`. Local `.epc_smart_search/`, logs, and test caches stay private too.

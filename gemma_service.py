@@ -32,6 +32,7 @@ def create_app() -> Flask:
         enable_thinking = payload.get("enable_thinking")
         max_new_tokens = payload.get("max_new_tokens")
         response_style = str(payload.get("response_style", "")).strip().lower()
+        previous_answer = str(payload.get("previous_answer", "")).strip()
         if not question or not context:
             return jsonify({"error": "question and context are required"}), 400
         if not state["ready"]:
@@ -79,6 +80,26 @@ def create_app() -> Flask:
                 "Use short markdown-style headers and flat bullet lists when they improve readability. "
                 "Do not show analysis, numbered reasoning steps, or chain-of-thought. "
                 "Use only the excerpts. If the excerpts do not fully support the answer, "
+                "respond exactly with: I can't verify that from the contract."
+            )
+        elif response_style == "expand_answer":
+            system_prompt = (
+                f"{STRICT_SYSTEM_PROMPT} "
+                "The user already saw a shorter grounded answer and explicitly asked for more detail. "
+                "Expand only with details supported by the excerpts, and avoid repeating the earlier answer verbatim."
+            )
+            prompt = (
+                "Contract excerpts:\n"
+                f"{context}\n\n"
+                "User question:\n"
+                f"{question}\n\n"
+                "Earlier answer already shown to the user:\n"
+                f"{previous_answer or 'None provided.'}\n\n"
+                "Write a more detailed contract-grounded answer in plain English. "
+                "Answer the same question with added specifics, clarifications, conditions, thresholds, dates, exceptions, dependencies, and practical distinctions that are supported by the excerpts. "
+                "Use short markdown-style headers and flat bullet lists when they improve readability. "
+                "Do not repeat the earlier answer verbatim, do not mention analysis or chain-of-thought, and do not use outside knowledge. "
+                "Use only the excerpts. If the excerpts do not fully support the expanded answer, "
                 "respond exactly with: I can't verify that from the contract."
             )
         else:

@@ -562,3 +562,76 @@ def test_follow_up_after_summary_reuses_last_user_topic_for_retrieval() -> None:
     assert any("fuel gas system" in query.lower() for query in assistant.retriever.queries)
     assert "Section 5.23 - Fuel Gas Supply" in answer.text
     assert assistant.gemma.calls == []
+
+
+def test_expand_answer_routes_through_gemma_with_previous_answer() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.23",
+            heading="Fuel Gas Supply",
+            full_text=(
+                "The Fuel Gas System receives, conditions and transports natural gas supplied from an offsite pipeline. "
+                "Contractor shall supply and install the main fuel gas regulating station."
+            ),
+            page_start=270,
+            page_end=271,
+            ordinal_in_document=1,
+            total_score=3.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+    citations = [Citation("chunk1", "5.23", "Fuel Gas Supply", None, 270, 271, "quote")]
+    exact_hits = [ExactPageHit(page_num=270, snippet="fuel gas", page_text=ranked[0].full_text)]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return exact_hits
+
+        def retrieve(self, question: str):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    class FakeGemma:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def ask(
+            self,
+            question: str,
+            context: str,
+            *,
+            enable_thinking=None,
+            max_new_tokens=None,
+            response_style=None,
+            previous_answer=None,
+        ):
+            self.calls.append(
+                {
+                    "question": question,
+                    "context": context,
+                    "enable_thinking": enable_thinking,
+                    "max_new_tokens": max_new_tokens,
+                    "response_style": response_style,
+                    "previous_answer": previous_answer,
+                }
+            )
+            return "Expanded answer."
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+
+    answer = assistant.ask(
+        "show me the fuel gas supply clause",
+        expand_answer=True,
+        previous_answer="Short grounded answer.",
+    )
+
+    assert answer.text == "Expanded answer."
+    assert assistant.gemma.calls[0]["response_style"] == "expand_answer"
+    assert assistant.gemma.calls[0]["previous_answer"] == "Short grounded answer."
+    assert "Previous answer shown to the user:" in assistant.gemma.calls[0]["context"]

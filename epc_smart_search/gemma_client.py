@@ -74,6 +74,7 @@ class GemmaServiceClient:
         enable_thinking: bool | None = None,
         max_new_tokens: int | None = None,
         response_style: str | None = None,
+        previous_answer: str | None = None,
     ) -> str:
         self.ensure_running()
         payload: dict[str, object] = {"question": question, "context": context}
@@ -83,6 +84,8 @@ class GemmaServiceClient:
             payload["max_new_tokens"] = max_new_tokens
         if response_style is not None:
             payload["response_style"] = response_style
+        if previous_answer is not None:
+            payload["previous_answer"] = previous_answer
         response = requests.post(f"{self.base_url}/generate", json=payload, timeout=300)
         response.raise_for_status()
         return str(response.json().get("answer", "")).strip()
