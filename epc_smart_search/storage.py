@@ -390,6 +390,14 @@ class ContractStore:
             ).fetchone()
         return int(row["feature_count"]) if row else 0
 
+    def get_chunk_count(self, document_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS chunk_count FROM contract_chunks WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+        return int(row["chunk_count"]) if row else 0
+
     def section_lookup(self, document_id: str, section_number: str) -> list[sqlite3.Row]:
         with self._connect() as connection:
             return connection.execute(

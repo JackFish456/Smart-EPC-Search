@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import html
+import re
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QRectF, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QPainterPath, QRegion
 from PySide6.QtWidgets import (
     QDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -19,17 +21,28 @@ from epc_smart_search.assistant import AssistantAnswer, ContractAssistant
 from epc_smart_search.config import GREETING
 
 
+CONTRACT_DATA_UNAVAILABLE_STATUS = "Contract data unavailable. Please contact support."
+CONTRACT_DATA_UNAVAILABLE_MESSAGE = (
+    "The bundled contract data is unavailable in this build. "
+    "Please contact support to reinstall the app or replace the contract package."
+)
+
+
 def _dialog_style() -> str:
+    # ChatScrollArea applies a rounded mask so viewport + scrollbar share one outline
+    # with the border (no per-subwidget radii that fight each other).
     return """
     QDialog { background-color: #fff4cc; }
     QScrollArea#chatScroll {
-        background-color: #fff4cc;
+        background-color: #ffffff;
         border: 1px solid #000;
         border-radius: 6px;
     }
+    QWidget#chatViewport {
+        background-color: #ffffff;
+    }
     QWidget#chatContent {
-        background-color: #fff;
-        border-radius: 4px;
+        background-color: #ffffff;
     }
     QLineEdit {
         background-color: #fff;
@@ -53,51 +66,68 @@ def _dialog_style() -> str:
     """
 
 
-class IndexWorker(QThread):
-    progress = Signal(str)
-    finished = Signal(dict)
-    failed = Signal(str)
+class ChatScrollArea(QScrollArea):
+    """Rounded clip so the black border, chat body, and scrollbar share one continuous outline."""
 
-    def __init__(self, assistant: ContractAssistant) -> None:
-        super().__init__()
-        self._assistant = assistant
+    def __init__(self, corner_radius: float = 6.0, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._corner_radius = corner_radius
 
-    def run(self) -> None:
-        try:
-            result = self._assistant.build_index(progress_callback=self.progress.emit)
-            self.finished.emit(result)
-        except Exception as exc:
-            self.failed.emit(str(exc))
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_rounded_mask()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._apply_rounded_mask()
+
+    def _apply_rounded_mask(self) -> None:
+        w, h = self.width(), self.height()
+        if w <= 1 or h <= 1:
+            return
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, float(w), float(h)), self._corner_radius, self._corner_radius)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
 
 
 class AskWorker(QThread):
-    finished = Signal(object)
-    failed = Signal(str)
+    finished = Signal(int, object)
+    failed = Signal(int, str)
 
-    def __init__(self, assistant: ContractAssistant, question: str) -> None:
+    def __init__(
+        self,
+        assistant: ContractAssistant,
+        question: str,
+        request_token: int,
+        history: list[dict[str, str]] | None = None,
+    ) -> None:
         super().__init__()
         self._assistant = assistant
         self._question = question
+        self._request_token = request_token
+        self._history = list(history or [])
 
     def run(self) -> None:
         try:
-            answer = self._assistant.ask(self._question)
-            self.finished.emit(answer)
+            answer = self._assistant.ask(self._question, history=self._history)
+            self.finished.emit(self._request_token, answer)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(self._request_token, str(exc))
 
 
 class ContractChatDialog(QDialog):
     def __init__(self, assistant: ContractAssistant, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._assistant = assistant
-        self._index_worker: IndexWorker | None = None
         self._ask_worker: AskWorker | None = None
         self._pending_answer_label: QLabel | None = None
-        self._has_announced_index_ready = False
+        self._pending_question: str | None = None
+        self._conversation_history: list[dict[str, str]] = []
         self._message_cap = 50
         self._message_count = 0
         self._context_low_locked = False
+        self._request_token = 0
+        self._active_request_token: int | None = None
         self._thinking_frame = 0
         self._thinking_timer = QTimer(self)
         self._thinking_timer.setInterval(350)
@@ -114,12 +144,15 @@ class ContractChatDialog(QDialog):
         layout.addWidget(self._status)
         self._status.hide()
 
-        self._scroll = QScrollArea()
+        self._scroll = ChatScrollArea(corner_radius=6.0)
         self._scroll.setObjectName("chatScroll")
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setWidgetResizable(True)
+        viewport = self._scroll.viewport()
+        viewport.setObjectName("chatViewport")
+        viewport.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._content = QWidget()
         self._content.setObjectName("chatContent")
-        self._scroll.viewport().setStyleSheet("background-color: #fff;")
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(16, 12, 16, 12)
         self._content_layout.setSpacing(6)
@@ -130,7 +163,7 @@ class ContractChatDialog(QDialog):
         input_row = QHBoxLayout()
         input_row.setSpacing(8)
         self._input = QLineEdit()
-        self._input.setPlaceholderText("Ask Kiewey about the EPC contract...")
+        self._input.setPlaceholderText("Ask Kiewey about the EPC contract")
         self._input.returnPressed.connect(self._on_send)
         input_row.addWidget(self._input)
 
@@ -145,42 +178,11 @@ class ContractChatDialog(QDialog):
     def _ensure_index_ready(self) -> None:
         if self._assistant.is_index_ready():
             self._clear_status()
-            self._announce_index_ready()
             self._set_input_enabled(True)
             return
-        self._append_message("assistant", "I’m getting the contract ready for search. This may take a little while on the first run.")
-        self._start_index_worker()
-
-    def _rebuild_index(self) -> None:
-        self._append_message("assistant", "Rebuilding the contract index now.")
-        self._start_index_worker()
-
-    def _start_index_worker(self) -> None:
-        if self._index_worker is not None and self._index_worker.isRunning():
-            return
+        self._append_message("assistant", CONTRACT_DATA_UNAVAILABLE_MESSAGE, count_toward_cap=False)
         self._set_input_enabled(False)
-        self._set_status_message("Building contract index...")
-        self._index_worker = IndexWorker(self._assistant)
-        self._index_worker.progress.connect(self._set_status_message)
-        self._index_worker.finished.connect(self._on_index_finished)
-        self._index_worker.failed.connect(self._on_index_failed)
-        self._index_worker.start()
-
-    def _on_index_finished(self, result: dict) -> None:
-        self._clear_status()
-        if self._has_announced_index_ready:
-            self._append_message(
-                "assistant",
-                f"Index rebuild finished. I loaded {result.get('chunk_count', '?')} searchable chunks.",
-            )
-        else:
-            self._announce_index_ready()
-        self._set_input_enabled(True)
-
-    def _on_index_failed(self, error: str) -> None:
-        self._set_status_message("Index build failed.")
-        self._append_message("assistant", f"I couldn't finish building the contract index.\n\n{error}")
-        self._set_input_enabled(True)
+        self._set_status_message(CONTRACT_DATA_UNAVAILABLE_STATUS)
 
     def _on_send(self) -> None:
         question = self._input.text().strip()
@@ -188,23 +190,51 @@ class ContractChatDialog(QDialog):
             return
         self._input.clear()
         self._append_message("user", question)
+        self._pending_question = question
         self._pending_answer_label = self._append_message("assistant", "", count_toward_cap=False)
         self._start_thinking_indicator()
         self._set_input_enabled(False)
-        self._ask_worker = AskWorker(self._assistant, question)
+        self._request_token += 1
+        self._active_request_token = self._request_token
+        self._ask_worker = AskWorker(
+            self._assistant,
+            question,
+            self._request_token,
+            history=self._conversation_history[-8:],
+        )
         self._ask_worker.finished.connect(self._on_answer_ready)
         self._ask_worker.failed.connect(self._on_answer_failed)
+        self._ask_worker.finished.connect(self._ask_worker.deleteLater)
+        self._ask_worker.failed.connect(self._ask_worker.deleteLater)
         self._ask_worker.start()
 
-    def _on_answer_ready(self, answer: AssistantAnswer) -> None:
+    def _on_answer_ready(self, request_token: int, answer: AssistantAnswer) -> None:
+        self._clear_finished_worker()
+        if request_token != self._active_request_token:
+            return
+        self._active_request_token = None
+        if self._pending_question:
+            self._conversation_history.append({"role": "user", "content": self._pending_question})
+        self._conversation_history.append({"role": "assistant", "content": answer.text})
+        self._conversation_history = self._conversation_history[-8:]
+        self._pending_question = None
         self._replace_pending_answer(answer.text)
         if not self._context_low_locked:
             self._set_input_enabled(True)
 
-    def _on_answer_failed(self, error: str) -> None:
+    def _on_answer_failed(self, request_token: int, error: str) -> None:
+        self._clear_finished_worker()
+        if request_token != self._active_request_token:
+            return
+        self._active_request_token = None
+        self._pending_question = None
         self._replace_pending_answer(f"I hit an error while answering that question.\n\n{error}")
         if not self._context_low_locked:
             self._set_input_enabled(True)
+
+    def closeEvent(self, event) -> None:
+        self._reset_chat_session()
+        super().closeEvent(event)
 
     def _append_message(self, role: str, content: str, *, count_toward_cap: bool = True) -> QLabel:
         label = QLabel()
@@ -254,11 +284,6 @@ class ContractChatDialog(QDialog):
         self._status.clear()
         self._status.hide()
 
-    def _announce_index_ready(self) -> None:
-        if self._has_announced_index_ready:
-            return
-        self._has_announced_index_ready = True
-
     def _start_thinking_indicator(self) -> None:
         self._thinking_frame = 0
         self._advance_thinking_indicator()
@@ -287,6 +312,28 @@ class ContractChatDialog(QDialog):
         self._append_message("assistant", "Context Low Please Open Another Chat Window", count_toward_cap=False)
         self._set_input_enabled(False)
 
+    def _clear_finished_worker(self) -> None:
+        worker = self.sender()
+        if worker is self._ask_worker:
+            self._ask_worker = None
+
+    def _reset_chat_session(self) -> None:
+        self._stop_thinking_indicator()
+        self._pending_answer_label = None
+        self._active_request_token = None
+        self._pending_question = None
+        self._conversation_history.clear()
+        self._message_count = 0
+        self._context_low_locked = False
+        self._input.clear()
+        while self._content_layout.count():
+            item = self._content_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._append_message("assistant", GREETING, count_toward_cap=False)
+        self._ensure_index_ready()
+
     def _set_message_content(self, label: QLabel, role: str, content: str) -> None:
         if role == "assistant":
             label.setTextFormat(Qt.TextFormat.RichText)
@@ -307,14 +354,91 @@ class ContractChatDialog(QDialog):
                 blocks.append(cls._format_section_block(paragraph))
             elif paragraph.startswith("Page "):
                 blocks.append(cls._format_page_block(paragraph))
-            elif paragraph.endswith(":"):
-                blocks.append(
-                    f"<div style='font-size:13px; font-weight:700; margin:2px 0 10px 0;'>{html.escape(paragraph)}</div>"
-                )
             else:
-                escaped = html.escape(paragraph).replace("\n", "<br>")
-                blocks.append(f"<div style='font-size:13px; line-height:1.45; margin:2px 0 10px 0;'>{escaped}</div>")
+                blocks.append(cls._format_generic_block(paragraph))
         return "".join(blocks)
+
+    @classmethod
+    def _format_generic_block(cls, paragraph: str) -> str:
+        lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+        if not lines:
+            return ""
+        if cls._is_markdown_header(lines[0]):
+            header_html = cls._format_header_block(lines[0].lstrip("#").strip())
+            if len(lines) == 1:
+                return header_html
+            remainder = "\n".join(lines[1:])
+            return header_html + cls._format_generic_block(remainder)
+        if cls._is_list_block(lines):
+            return cls._format_list_block(lines)
+        if lines[0].endswith(":"):
+            header_html = cls._format_header_block(lines[0].removesuffix(":").strip())
+            if len(lines) == 1:
+                return header_html
+            remainder = lines[1:]
+            if cls._is_list_block(remainder):
+                return header_html + cls._format_list_block(remainder)
+            body = "<br>".join(cls._format_inline_text(line) for line in remainder)
+            return header_html + f"<div style='font-size:13px; line-height:1.45; margin:2px 0 10px 0;'>{body}</div>"
+        body = "<br>".join(cls._format_inline_text(line) for line in lines)
+        return f"<div style='font-size:13px; line-height:1.45; margin:2px 0 10px 0;'>{body}</div>"
+
+    @staticmethod
+    def _is_markdown_header(line: str) -> bool:
+        return bool(re.match(r"^#{1,3}\s+\S", line))
+
+    @staticmethod
+    def _is_list_block(lines: list[str]) -> bool:
+        if not lines:
+            return False
+        unordered = all(re.match(r"^[-*•]\s+\S", line) for line in lines)
+        ordered = all(re.match(r"^\d+\.\s+\S", line) for line in lines)
+        return unordered or ordered
+
+    @classmethod
+    def _format_header_block(cls, text: str) -> str:
+        return (
+            "<div style='font-size:13px; font-weight:700; margin:2px 0 6px 0;'>"
+            f"{cls._format_inline_text(text)}</div>"
+        )
+
+    @classmethod
+    def _format_list_block(cls, lines: list[str]) -> str:
+        ordered = all(re.match(r"^\d+\.\s+\S", line) for line in lines)
+        tag = "ol" if ordered else "ul"
+        items: list[str] = []
+        pattern = r"^\d+\.\s+" if ordered else r"^[-*•]\s+"
+        for line in lines:
+            item_text = re.sub(pattern, "", line, count=1).strip()
+            items.append(f"<li style='margin:0 0 4px 0;'>{cls._format_inline_text(item_text)}</li>")
+        return (
+            f"<{tag} style='font-size:13px; line-height:1.45; margin:2px 0 12px 18px; padding-left:18px;'>"
+            f"{''.join(items)}</{tag}>"
+        )
+
+    @staticmethod
+    def _format_inline_text(text: str) -> str:
+        escaped = html.escape(text)
+        escaped = re.sub(
+            r"`([^`]+)`",
+            lambda match: (
+                "<code style='background-color:#fff4cc; border:1px solid #e0cf85; "
+                "border-radius:3px; padding:0 3px;'>"
+                f"{match.group(1)}</code>"
+            ),
+            escaped,
+        )
+        escaped = re.sub(
+            r"\*\*([^*]+)\*\*",
+            lambda match: f"<span style='font-weight:700;'>{match.group(1)}</span>",
+            escaped,
+        )
+        escaped = re.sub(
+            r"(?<!\*)\*([^*]+)\*(?!\*)",
+            lambda match: f"<span style='font-style:italic;'>{match.group(1)}</span>",
+            escaped,
+        )
+        return escaped
 
     @classmethod
     def _format_section_block(cls, paragraph: str) -> str:

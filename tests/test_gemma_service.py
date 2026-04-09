@@ -1,0 +1,84 @@
+from types import SimpleNamespace
+
+import gemma_service
+
+
+def test_generate_accepts_summary_overrides(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeRuntime:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def load(self) -> None:
+            return None
+
+        def generate(self, *, user_text: str, system_prompt: str, enable_thinking=None, max_new_tokens=None):
+            calls.append(
+                {
+                    "user_text": user_text,
+                    "system_prompt": system_prompt,
+                    "enable_thinking": enable_thinking,
+                    "max_new_tokens": max_new_tokens,
+                }
+            )
+            return SimpleNamespace(text="Summary")
+
+    monkeypatch.setattr(gemma_service, "GemmaChatRuntime", FakeRuntime)
+
+    app = gemma_service.create_app()
+    client = app.test_client()
+    response = client.post(
+        "/generate",
+        json={
+            "question": "summarize the fuel gas system",
+            "context": "Fuel gas evidence",
+            "enable_thinking": True,
+            "max_new_tokens": 448,
+            "response_style": "detailed_summary",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["answer"] == "Summary"
+    assert calls[0]["enable_thinking"] is True
+    assert calls[0]["max_new_tokens"] == 448
+    assert "Write a detailed contract-grounded summary in plain English." in calls[0]["user_text"]
+    assert "Prefer short markdown-style section headers and bullet lists" in calls[0]["user_text"]
+    assert "provide a detailed, well-organized synthesis" in calls[0]["system_prompt"]
+
+
+def test_generate_defaults_do_not_force_summary_overrides(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeRuntime:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def load(self) -> None:
+            return None
+
+        def generate(self, *, user_text: str, system_prompt: str, enable_thinking=None, max_new_tokens=None):
+            calls.append(
+                {
+                    "enable_thinking": enable_thinking,
+                    "max_new_tokens": max_new_tokens,
+                }
+            )
+            return SimpleNamespace(text="Answer")
+
+    monkeypatch.setattr(gemma_service, "GemmaChatRuntime", FakeRuntime)
+
+    app = gemma_service.create_app()
+    client = app.test_client()
+    response = client.post(
+        "/generate",
+        json={
+            "question": "what does the contract say about fuel gas supply",
+            "context": "Fuel gas evidence",
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls[0]["enable_thinking"] is None
+    assert calls[0]["max_new_tokens"] is None

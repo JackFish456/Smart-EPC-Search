@@ -1,4 +1,6 @@
 from epc_smart_search.assistant import AssistantAnswer, ContractAssistant
+from epc_smart_search.assistant import SUMMARY_ENABLE_THINKING
+from epc_smart_search.assistant import SUMMARY_MAX_NEW_TOKENS
 from epc_smart_search.retrieval import Citation
 from epc_smart_search.retrieval import RankedChunk
 
@@ -43,7 +45,7 @@ def test_build_extractive_answer_returns_direct_contract_text() -> None:
 
     assert isinstance(answer, AssistantAnswer)
     assert answer is not None
-    assert "Most relevant contract text:" in answer.text
+    assert "Most relevant contract text:" not in answer.text
     assert "Section 5.23 - Fuel Gas Supply" in answer.text
     assert 'Contract text: "Contractor shall provide the fuel gas supply equipment for the Work.' in answer.text
     assert answer.citations == citations
@@ -198,3 +200,232 @@ def test_build_extractive_answer_skips_definition_only_text_for_requirement_ques
     assert answer is not None
     assert "Section 7.5.1 - Air Permit Tests" in answer.text
     assert "Section 2 - Air Permit Test" not in answer.text
+
+
+def test_build_summary_prompt_context_uses_ranked_chunks_and_filters_noise() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="toc",
+            section_number="5.22",
+            heading="Fuel Gas Supply ...................................................................................................................... 5-91",
+            full_text="5.22",
+            page_start=146,
+            page_end=146,
+            ordinal_in_document=1,
+            total_score=4.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        ),
+        RankedChunk(
+            chunk_id="main",
+            section_number="5.23",
+            heading="Fuel Gas Supply",
+            full_text=(
+                "The Fuel Gas System receives, conditions and transports natural gas supplied from an offsite pipeline. "
+                "Contractor shall supply and install the main fuel gas regulating station."
+            ),
+            page_start=270,
+            page_end=271,
+            ordinal_in_document=2,
+            total_score=3.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        ),
+        RankedChunk(
+            chunk_id="requirements",
+            section_number="13.2.2.1",
+            heading="Customer Gas Fuel System Supply Requirements",
+            full_text=(
+                "The allowable minimum and maximum fuel gas supply pressures are referenced to the inlet of the gas module. "
+                "The plant designer shall account for a pressure drop of 51 psi."
+            ),
+            page_start=1955,
+            page_end=1955,
+            ordinal_in_document=3,
+            total_score=2.8,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        ),
+    ]
+
+    context = ContractAssistant._build_summary_prompt_context("summarize the fuel gas system", ranked)
+
+    assert "Heading: Fuel Gas Supply" in context
+    assert "Heading: Customer Gas Fuel System Supply Requirements" in context
+    assert "5.22" not in context
+
+
+def test_summary_requests_use_reasoning_and_fall_back_to_extractive() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.23",
+            heading="Fuel Gas Supply",
+            full_text=(
+                "The Fuel Gas System receives, conditions and transports natural gas supplied from an offsite pipeline. "
+                "Contractor shall supply and install the main fuel gas regulating station."
+            ),
+            page_start=270,
+            page_end=271,
+            ordinal_in_document=1,
+            total_score=3.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+    citations = [Citation("chunk1", "5.23", "Fuel Gas Supply", None, 270, 271, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    class FakeGemma:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def ask(self, question: str, context: str, *, enable_thinking=None, max_new_tokens=None, response_style=None):
+            self.calls.append(
+                {
+                    "question": question,
+                    "context": context,
+                    "enable_thinking": enable_thinking,
+                    "max_new_tokens": max_new_tokens,
+                    "response_style": response_style,
+                }
+            )
+            return "I can't verify that from the contract."
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+
+    answer = assistant.ask("summarize the fuel gas system")
+
+    assert "Most relevant contract text:" not in answer.text
+    assert assistant.gemma.calls[0]["enable_thinking"] is SUMMARY_ENABLE_THINKING
+    assert assistant.gemma.calls[0]["max_new_tokens"] == SUMMARY_MAX_NEW_TOKENS
+    assert assistant.gemma.calls[0]["response_style"] == "detailed_summary"
+
+
+def test_summary_request_does_not_change_following_normal_request_behavior() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.23",
+            heading="Fuel Gas Supply",
+            full_text=(
+                "The Fuel Gas System receives, conditions and transports natural gas supplied from an offsite pipeline. "
+                "Contractor shall supply and install the main fuel gas regulating station."
+            ),
+            page_start=270,
+            page_end=271,
+            ordinal_in_document=1,
+            total_score=3.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+    citations = [Citation("chunk1", "5.23", "Fuel Gas Supply", None, 270, 271, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    class FakeGemma:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def ask(self, question: str, context: str, *, enable_thinking=None, max_new_tokens=None, response_style=None):
+            self.calls.append(
+                {
+                    "question": question,
+                    "enable_thinking": enable_thinking,
+                    "max_new_tokens": max_new_tokens,
+                    "response_style": response_style,
+                }
+            )
+            return "Grounded summary."
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+
+    summary_answer = assistant.ask("explain the fuel gas system")
+    normal_answer = assistant.ask("what does the contract say about fuel gas supply?")
+
+    assert summary_answer.text == "Grounded summary."
+    assert "Most relevant contract text:" not in normal_answer.text
+    assert len(assistant.gemma.calls) == 1
+    assert assistant.gemma.calls[0]["response_style"] == "detailed_summary"
+
+
+def test_follow_up_after_summary_reuses_last_user_topic_for_retrieval() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.23",
+            heading="Fuel Gas Supply",
+            full_text=(
+                "The Fuel Gas System receives, conditions and transports natural gas supplied from an offsite pipeline. "
+                "Contractor shall supply and install the main fuel gas regulating station."
+            ),
+            page_start=270,
+            page_end=271,
+            ordinal_in_document=1,
+            total_score=3.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+    citations = [Citation("chunk1", "5.23", "Fuel Gas Supply", None, 270, 271, "quote")]
+
+    class FakeRetriever:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def find_exact_page_hits(self, question: str):
+            self.queries.append(question)
+            return []
+
+        def retrieve(self, question: str):
+            self.queries.append(question)
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    class FakeGemma:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def ask(self, question: str, context: str, *, enable_thinking=None, max_new_tokens=None, response_style=None):
+            self.calls.append({"question": question, "context": context, "response_style": response_style})
+            return "Grounded summary."
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+
+    answer = assistant.ask(
+        "what section is that in?",
+        history=[
+            {"role": "user", "content": "summarize the fuel gas system"},
+            {"role": "assistant", "content": "Grounded summary."},
+        ],
+    )
+
+    assert any("fuel gas system" in query.lower() for query in assistant.retriever.queries)
+    assert "Section 5.23 - Fuel Gas Supply" in answer.text
+    assert assistant.gemma.calls == []

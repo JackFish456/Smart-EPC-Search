@@ -12,18 +12,27 @@ dist/
 build/
 *.spec
 
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
 # Local test artifacts
 .tmp_test/
 
-# Rebuilt on first run (local index DB)
-.epc_smart_search/*.db
-.epc_smart_search/*.db-journal
+# Local app data (workspace fallback under repo root; see app_paths.get_app_data_root)
+.epc_smart_search/
 
-# Prebuilt index exceeds GitHub single-file limit; build locally or distribute out-of-band
-assets/contract_store.prebuilt.db
+# SQLite database *files* (schema/code lives in Python; do not publish contract content)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
 
-# Contract PDF — supply your own copy in the project root; not committed
-/Clean Contract.pdf
+# Contract PDFs at repo root — sensitive; supply your own copy locally
+/*.pdf
 
 # OS / IDE
 Thumbs.db

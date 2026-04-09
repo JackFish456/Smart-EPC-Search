@@ -9,7 +9,6 @@ from PySide6.QtWidgets import QApplication, QLabel, QMenu, QWidget
 
 class AvatarWindow(QWidget):
     open_chat = Signal()
-    rebuild_index = Signal()
     hide_requested = Signal()
     exit_requested = Signal()
 
@@ -63,13 +62,10 @@ class AvatarWindow(QWidget):
         toggle_visibility_action = QAction(menu)
         toggle_visibility_action.setText("Hide Kiewey" if self.isVisible() else "Show Kiewey")
         toggle_visibility_action.triggered.connect(self.hide_requested.emit if self.isVisible() else self._show_requested)
-        rebuild_action = QAction("Rebuild Contract Index", menu)
-        rebuild_action.triggered.connect(self.rebuild_index.emit)
         exit_action = QAction("Exit", menu)
         exit_action.triggered.connect(self.exit_requested.emit)
         menu.addAction(open_action)
         menu.addAction(toggle_visibility_action)
-        menu.addAction(rebuild_action)
         menu.addSeparator()
         menu.addAction(exit_action)
         menu.exec(global_pos)

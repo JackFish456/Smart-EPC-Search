@@ -19,7 +19,6 @@ def main() -> int:
     avatar_path = ASSETS_DIR / "kiewey.png"
     avatar = AvatarWindow(avatar_path)
     avatar.open_chat.connect(chat_dialog.show)
-    avatar.rebuild_index.connect(chat_dialog._rebuild_index)  # noqa: SLF001
     avatar.hide_requested.connect(avatar.hide)
     avatar.exit_requested.connect(app.quit)
     avatar.place_bottom_right()
@@ -35,13 +34,10 @@ def main() -> int:
         open_chat_action.triggered.connect(chat_dialog.show)
         toggle_avatar_action = QAction(tray_menu)
         toggle_avatar_action.triggered.connect(lambda: _toggle_avatar(avatar))
-        rebuild_action = QAction("Rebuild Contract Index", tray_menu)
-        rebuild_action.triggered.connect(chat_dialog._rebuild_index)  # noqa: SLF001
         exit_action = QAction("Exit", tray_menu)
         exit_action.triggered.connect(app.quit)
         tray_menu.addAction(open_chat_action)
         tray_menu.addAction(toggle_avatar_action)
-        tray_menu.addAction(rebuild_action)
         tray_menu.addSeparator()
         tray_menu.addAction(exit_action)
         tray_menu.aboutToShow.connect(lambda: _sync_toggle_avatar_action(toggle_avatar_action, avatar))

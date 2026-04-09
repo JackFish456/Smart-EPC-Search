@@ -37,6 +37,28 @@ def test_seed_preloaded_db_skips_when_target_exists(monkeypatch) -> None:
     assert target.read_bytes() == b"existing"
 
 
+def test_get_app_data_root_skips_unwritable_localappdata(monkeypatch) -> None:
+    base = _test_dir("fallback")
+    local_root = base / "local"
+    temp_root = base / "temp"
+    home_root = base / "home"
+    workspace_root = base / "workspace"
+
+    monkeypatch.setenv("LOCALAPPDATA", str(local_root))
+    monkeypatch.setattr(app_paths.tempfile, "gettempdir", lambda: str(temp_root))
+    monkeypatch.setattr(app_paths, "WORKSPACE_ROOT", workspace_root)
+    monkeypatch.setattr(app_paths.Path, "home", staticmethod(lambda: home_root))
+
+    def fake_supports_sqlite(candidate: Path) -> bool:
+        return candidate == temp_root / "EPC Smart Search"
+
+    monkeypatch.setattr(app_paths, "_supports_sqlite", fake_supports_sqlite)
+
+    chosen = app_paths.get_app_data_root()
+
+    assert chosen == temp_root / "EPC Smart Search"
+
+
 def _test_dir(label: str) -> Path:
     base = Path(".tmp_test") / f"app_paths_{label}_{uuid.uuid4().hex[:8]}"
     if base.exists():
