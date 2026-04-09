@@ -1,5 +1,6 @@
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.ocr_support import PageText
+from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractStore
 
 
@@ -27,6 +28,7 @@ def test_fts_triggers_stay_in_sync() -> None:
         page_count=1,
         chunks=[chunk],
         pages=[PageText(page_num=10, text=chunk.full_text, ocr_used=False)],
+        features=build_chunk_features([chunk]),
         embeddings={"chunk1": b"\x00\x00\x00\x00"},
         model_name="test",
         dimension=1,
@@ -34,3 +36,8 @@ def test_fts_triggers_stay_in_sync() -> None:
     rows = store.search_fts("doc1", '"liquidated"', limit=5)
     assert rows
     assert rows[0]["chunk_id"] == "chunk1"
+
+    feature_rows = store.search_chunk_feature_fts("doc1", 'topic_tags : "liquidated damages" OR heading : "liquidated"', limit=5)
+    assert feature_rows
+    assert feature_rows[0]["chunk_id"] == "chunk1"
+    assert store.get_metadata("search_schema_version") is not None

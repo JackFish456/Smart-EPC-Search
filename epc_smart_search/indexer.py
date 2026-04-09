@@ -6,9 +6,10 @@ from typing import Callable
 
 import fitz
 
-from epc_smart_search.chunking import build_document_id, parse_chunks
+from epc_smart_search.chunking import ChunkRecord, build_document_id, parse_chunks
 from epc_smart_search.ocr_support import extract_pages
 from epc_smart_search.retrieval import HashingEmbedder
+from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractStore, pack_vector
 
 
@@ -44,6 +45,7 @@ def build_index(
         chunk.chunk_id: pack_vector(embedder.embed(f"{chunk.section_number or ''} {chunk.heading}\n{chunk.full_text}"))
         for chunk in chunks
     }
+    features = build_chunk_features(chunks)
 
     if progress_callback:
         progress_callback("Writing SQLite index...")
@@ -59,6 +61,7 @@ def build_index(
         page_count=page_count,
         chunks=chunks,
         pages=pages,
+        features=features,
         embeddings=embeddings,
         model_name=embedder.model_name,
         dimension=embedder.dimension,
@@ -68,3 +71,32 @@ def build_index(
         "page_count": page_count,
         "chunk_count": len(chunks),
     }
+
+
+def refresh_query_index(
+    store: ContractStore,
+    document_id: str,
+    *,
+    progress_callback: Callable[[str], None] | None = None,
+) -> int:
+    if progress_callback:
+        progress_callback("Refreshing query planner index...")
+    rows = store.fetch_document_chunks(document_id)
+    chunks = [
+        ChunkRecord(
+            chunk_id=str(row["chunk_id"]),
+            document_id=str(row["document_id"]),
+            chunk_type=str(row["chunk_type"]),
+            section_number=row["section_number"],
+            heading=str(row["heading"]),
+            full_text=str(row["full_text"]),
+            page_start=int(row["page_start"]),
+            page_end=int(row["page_end"]),
+            parent_chunk_id=row["parent_chunk_id"],
+            ordinal_in_document=int(row["ordinal_in_document"]),
+        )
+        for row in rows
+    ]
+    features = build_chunk_features(chunks)
+    store.replace_search_features(document_id, features)
+    return len(features)

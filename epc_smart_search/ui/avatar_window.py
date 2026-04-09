@@ -4,12 +4,13 @@ from pathlib import Path
 
 from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QAction, QCursor, QPixmap
-from PySide6.QtWidgets import QLabel, QMenu, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QMenu, QWidget
 
 
 class AvatarWindow(QWidget):
     open_chat = Signal()
     rebuild_index = Signal()
+    hide_requested = Signal()
     exit_requested = Signal()
 
     def __init__(self, avatar_path: Path) -> None:
@@ -29,6 +30,15 @@ class AvatarWindow(QWidget):
         self._label.adjustSize()
         self.resize(self._label.size())
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+    def place_bottom_right(self, margin: int = 24) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        work_area = screen.availableGeometry()
+        x_pos = work_area.right() - self.width() - margin
+        y_pos = work_area.bottom() - self.height() - margin
+        self.move(max(work_area.left(), x_pos), max(work_area.top(), y_pos))
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -52,11 +62,13 @@ class AvatarWindow(QWidget):
         open_action.triggered.connect(self.open_chat.emit)
         rebuild_action = QAction("Rebuild Contract Index", menu)
         rebuild_action.triggered.connect(self.rebuild_index.emit)
+        hide_action = QAction("Hide Kiewey", menu)
+        hide_action.triggered.connect(self.hide_requested.emit)
         exit_action = QAction("Exit", menu)
         exit_action.triggered.connect(self.exit_requested.emit)
         menu.addAction(open_action)
         menu.addAction(rebuild_action)
+        menu.addAction(hide_action)
         menu.addSeparator()
         menu.addAction(exit_action)
         menu.exec(global_pos)
-

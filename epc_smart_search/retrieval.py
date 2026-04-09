@@ -6,11 +6,16 @@ import re
 from dataclasses import dataclass
 
 from epc_smart_search.config import MAX_EMBEDDING_DIM, MAX_SEARCH_RESULTS, MAX_SEMANTIC_SCAN
+from epc_smart_search.query_planner import (
+    QueryPlan,
+    build_like_fallback,
+    build_match_queries,
+    has_term_overlap,
+    plan_query,
+)
 from epc_smart_search.storage import ContractStore, unpack_vector
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{1,}")
-SECTION_QUERY_RE = re.compile(r"\b(?:section|sec\.?)\s*(\d+(?:\.\d+){0,5})\b", re.IGNORECASE)
-BARE_SECTION_RE = re.compile(r"^\s*(\d+(?:\.\d+){0,5})\s*$")
 
 
 @dataclass(slots=True)
@@ -40,6 +45,14 @@ class RankedChunk:
     page_start: int
     page_end: int
     ordinal_in_document: int
+    total_score: float
+    lexical_score: float
+    semantic_score: float
+
+
+@dataclass(slots=True)
+class SearchCandidate:
+    row: dict
     total_score: float
     lexical_score: float
     semantic_score: float
@@ -103,34 +116,51 @@ class HybridRetriever:
         document_id = self.resolve_document_id()
         if not document_id:
             return []
-        section_number = self._extract_section_number(query)
-        direct_rows = self.store.section_lookup(document_id, section_number) if section_number else []
-        lexical_rows = []
-        match_query = build_match_query(query)
-        if match_query:
-            lexical_rows = self.store.search_fts(document_id, match_query, limit=24)
-        if not lexical_rows:
-            lexical_rows = self.store.keyword_like_search(document_id, query.strip(), limit=18)
-        query_vector = self.embedder.embed(query)
-        semantic_rows = self._semantic_candidates(document_id, query_vector)
+        plan = plan_query(query)
+        combined: dict[str, SearchCandidate] = {}
 
-        combined: dict[str, RankedChunk] = {}
-        for row in direct_rows:
-            ranked = self._rank_row(row, lexical_score=1.0, semantic_score=0.85, bonus=0.35)
-            combined[ranked.chunk_id] = ranked
-        for row in lexical_rows:
-            lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
-            semantic_score = cosine_similarity(query_vector, self._row_vector(row))
-            ranked = self._rank_row(row, lexical_score=lexical_score, semantic_score=semantic_score)
-            existing = combined.get(ranked.chunk_id)
-            if existing is None or ranked.total_score > existing.total_score:
-                combined[ranked.chunk_id] = ranked
-        for row, semantic_score in semantic_rows:
-            ranked = self._rank_row(row, lexical_score=0.0, semantic_score=semantic_score)
-            existing = combined.get(ranked.chunk_id)
-            if existing is None or ranked.total_score > existing.total_score:
-                combined[ranked.chunk_id] = ranked
-        return sorted(combined.values(), key=lambda item: item.total_score, reverse=True)[:limit]
+        if plan.section_number:
+            for row in self.store.section_lookup(document_id, plan.section_number):
+                candidate = self._score_row(plan, row, lexical_score=1.0, semantic_score=0.85, bonus=0.9)
+                combined[str(row["chunk_id"])] = candidate
+
+        for match_query in build_match_queries(plan):
+            for row in self.store.search_chunk_feature_fts(document_id, match_query, limit=24):
+                lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
+                semantic_score = self._semantic_for_row(query, row)
+                candidate = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
+                self._merge_candidate(combined, candidate)
+
+        if not combined:
+            fallback_query = build_like_fallback(plan)
+            for row in self.store.keyword_like_search(document_id, fallback_query, limit=18):
+                lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
+                semantic_score = self._semantic_for_row(query, row)
+                candidate = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
+                self._merge_candidate(combined, candidate)
+
+        if not combined:
+            query_vector = self.embedder.embed(query)
+            for row, semantic_score in self._semantic_candidates(document_id, query_vector):
+                candidate = self._score_row(plan, row, lexical_score=0.0, semantic_score=semantic_score)
+                self._merge_candidate(combined, candidate)
+
+        ranked = [
+            RankedChunk(
+                chunk_id=str(candidate.row["chunk_id"]),
+                section_number=candidate.row["section_number"],
+                heading=str(candidate.row["heading"]),
+                full_text=str(candidate.row["full_text"]),
+                page_start=int(candidate.row["page_start"]),
+                page_end=int(candidate.row["page_end"]),
+                ordinal_in_document=int(candidate.row["ordinal_in_document"]),
+                total_score=candidate.total_score,
+                lexical_score=candidate.lexical_score,
+                semantic_score=candidate.semantic_score,
+            )
+            for candidate in sorted(combined.values(), key=lambda item: item.total_score, reverse=True)[:limit]
+        ]
+        return ranked
 
     def expand_with_context(self, ranked: list[RankedChunk]) -> list[Citation]:
         document_id = self.resolve_document_id()
@@ -138,26 +168,32 @@ class HybridRetriever:
             return []
         chosen_ids: set[str] = set()
         citations: list[Citation] = []
-        for item in ranked[:3]:
-            for row in self.store.fetch_context_neighbors(document_id, item.ordinal_in_document):
-                if row["chunk_id"] in chosen_ids:
-                    continue
-                heading = self._compact_heading(str(row["heading"]))
-                chosen_ids.add(str(row["chunk_id"]))
-                citations.append(
-                    Citation(
-                        chunk_id=str(row["chunk_id"]),
-                        section_number=row["section_number"],
-                        heading=heading,
-                        attachment=self._attachment_label(str(row["chunk_id"])),
-                        page_start=int(row["page_start"]),
-                        page_end=int(row["page_end"]),
-                        quote=self._short_quote(str(row["full_text"])),
-                    )
+        primary = ranked[0]
+        candidate_rows = list(self.store.fetch_context_neighbors(document_id, primary.ordinal_in_document))
+        primary_row = self.store.fetch_chunk(primary.chunk_id)
+        parent = self.store.fetch_parent(primary_row["parent_chunk_id"]) if primary_row is not None else None
+        if parent is not None:
+            candidate_rows.insert(0, parent)
+        candidate_rows.extend(self.store.fetch_chunks_on_pages(document_id, primary.page_start, primary.page_end, limit=4))
+        for row in candidate_rows:
+            if row["chunk_id"] in chosen_ids:
+                continue
+            heading = self._compact_heading(str(row["heading"]))
+            chosen_ids.add(str(row["chunk_id"]))
+            citations.append(
+                Citation(
+                    chunk_id=str(row["chunk_id"]),
+                    section_number=row["section_number"],
+                    heading=heading,
+                    attachment=self._attachment_label(str(row["chunk_id"])),
+                    page_start=int(row["page_start"]),
+                    page_end=int(row["page_end"]),
+                    quote=self._short_quote(str(row["full_text"])),
                 )
+            )
         return citations[:6]
 
-    def build_prompt_context(self, citations: list[Citation]) -> str:
+    def build_prompt_context(self, citations: list[Citation], page_context: list[str] | None = None) -> str:
         blocks: list[str] = []
         for index, citation in enumerate(citations, start=1):
             label = citation.section_number or "Unnumbered clause"
@@ -167,7 +203,21 @@ class HybridRetriever:
                 f"Pages: {citation.page_start}-{citation.page_end}\n"
                 f"Excerpt: {citation.quote}"
             )
+        if page_context:
+            blocks.append("Page context:\n" + "\n\n".join(page_context))
         return "\n\n".join(blocks)
+
+    def build_evidence_pack(self, question: str, ranked: list[RankedChunk], citations: list[Citation]) -> str:
+        document_id = self.resolve_document_id()
+        if not document_id or not ranked:
+            return self.build_prompt_context(citations)
+        primary = ranked[0]
+        pages = self.store.fetch_page_window(document_id, primary.page_start, primary.page_end, padding=0, limit=2)
+        page_blocks = [
+            f"Page {int(row['page_num'])}: {self._short_quote(str(row['page_text']), limit=500)}"
+            for row in pages
+        ]
+        return self.build_prompt_context(citations, page_blocks)
 
     def find_exact_page_hits(self, query: str, limit: int = 8) -> list[ExactPageHit]:
         document_id = self.resolve_document_id()
@@ -209,11 +259,6 @@ class HybridRetriever:
     def _row_vector(row: dict) -> list[float]:
         blob = row["vector_blob"] if "vector_blob" in row.keys() else None
         return unpack_vector(blob) if blob else []
-
-    @staticmethod
-    def _extract_section_number(query: str) -> str | None:
-        match = SECTION_QUERY_RE.search(query) or BARE_SECTION_RE.match(query.strip())
-        return match.group(1) if match else None
 
     @staticmethod
     def _short_quote(text: str, limit: int = 340) -> str:
@@ -279,21 +324,93 @@ class HybridRetriever:
             return f"Appendix {section_number.upper()}"
         return heading
 
-    def _rank_row(self, row: dict, *, lexical_score: float, semantic_score: float, bonus: float = 0.0) -> RankedChunk:
-        heading_bonus = 0.1 if row["heading"] else 0.0
-        total_score = lexical_score * 0.65 + semantic_score * 0.35 + bonus + heading_bonus - self._toc_penalty(row)
-        return RankedChunk(
-            chunk_id=str(row["chunk_id"]),
-            section_number=row["section_number"],
-            heading=str(row["heading"]),
-            full_text=str(row["full_text"]),
-            page_start=int(row["page_start"]),
-            page_end=int(row["page_end"]),
-            ordinal_in_document=int(row["ordinal_in_document"]),
-            total_score=total_score,
+    def _semantic_for_row(self, query: str, row: dict) -> float:
+        vector = self._row_vector(row)
+        if vector:
+            return cosine_similarity(self.embedder.embed(query), vector)
+        return 0.0
+
+    @staticmethod
+    def _merge_candidate(combined: dict[str, SearchCandidate], candidate: SearchCandidate) -> None:
+        chunk_id = str(candidate.row["chunk_id"])
+        existing = combined.get(chunk_id)
+        if existing is None or candidate.total_score > existing.total_score:
+            combined[chunk_id] = candidate
+
+    def _score_row(
+        self,
+        plan: QueryPlan,
+        row: dict,
+        *,
+        lexical_score: float,
+        semantic_score: float,
+        bonus: float = 0.0,
+    ) -> SearchCandidate:
+        heading = str(row["heading"])
+        parent_heading = str(row["parent_heading"] or "")
+        full_text = str(row["full_text"])
+        actor_tags = str(row["actor_tags"] or "")
+        action_tags = str(row["action_tags"] or "")
+        topic_tags = str(row["topic_tags"] or "")
+        clause_type = str(row["clause_type"] or row["chunk_type"])
+        combined_text = " ".join([heading, parent_heading, full_text, actor_tags, action_tags, topic_tags])
+
+        score = lexical_score * 0.55 + semantic_score * 0.15 + bonus
+        if row["section_number"] and row["section_number"] == plan.section_number:
+            score += 1.2
+        if has_term_overlap(heading, plan.topic_terms + plan.action_terms):
+            score += 0.8
+        if has_term_overlap(parent_heading, plan.topic_terms):
+            score += 0.4
+        if has_term_overlap(actor_tags, plan.actor_terms):
+            score += 0.75
+        if has_term_overlap(action_tags, plan.action_terms):
+            score += 0.65
+        if has_term_overlap(topic_tags, plan.topic_terms):
+            score += 0.8
+        if has_term_overlap(combined_text, plan.expansion_terms):
+            score += 0.9
+        score += 0.12 * self._term_hit_count(combined_text, plan.actor_terms + plan.action_terms + plan.topic_terms + plan.expansion_terms)
+        if plan.intent == "definition" and clause_type == "definition":
+            score += 1.0
+        if plan.intent == "responsibility" and re.search(r"\b(shall|must|responsible|required)\b", full_text, re.IGNORECASE):
+            score += 0.55
+            if ("permit" in plan.action_terms or "permitting" in plan.topic_terms) and not has_term_overlap(
+                combined_text,
+                ("permit", "permits", "permitting", "approval", "approvals"),
+            ):
+                score -= 0.8
+        if plan.intent == "payment_liability" and re.search(r"\b(pay|payment|cost|compensation|damages)\b", full_text, re.IGNORECASE):
+            score += 0.5
+            if plan.expansion_terms and not has_term_overlap(combined_text, plan.expansion_terms):
+                score -= 0.45
+            if "late" in plan.normalized_query and not has_term_overlap(
+                combined_text,
+                ("late", "delay", "completion", "liquidated damages", "substantial completion"),
+            ):
+                score -= 0.75
+        if plan.intent == "termination" and re.search(r"\b(terminate|termination|convenience|default)\b", full_text, re.IGNORECASE):
+            score += 0.5
+            if "owner" in plan.actor_terms and not has_term_overlap(combined_text, ("owner",)):
+                score -= 0.4
+            if "convenience" in plan.normalized_query and not has_term_overlap(combined_text, ("convenience",)):
+                score -= 0.55
+        if plan.intent == "delay_schedule" and re.search(r"\b(delay|weather|completion|schedule|liquidated)\b", full_text, re.IGNORECASE):
+            score += 0.5
+            if "weather" in plan.normalized_query and not has_term_overlap(combined_text, ("weather",)):
+                score -= 0.6
+        score -= self._toc_penalty(row)
+        return SearchCandidate(
+            row=row,
+            total_score=score,
             lexical_score=lexical_score,
             semantic_score=semantic_score,
         )
+
+    @staticmethod
+    def _term_hit_count(text: str, terms: tuple[str, ...]) -> int:
+        normalized = text.lower()
+        return sum(1 for term in terms if term and term.lower() in normalized)
 
     @staticmethod
     def _toc_penalty(row: dict) -> float:

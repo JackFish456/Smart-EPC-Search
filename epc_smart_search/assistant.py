@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import subprocess
 import time
 from dataclasses import dataclass
@@ -9,9 +10,9 @@ import re
 
 import requests
 
-from epc_smart_search.app_paths import CONTRACT_PATH, DB_PATH, GEMMA_TEST_PYTHON, WORKSPACE_ROOT
-from epc_smart_search.config import GEMMA_SERVICE_HOST, GEMMA_SERVICE_PORT
-from epc_smart_search.indexer import build_index
+from epc_smart_search.app_paths import CONTRACT_PATH, DB_PATH, GEMMA_TEST_PYTHON, WORKSPACE_ROOT, seed_preloaded_db
+from epc_smart_search.config import GEMMA_SERVICE_HOST, GEMMA_SERVICE_PORT, SEARCH_SCHEMA_VERSION
+from epc_smart_search.indexer import build_index, refresh_query_index
 from epc_smart_search.retrieval import Citation, ExactPageHit, HashingEmbedder, HybridRetriever
 from epc_smart_search.storage import ContractStore
 
@@ -84,15 +85,27 @@ class GemmaServiceClient:
 
 class ContractAssistant:
     def __init__(self, db_path: str | Path = DB_PATH) -> None:
+        seed_preloaded_db()
         self.store = ContractStore(db_path)
         self.retriever = HybridRetriever(self.store, HashingEmbedder())
         self.gemma = GemmaServiceClient()
+        self._expected_contract_hash = self._sha256(CONTRACT_PATH) if CONTRACT_PATH.exists() else ""
+        self._ensure_query_index_ready()
 
     def is_index_ready(self) -> bool:
-        return self.store.get_document() is not None and self.store.get_stats()["chunk_count"] > 0
+        document = self.store.get_document()
+        if document is None:
+            return False
+        if str(document["sha256"]) != self._expected_contract_hash:
+            return False
+        if self.store.get_metadata("search_schema_version") != str(SEARCH_SCHEMA_VERSION):
+            return False
+        return self.store.get_stats()["chunk_count"] > 0 and self.store.get_feature_count(str(document["document_id"])) > 0
 
     def build_index(self, progress_callback=None) -> dict[str, int | str]:
-        return build_index(pdf_path=CONTRACT_PATH, db_path=self.store.db_path, progress_callback=progress_callback)
+        result = build_index(pdf_path=CONTRACT_PATH, db_path=self.store.db_path, progress_callback=progress_callback)
+        self._ensure_query_index_ready(progress_callback=progress_callback)
+        return result
 
     def ask(self, question: str) -> AssistantAnswer:
         exact_hits = self.retriever.find_exact_page_hits(question)
@@ -108,7 +121,7 @@ class ContractAssistant:
         best = ranked[0]
         if best.total_score < 0.16 and best.lexical_score < 0.05:
             return AssistantAnswer("I can't verify that from the contract.", citations[:3], True)
-        prompt_context = self.retriever.build_prompt_context(citations[:4])
+        prompt_context = self.retriever.build_evidence_pack(question, ranked, citations[:4])
         try:
             answer_text = self.gemma.ask(question, prompt_context)
         except Exception:
@@ -183,3 +196,20 @@ class ContractAssistant:
         start = max(0, idx - 120)
         excerpt = compact[start:start + limit]
         return excerpt if len(excerpt) < len(compact) else compact[:limit]
+
+    def _ensure_query_index_ready(self, progress_callback=None) -> None:
+        document = self.store.get_document()
+        if document is None:
+            return
+        document_id = str(document["document_id"])
+        if self.store.get_feature_count(document_id) > 0 and self.store.get_metadata("search_schema_version") == str(SEARCH_SCHEMA_VERSION):
+            return
+        refresh_query_index(self.store, document_id, progress_callback=progress_callback)
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()

@@ -19,6 +19,9 @@ build/
 .epc_smart_search/*.db
 .epc_smart_search/*.db-journal
 
+# Prebuilt index exceeds GitHub single-file limit; build locally or distribute out-of-band
+assets/contract_store.prebuilt.db
+
 # Contract PDF — supply your own copy in the project root; not committed
 /Clean Contract.pdf
 

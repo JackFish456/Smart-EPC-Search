@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 
@@ -30,6 +31,15 @@ def get_app_data_root() -> Path:
 
 APP_DATA_ROOT = get_app_data_root()
 DB_PATH = APP_DATA_ROOT / "contract_store.db"
+PRELOADED_DB_PATH = ASSETS_DIR / "contract_store.prebuilt.db"
 LOG_PATH = APP_DATA_ROOT / "epc_smart_search.log"
 OCR_CACHE_DIR = APP_DATA_ROOT / "ocr_cache"
 OCR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def seed_preloaded_db() -> bool:
+    if DB_PATH.exists() or not PRELOADED_DB_PATH.exists():
+        return False
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(PRELOADED_DB_PATH, DB_PATH)
+    return True

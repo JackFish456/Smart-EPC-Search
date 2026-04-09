@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import sys
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QAction, QIcon
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from epc_smart_search.app_paths import ASSETS_DIR
 from epc_smart_search.assistant import ContractAssistant
@@ -12,18 +13,64 @@ from epc_smart_search.ui.chat_dialog import ContractChatDialog
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     assistant = ContractAssistant()
     chat_dialog = ContractChatDialog(assistant)
-    avatar = AvatarWindow(ASSETS_DIR / "kiewey.png")
+    avatar_path = ASSETS_DIR / "kiewey.png"
+    avatar = AvatarWindow(avatar_path)
     avatar.open_chat.connect(chat_dialog.show)
     avatar.rebuild_index.connect(chat_dialog._rebuild_index)  # noqa: SLF001
+    avatar.hide_requested.connect(avatar.hide)
     avatar.exit_requested.connect(app.quit)
-    avatar.move(60, 60)
+    avatar.place_bottom_right()
     avatar.show()
     chat_dialog.show()
+
+    tray_icon: QSystemTrayIcon | None = None
+    if QSystemTrayIcon.isSystemTrayAvailable():
+        tray_icon = QSystemTrayIcon(QIcon(str(avatar_path)), app)
+        tray_icon.setToolTip("Kiewey - EPC Smart Search")
+        tray_menu = QMenu()
+        open_chat_action = QAction("Open Contract Chat", tray_menu)
+        open_chat_action.triggered.connect(chat_dialog.show)
+        show_avatar_action = QAction("Show Kiewey", tray_menu)
+        show_avatar_action.triggered.connect(lambda: _show_avatar(avatar))
+        hide_avatar_action = QAction("Hide Kiewey", tray_menu)
+        hide_avatar_action.triggered.connect(avatar.hide)
+        rebuild_action = QAction("Rebuild Contract Index", tray_menu)
+        rebuild_action.triggered.connect(chat_dialog._rebuild_index)  # noqa: SLF001
+        exit_action = QAction("Exit", tray_menu)
+        exit_action.triggered.connect(app.quit)
+        tray_menu.addAction(open_chat_action)
+        tray_menu.addAction(show_avatar_action)
+        tray_menu.addAction(hide_avatar_action)
+        tray_menu.addAction(rebuild_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(exit_action)
+        tray_icon.setContextMenu(tray_menu)
+        tray_icon.activated.connect(lambda reason: _handle_tray_activation(reason, avatar, chat_dialog))
+        tray_icon.show()
+
     exit_code = app.exec()
+    if tray_icon is not None:
+        tray_icon.hide()
     assistant.gemma.stop()
     return exit_code
+
+
+def _show_avatar(avatar: AvatarWindow) -> None:
+    avatar.place_bottom_right()
+    avatar.show()
+    avatar.raise_()
+    avatar.activateWindow()
+
+
+def _handle_tray_activation(reason: QSystemTrayIcon.ActivationReason, avatar: AvatarWindow, chat_dialog: ContractChatDialog) -> None:
+    if reason in {QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick}:
+        _show_avatar(avatar)
+        chat_dialog.show()
+        chat_dialog.raise_()
+        chat_dialog.activateWindow()
 
 
 if __name__ == "__main__":

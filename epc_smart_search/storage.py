@@ -4,13 +4,18 @@ import sqlite3
 from array import array
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable
-
 from epc_smart_search.chunking import ChunkRecord
+from epc_smart_search.config import SEARCH_SCHEMA_VERSION
 from epc_smart_search.ocr_support import PageText
+from epc_smart_search.search_features import ChunkFeatures
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS app_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS documents (
     document_id TEXT PRIMARY KEY,
@@ -101,12 +106,48 @@ CREATE TABLE IF NOT EXISTS contract_pages (
 CREATE INDEX IF NOT EXISTS idx_contract_pages_doc_page
 ON contract_pages(document_id, page_num);
 
+CREATE TABLE IF NOT EXISTS chunk_search_features (
+    feature_rowid INTEGER PRIMARY KEY,
+    chunk_id TEXT NOT NULL UNIQUE,
+    document_id TEXT NOT NULL,
+    section_number TEXT,
+    heading TEXT NOT NULL DEFAULT '',
+    parent_heading TEXT NOT NULL DEFAULT '',
+    search_text TEXT NOT NULL DEFAULT '',
+    normalized_text TEXT NOT NULL DEFAULT '',
+    clause_type TEXT NOT NULL DEFAULT '',
+    actor_tags TEXT NOT NULL DEFAULT '',
+    action_tags TEXT NOT NULL DEFAULT '',
+    topic_tags TEXT NOT NULL DEFAULT '',
+    noise_flags TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (chunk_id) REFERENCES contract_chunks(chunk_id),
+    FOREIGN KEY (document_id) REFERENCES documents(document_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunk_search_features_doc
+ON chunk_search_features(document_id, chunk_id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS contract_pages_fts USING fts5(
     page_text,
     document_id UNINDEXED,
     page_num UNINDEXED,
     content='contract_pages',
     content_rowid='page_rowid',
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunk_search_fts USING fts5(
+    section_number,
+    heading,
+    parent_heading,
+    search_text,
+    actor_tags,
+    action_tags,
+    topic_tags,
+    chunk_id UNINDEXED,
+    document_id UNINDEXED,
+    content='chunk_search_features',
+    content_rowid='feature_rowid',
     tokenize='unicode61 remove_diacritics 2'
 );
 
@@ -126,6 +167,44 @@ CREATE TRIGGER IF NOT EXISTS contract_pages_au AFTER UPDATE ON contract_pages BE
 
   INSERT INTO contract_pages_fts(rowid, page_text, document_id, page_num)
   VALUES (new.page_rowid, new.page_text, new.document_id, new.page_num);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunk_search_features_ai AFTER INSERT ON chunk_search_features BEGIN
+  INSERT INTO chunk_search_fts(
+    rowid, section_number, heading, parent_heading, search_text,
+    actor_tags, action_tags, topic_tags, chunk_id, document_id
+  ) VALUES (
+    new.feature_rowid, new.section_number, new.heading, new.parent_heading, new.search_text,
+    new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
+  );
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunk_search_features_ad AFTER DELETE ON chunk_search_features BEGIN
+  INSERT INTO chunk_search_fts(
+    chunk_search_fts, rowid, section_number, heading, parent_heading, search_text,
+    actor_tags, action_tags, topic_tags, chunk_id, document_id
+  ) VALUES (
+    'delete', old.feature_rowid, old.section_number, old.heading, old.parent_heading, old.search_text,
+    old.actor_tags, old.action_tags, old.topic_tags, old.chunk_id, old.document_id
+  );
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunk_search_features_au AFTER UPDATE ON chunk_search_features BEGIN
+  INSERT INTO chunk_search_fts(
+    chunk_search_fts, rowid, section_number, heading, parent_heading, search_text,
+    actor_tags, action_tags, topic_tags, chunk_id, document_id
+  ) VALUES (
+    'delete', old.feature_rowid, old.section_number, old.heading, old.parent_heading, old.search_text,
+    old.actor_tags, old.action_tags, old.topic_tags, old.chunk_id, old.document_id
+  );
+
+  INSERT INTO chunk_search_fts(
+    rowid, section_number, heading, parent_heading, search_text,
+    actor_tags, action_tags, topic_tags, chunk_id, document_id
+  ) VALUES (
+    new.feature_rowid, new.section_number, new.heading, new.parent_heading, new.search_text,
+    new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
+  );
 END;
 """
 
@@ -164,6 +243,14 @@ class ContractStore:
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO app_metadata (key, value)
+                VALUES ('search_schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(SEARCH_SCHEMA_VERSION),),
+            )
             connection.commit()
 
     def replace_document(
@@ -177,6 +264,7 @@ class ContractStore:
         page_count: int,
         chunks: list[ChunkRecord],
         pages: list[PageText],
+        features: list[ChunkFeatures],
         embeddings: dict[str, bytes],
         model_name: str,
         dimension: int,
@@ -186,6 +274,7 @@ class ContractStore:
                 "DELETE FROM chunk_embeddings WHERE chunk_id IN (SELECT chunk_id FROM contract_chunks WHERE document_id = ?)",
                 (document_id,),
             )
+            connection.execute("DELETE FROM chunk_search_features WHERE document_id = ?", (document_id,))
             connection.execute("DELETE FROM contract_chunks WHERE document_id = ?", (document_id,))
             connection.execute("DELETE FROM contract_pages WHERE document_id = ?", (document_id,))
             connection.execute(
@@ -223,6 +312,7 @@ class ContractStore:
                     for page in pages
                 ],
             )
+            self._insert_features(connection, features)
             connection.executemany(
                 """
                 INSERT INTO chunk_embeddings (chunk_id, model_name, vector_blob, dimension)
@@ -230,7 +320,51 @@ class ContractStore:
                 """,
                 [(chunk_id, model_name, blob, dimension) for chunk_id, blob in embeddings.items()],
             )
+            connection.execute(
+                """
+                INSERT INTO app_metadata (key, value)
+                VALUES ('search_schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(SEARCH_SCHEMA_VERSION),),
+            )
             connection.commit()
+
+    @staticmethod
+    def _insert_features(connection: sqlite3.Connection, features: list[ChunkFeatures]) -> None:
+        connection.executemany(
+            """
+            INSERT INTO chunk_search_features (
+                chunk_id, document_id, section_number, heading, parent_heading,
+                search_text, normalized_text, clause_type, actor_tags,
+                action_tags, topic_tags, noise_flags
+            ) VALUES (
+                :chunk_id, :document_id, :section_number, :heading, :parent_heading,
+                :search_text, :normalized_text, :clause_type, :actor_tags,
+                :action_tags, :topic_tags, :noise_flags
+            )
+            """,
+            [asdict(feature) for feature in features],
+        )
+
+    def replace_search_features(self, document_id: str, features: list[ChunkFeatures]) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM chunk_search_features WHERE document_id = ?", (document_id,))
+            self._insert_features(connection, features)
+            connection.execute(
+                """
+                INSERT INTO app_metadata (key, value)
+                VALUES ('search_schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(SEARCH_SCHEMA_VERSION),),
+            )
+            connection.commit()
+
+    def get_metadata(self, key: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT value FROM app_metadata WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row else None
 
     def get_document(self) -> sqlite3.Row | None:
         with self._connect() as connection:
@@ -248,14 +382,30 @@ class ContractStore:
             "document_count": int(row["document_count"]) if row else 0,
         }
 
+    def get_feature_count(self, document_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS feature_count FROM chunk_search_features WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+        return int(row["feature_count"]) if row else 0
+
     def section_lookup(self, document_id: str, section_number: str) -> list[sqlite3.Row]:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT *
-                FROM contract_chunks
-                WHERE document_id = ? AND section_number = ?
-                ORDER BY ordinal_in_document
+                SELECT
+                    c.*,
+                    f.parent_heading,
+                    f.clause_type,
+                    f.actor_tags,
+                    f.action_tags,
+                    f.topic_tags,
+                    f.noise_flags
+                FROM contract_chunks c
+                LEFT JOIN chunk_search_features f ON f.chunk_id = c.chunk_id
+                WHERE c.document_id = ? AND c.section_number = ?
+                ORDER BY c.ordinal_in_document
                 """,
                 (document_id, section_number),
             ).fetchall()
@@ -266,11 +416,44 @@ class ContractStore:
                 """
                 SELECT
                     c.*,
+                    f.parent_heading,
+                    f.clause_type,
+                    f.actor_tags,
+                    f.action_tags,
+                    f.topic_tags,
+                    f.noise_flags,
                     bm25(contract_chunks_fts, 5.0, 3.0, 1.0) AS bm25_score,
                     snippet(contract_chunks_fts, 2, '[', ']', '...', 18) AS hit_snippet
                 FROM contract_chunks_fts
                 JOIN contract_chunks c ON c.chunk_rowid = contract_chunks_fts.rowid
+                LEFT JOIN chunk_search_features f ON f.chunk_id = c.chunk_id
                 WHERE c.document_id = ? AND contract_chunks_fts MATCH ?
+                ORDER BY bm25_score
+                LIMIT ?
+                """,
+                (document_id, match_query, limit),
+            ).fetchall()
+
+    def search_chunk_feature_fts(self, document_id: str, match_query: str, limit: int = 24) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT
+                    c.*,
+                    f.parent_heading,
+                    f.clause_type,
+                    f.actor_tags,
+                    f.action_tags,
+                    f.topic_tags,
+                    f.noise_flags,
+                    f.search_text,
+                    f.normalized_text,
+                    bm25(chunk_search_fts, 10.0, 7.0, 4.0, 1.2, 4.0, 4.0, 4.0) AS bm25_score,
+                    snippet(chunk_search_fts, 3, '[', ']', '...', 18) AS hit_snippet
+                FROM chunk_search_fts
+                JOIN chunk_search_features f ON f.feature_rowid = chunk_search_fts.rowid
+                JOIN contract_chunks c ON c.chunk_id = f.chunk_id
+                WHERE f.document_id = ? AND chunk_search_fts MATCH ?
                 ORDER BY bm25_score
                 LIMIT ?
                 """,
@@ -282,25 +465,46 @@ class ContractStore:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT *, 9999.0 AS bm25_score, substr(full_text, 1, 240) AS hit_snippet
-                FROM contract_chunks
-                WHERE document_id = ?
-                  AND (heading LIKE ? OR full_text LIKE ? OR section_number LIKE ?)
-                ORDER BY ordinal_in_document
+                SELECT
+                    c.*,
+                    f.parent_heading,
+                    f.clause_type,
+                    f.actor_tags,
+                    f.action_tags,
+                    f.topic_tags,
+                    f.noise_flags,
+                    9999.0 AS bm25_score,
+                    substr(c.full_text, 1, 240) AS hit_snippet
+                FROM contract_chunks c
+                LEFT JOIN chunk_search_features f ON f.chunk_id = c.chunk_id
+                WHERE c.document_id = ?
+                  AND (
+                    c.heading LIKE ? OR c.full_text LIKE ? OR c.section_number LIKE ?
+                    OR f.parent_heading LIKE ? OR f.search_text LIKE ? OR f.topic_tags LIKE ?
+                  )
+                ORDER BY c.ordinal_in_document
                 LIMIT ?
                 """,
-                (document_id, like, like, like, limit),
+                (document_id, like, like, like, like, like, like, limit),
             ).fetchall()
 
     def fetch_context_neighbors(self, document_id: str, ordinal: int) -> list[sqlite3.Row]:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT *
-                FROM contract_chunks
-                WHERE document_id = ?
-                  AND ordinal_in_document BETWEEN ? AND ?
-                ORDER BY ordinal_in_document
+                SELECT
+                    c.*,
+                    f.parent_heading,
+                    f.clause_type,
+                    f.actor_tags,
+                    f.action_tags,
+                    f.topic_tags,
+                    f.noise_flags
+                FROM contract_chunks c
+                LEFT JOIN chunk_search_features f ON f.chunk_id = c.chunk_id
+                WHERE c.document_id = ?
+                  AND c.ordinal_in_document BETWEEN ? AND ?
+                ORDER BY c.ordinal_in_document
                 """,
                 (document_id, ordinal - 1, ordinal + 1),
             ).fetchall()
@@ -310,7 +514,19 @@ class ContractStore:
             return None
         with self._connect() as connection:
             return connection.execute(
-                "SELECT * FROM contract_chunks WHERE chunk_id = ?",
+                """
+                SELECT
+                    c.*,
+                    f.parent_heading,
+                    f.clause_type,
+                    f.actor_tags,
+                    f.action_tags,
+                    f.topic_tags,
+                    f.noise_flags
+                FROM contract_chunks c
+                LEFT JOIN chunk_search_features f ON f.chunk_id = c.chunk_id
+                WHERE c.chunk_id = ?
+                """,
                 (parent_chunk_id,),
             ).fetchone()
 
@@ -319,9 +535,86 @@ class ContractStore:
             return None
         with self._connect() as connection:
             return connection.execute(
-                "SELECT * FROM contract_chunks WHERE chunk_id = ?",
+                """
+                SELECT
+                    c.*,
+                    f.parent_heading,
+                    f.clause_type,
+                    f.actor_tags,
+                    f.action_tags,
+                    f.topic_tags,
+                    f.noise_flags
+                FROM contract_chunks c
+                LEFT JOIN chunk_search_features f ON f.chunk_id = c.chunk_id
+                WHERE c.chunk_id = ?
+                """,
                 (chunk_id,),
             ).fetchone()
+
+    def fetch_document_chunks(self, document_id: str) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT *
+                FROM contract_chunks
+                WHERE document_id = ?
+                ORDER BY ordinal_in_document
+                """,
+                (document_id,),
+            ).fetchall()
+
+    def fetch_page_window(
+        self,
+        document_id: str,
+        page_start: int,
+        page_end: int,
+        *,
+        padding: int = 0,
+        limit: int = 4,
+    ) -> list[sqlite3.Row]:
+        lower = max(1, page_start - padding)
+        upper = max(page_end, page_end + padding)
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT page_num, page_text, ocr_used
+                FROM contract_pages
+                WHERE document_id = ?
+                  AND page_num BETWEEN ? AND ?
+                ORDER BY page_num
+                LIMIT ?
+                """,
+                (document_id, lower, upper, limit),
+            ).fetchall()
+
+    def fetch_chunks_on_pages(
+        self,
+        document_id: str,
+        page_start: int,
+        page_end: int,
+        *,
+        limit: int = 6,
+    ) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT
+                    c.*,
+                    f.parent_heading,
+                    f.clause_type,
+                    f.actor_tags,
+                    f.action_tags,
+                    f.topic_tags,
+                    f.noise_flags
+                FROM contract_chunks c
+                LEFT JOIN chunk_search_features f ON f.chunk_id = c.chunk_id
+                WHERE c.document_id = ?
+                  AND NOT (c.page_end < ? OR c.page_start > ?)
+                ORDER BY c.ordinal_in_document
+                LIMIT ?
+                """,
+                (document_id, page_start, page_end, limit),
+            ).fetchall()
 
     def iter_embeddings(self, document_id: str) -> list[sqlite3.Row]:
         with self._connect() as connection:
@@ -341,6 +634,7 @@ class ContractStore:
         with self._connect() as connection:
             connection.execute("INSERT INTO contract_chunks_fts(contract_chunks_fts) VALUES('rebuild')")
             connection.execute("INSERT INTO contract_pages_fts(contract_pages_fts) VALUES('rebuild')")
+            connection.execute("INSERT INTO chunk_search_fts(chunk_search_fts) VALUES('rebuild')")
             connection.commit()
 
     def search_pages_fts(self, document_id: str, match_query: str, limit: int = 12) -> list[sqlite3.Row]:
