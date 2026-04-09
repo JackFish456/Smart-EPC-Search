@@ -1,12 +1,15 @@
 import inspect
 import uuid
 import html
+import tempfile
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 import epc_smart_search.rebuild_contract as rebuild_contract_module
 import epc_smart_search.ui.avatar_window as avatar_window_module
+import epc_smart_search.ui.chat_dialog as chat_dialog_module
 import epc_smart_search_app
 from epc_smart_search.assistant import INTERNAL_REBUILD_ERROR
 from epc_smart_search.assistant import ContractAssistant
@@ -110,6 +113,7 @@ def test_chat_dialog_clears_history_when_closed() -> None:
     assert dialog._content_layout.count() == 1  # noqa: SLF001
     assert dialog._message_count == 0  # noqa: SLF001
     assert dialog._context_low_locked is False  # noqa: SLF001
+    assert dialog._deep_think_button.isChecked() is False  # noqa: SLF001
     first_label = dialog._content_layout.itemAt(0).widget()  # noqa: SLF001
     assert html.escape(GREETING.split(".")[0]) in first_label.text()
 
@@ -129,6 +133,59 @@ def test_chat_dialog_formats_summary_markdown_like_content() -> None:
     assert "<ol" in rendered
     assert "font-weight:700;'>Contractor" in rendered
     assert "<code" in rendered
+    assert "## Overview" not in rendered
+    assert "- **Contractor**" not in rendered
+
+
+def test_chat_dialog_deep_think_toggle_is_session_local(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication(["test", "-platform", "offscreen"])
+    captured: dict[str, object] = {}
+
+    class FakeSignal:
+        def connect(self, callback) -> None:
+            return None
+
+    class FakeWorker:
+        def __init__(self, assistant, question: str, request_token: int, history=None, *, deep_think: bool = False) -> None:
+            captured["question"] = question
+            captured["request_token"] = request_token
+            captured["deep_think"] = deep_think
+            self.finished = FakeSignal()
+            self.failed = FakeSignal()
+
+        def deleteLater(self) -> None:
+            return None
+
+        def start(self) -> None:
+            captured["started"] = True
+
+    class FakeAssistant:
+        def is_index_ready(self) -> bool:
+            return True
+
+        def get_index_status(self) -> IndexValidationResult:
+            return IndexValidationResult(True, None, "doc1")
+
+    monkeypatch.setattr(chat_dialog_module, "AskWorker", FakeWorker)
+
+    dialog = ContractChatDialog(FakeAssistant())
+
+    assert dialog._deep_think_button.isChecked() is False  # noqa: SLF001
+
+    dialog._input.setText("What does the contract say about fuel gas supply?")  # noqa: SLF001
+    dialog._deep_think_button.setChecked(True)  # noqa: SLF001
+    dialog._on_send()  # noqa: SLF001
+
+    assert app is not None
+    assert captured["started"] is True
+    assert captured["deep_think"] is True
+    assert dialog._deep_think_button.isEnabled() is False  # noqa: SLF001
+    assert "Deep Thinking" in dialog._pending_answer_label.text()  # noqa: SLF001
+
+    dialog.close()
+    app.processEvents()
+
+    assert dialog._deep_think_button.isChecked() is False  # noqa: SLF001
 
 
 def test_customer_ui_no_longer_exposes_rebuild_entry_points() -> None:
@@ -138,9 +195,45 @@ def test_customer_ui_no_longer_exposes_rebuild_entry_points() -> None:
     assert "Rebuild Contract Index" not in inspect.getsource(epc_smart_search_app)
 
 
+def test_show_chat_dialog_restores_and_raises_existing_window() -> None:
+    class FakeDialog:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object | None]] = []
+            self._minimized = True
+            self._state = Qt.WindowState.WindowMinimized
+
+        def isMinimized(self) -> bool:
+            return self._minimized
+
+        def windowState(self):
+            return self._state
+
+        def setWindowState(self, state) -> None:
+            self.calls.append(("setWindowState", state))
+            self._state = state
+            self._minimized = False
+
+        def show(self) -> None:
+            self.calls.append(("show", None))
+
+        def raise_(self) -> None:
+            self.calls.append(("raise_", None))
+
+        def activateWindow(self) -> None:
+            self.calls.append(("activateWindow", None))
+
+    dialog = FakeDialog()
+
+    epc_smart_search_app._show_chat_dialog(dialog)  # noqa: SLF001
+
+    assert dialog.calls[0][0] == "setWindowState"
+    assert dialog.calls[1:] == [("show", None), ("raise_", None), ("activateWindow", None)]
+
+
 def test_rebuild_cli_creates_and_validates_a_fresh_database(monkeypatch) -> None:
-    pdf_path = Path(".tmp_test") / f"contract_{uuid.uuid4().hex[:8]}.pdf"
-    out_path = Path(".tmp_test") / f"contract_store_{uuid.uuid4().hex[:8]}.db"
+    temp_root = Path(tempfile.gettempdir()) / "epc_smart_search_tests" / f"runtime_lockdown_{uuid.uuid4().hex[:8]}"
+    pdf_path = temp_root / f"contract_{uuid.uuid4().hex[:8]}.pdf"
+    out_path = temp_root / f"contract_store_{uuid.uuid4().hex[:8]}.db"
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
     pdf_path.write_bytes(b"%PDF-1.4\n")
     memory_store = _seed_store(_memory_db_uri("cli"))

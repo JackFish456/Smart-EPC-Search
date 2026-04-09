@@ -4,10 +4,11 @@ import html
 import re
 
 from PySide6.QtCore import QRectF, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QPainterPath, QRegion
+from PySide6.QtGui import QPainter, QPainterPath
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
+    QGraphicsEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -29,8 +30,8 @@ CONTRACT_DATA_UNAVAILABLE_MESSAGE = (
 
 
 def _dialog_style() -> str:
-    # ChatScrollArea applies a rounded mask so viewport + scrollbar share one outline
-    # with the border (no per-subwidget radii that fight each other).
+    # RoundedRectClipEffect clips the whole scroll subtree (border + viewport + scrollbar)
+    # with one antialiased path; viewport stays transparent so only the scroll area fills.
     return """
     QDialog { background-color: #fff4cc; }
     QScrollArea#chatScroll {
@@ -39,10 +40,10 @@ def _dialog_style() -> str:
         border-radius: 6px;
     }
     QWidget#chatViewport {
-        background-color: #ffffff;
+        background-color: transparent;
     }
     QWidget#chatContent {
-        background-color: #ffffff;
+        background-color: transparent;
     }
     QLineEdit {
         background-color: #fff;
@@ -62,32 +63,29 @@ def _dialog_style() -> str:
         font-size: 13px;
     }
     QPushButton:hover { background-color: #ffeb99; }
+    QPushButton:checked { background-color: #000; color: #fff4cc; }
     QLabel { color: #000; }
     """
 
 
-class ChatScrollArea(QScrollArea):
-    """Rounded clip so the black border, chat body, and scrollbar share one continuous outline."""
+class RoundedRectClipEffect(QGraphicsEffect):
+    """Antialiased rounded clip for the entire widget subtree (one outline vs binary setMask)."""
 
-    def __init__(self, corner_radius: float = 6.0, parent: QWidget | None = None) -> None:
+    def __init__(self, radius: float = 6.0, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._corner_radius = corner_radius
+        self._radius = radius
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._apply_rounded_mask()
+    def boundingRectFor(self, source_rect: QRectF) -> QRectF:
+        return source_rect
 
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        self._apply_rounded_mask()
-
-    def _apply_rounded_mask(self) -> None:
-        w, h = self.width(), self.height()
-        if w <= 1 or h <= 1:
-            return
+    def draw(self, painter: QPainter) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         path = QPainterPath()
-        path.addRoundedRect(QRectF(0, 0, float(w), float(h)), self._corner_radius, self._corner_radius)
-        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+        path.addRoundedRect(QRectF(self.sourceBoundingRect()), self._radius, self._radius)
+        painter.setClipPath(path)
+        self.drawSource(painter)
+        painter.restore()
 
 
 class AskWorker(QThread):
@@ -100,16 +98,19 @@ class AskWorker(QThread):
         question: str,
         request_token: int,
         history: list[dict[str, str]] | None = None,
+        *,
+        deep_think: bool = False,
     ) -> None:
         super().__init__()
         self._assistant = assistant
         self._question = question
         self._request_token = request_token
         self._history = list(history or [])
+        self._deep_think = deep_think
 
     def run(self) -> None:
         try:
-            answer = self._assistant.ask(self._question, history=self._history)
+            answer = self._assistant.ask(self._question, history=self._history, deep_think=self._deep_think)
             self.finished.emit(self._request_token, answer)
         except Exception as exc:
             self.failed.emit(self._request_token, str(exc))
@@ -129,6 +130,7 @@ class ContractChatDialog(QDialog):
         self._request_token = 0
         self._active_request_token: int | None = None
         self._thinking_frame = 0
+        self._pending_thinking_label = "Thinking"
         self._thinking_timer = QTimer(self)
         self._thinking_timer.setInterval(350)
         self._thinking_timer.timeout.connect(self._advance_thinking_indicator)
@@ -144,13 +146,14 @@ class ContractChatDialog(QDialog):
         layout.addWidget(self._status)
         self._status.hide()
 
-        self._scroll = ChatScrollArea(corner_radius=6.0)
+        self._scroll = QScrollArea()
         self._scroll.setObjectName("chatScroll")
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setWidgetResizable(True)
+        self._scroll.setGraphicsEffect(RoundedRectClipEffect(6.0, self._scroll))
         viewport = self._scroll.viewport()
         viewport.setObjectName("chatViewport")
-        viewport.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        viewport.setAutoFillBackground(False)
         self._content = QWidget()
         self._content.setObjectName("chatContent")
         self._content_layout = QVBoxLayout(self._content)
@@ -166,6 +169,10 @@ class ContractChatDialog(QDialog):
         self._input.setPlaceholderText("Ask Kiewey about the EPC contract")
         self._input.returnPressed.connect(self._on_send)
         input_row.addWidget(self._input)
+
+        self._deep_think_button = QPushButton("Deep Think")
+        self._deep_think_button.setCheckable(True)
+        input_row.addWidget(self._deep_think_button)
 
         self._send_button = QPushButton("Send")
         self._send_button.clicked.connect(self._on_send)
@@ -188,12 +195,14 @@ class ContractChatDialog(QDialog):
         question = self._input.text().strip()
         if not question or not self._assistant.is_index_ready() or self._context_low_locked:
             return
+        deep_think = self._deep_think_button.isChecked()
         self._input.clear()
         self._append_message("user", question)
         self._pending_question = question
         self._pending_answer_label = self._append_message("assistant", "", count_toward_cap=False)
+        self._pending_thinking_label = "Deep Thinking" if deep_think else "Thinking"
         self._start_thinking_indicator()
-        self._set_input_enabled(False)
+        self._set_input_busy(True)
         self._request_token += 1
         self._active_request_token = self._request_token
         self._ask_worker = AskWorker(
@@ -201,6 +210,7 @@ class ContractChatDialog(QDialog):
             question,
             self._request_token,
             history=self._conversation_history[-8:],
+            deep_think=deep_think,
         )
         self._ask_worker.finished.connect(self._on_answer_ready)
         self._ask_worker.failed.connect(self._on_answer_failed)
@@ -220,7 +230,7 @@ class ContractChatDialog(QDialog):
         self._pending_question = None
         self._replace_pending_answer(answer.text)
         if not self._context_low_locked:
-            self._set_input_enabled(True)
+            self._set_input_busy(False)
 
     def _on_answer_failed(self, request_token: int, error: str) -> None:
         self._clear_finished_worker()
@@ -230,7 +240,7 @@ class ContractChatDialog(QDialog):
         self._pending_question = None
         self._replace_pending_answer(f"I hit an error while answering that question.\n\n{error}")
         if not self._context_low_locked:
-            self._set_input_enabled(True)
+            self._set_input_busy(False)
 
     def closeEvent(self, event) -> None:
         self._reset_chat_session()
@@ -274,7 +284,18 @@ class ContractChatDialog(QDialog):
 
     def _set_input_enabled(self, enabled: bool) -> None:
         self._input.setEnabled(enabled)
+        self._input.setReadOnly(False)
+        self._deep_think_button.setEnabled(enabled)
         self._send_button.setEnabled(enabled)
+        if enabled:
+            self._input.setFocus()
+
+    def _set_input_busy(self, busy: bool) -> None:
+        self._input.setEnabled(True)
+        self._input.setReadOnly(busy)
+        self._deep_think_button.setEnabled(not busy)
+        self._send_button.setEnabled(not busy)
+        self._input.setFocus()
 
     def _set_status_message(self, message: str) -> None:
         self._status.setText(message)
@@ -302,7 +323,7 @@ class ContractChatDialog(QDialog):
             dot = "." if index < dot_count else "&nbsp;"
             dots.append(f"<span style=\"font-size: 18px; font-weight: 600;\">{dot}</span>")
         self._pending_answer_label.setTextFormat(Qt.TextFormat.RichText)
-        self._pending_answer_label.setText(f"<span>Thinking</span>&nbsp;{' '.join(dots)}")
+        self._pending_answer_label.setText(f"<span>{self._pending_thinking_label}</span>&nbsp;{' '.join(dots)}")
         self._thinking_frame += 1
 
     def _enforce_message_cap(self) -> None:
@@ -322,10 +343,12 @@ class ContractChatDialog(QDialog):
         self._pending_answer_label = None
         self._active_request_token = None
         self._pending_question = None
+        self._pending_thinking_label = "Thinking"
         self._conversation_history.clear()
         self._message_count = 0
         self._context_low_locked = False
         self._input.clear()
+        self._deep_think_button.setChecked(False)
         while self._content_layout.count():
             item = self._content_layout.takeAt(0)
             widget = item.widget()

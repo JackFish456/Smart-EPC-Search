@@ -58,6 +58,33 @@ class SearchCandidate:
     semantic_score: float
 
 
+@dataclass(slots=True, frozen=True)
+class RetrievalProfile:
+    name: str
+    result_limit: int
+    fts_limit: int
+    keyword_limit: int
+    semantic_limit: int
+    use_query_expansion: bool = False
+
+
+DEFAULT_RETRIEVAL_PROFILE = RetrievalProfile(
+    name="normal",
+    result_limit=MAX_SEARCH_RESULTS,
+    fts_limit=24,
+    keyword_limit=18,
+    semantic_limit=MAX_SEMANTIC_SCAN,
+)
+DEEP_RETRIEVAL_PROFILE = RetrievalProfile(
+    name="deep",
+    result_limit=10,
+    fts_limit=40,
+    keyword_limit=30,
+    semantic_limit=36,
+    use_query_expansion=True,
+)
+
+
 class HashingEmbedder:
     def __init__(self, dimension: int = MAX_EMBEDDING_DIM) -> None:
         self.dimension = dimension
@@ -112,11 +139,18 @@ class HybridRetriever:
         document = self.store.get_document()
         return str(document["document_id"]) if document else None
 
-    def retrieve(self, query: str, *, limit: int = MAX_SEARCH_RESULTS) -> list[RankedChunk]:
+    def retrieve(
+        self,
+        query: str,
+        *,
+        limit: int | None = None,
+        profile: str = "normal",
+    ) -> list[RankedChunk]:
         document_id = self.resolve_document_id()
         if not document_id:
             return []
         plan = plan_query(query)
+        active_profile = self._resolve_profile(profile, limit)
         semantic_query = plan.content_query or query
         combined: dict[str, SearchCandidate] = {}
 
@@ -125,24 +159,28 @@ class HybridRetriever:
                 candidate = self._score_row(plan, row, lexical_score=1.0, semantic_score=0.85, bonus=0.9)
                 combined[str(row["chunk_id"])] = candidate
 
-        for match_query in build_match_queries(plan):
-            for row in self.store.search_chunk_feature_fts(document_id, match_query, limit=24):
+        for match_query in self._match_queries_for_profile(plan, active_profile):
+            for row in self.store.search_chunk_feature_fts(document_id, match_query, limit=active_profile.fts_limit):
                 lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
                 semantic_score = self._semantic_for_row(semantic_query, row)
                 candidate = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
                 self._merge_candidate(combined, candidate)
 
         if not combined:
-            fallback_query = build_like_fallback(plan)
-            for row in self.store.keyword_like_search(document_id, fallback_query, limit=18):
-                lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
-                semantic_score = self._semantic_for_row(semantic_query, row)
-                candidate = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
-                self._merge_candidate(combined, candidate)
+            for fallback_query in self._fallback_queries_for_profile(plan, active_profile):
+                for row in self.store.keyword_like_search(document_id, fallback_query, limit=active_profile.keyword_limit):
+                    lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
+                    semantic_score = self._semantic_for_row(semantic_query, row)
+                    candidate = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
+                    self._merge_candidate(combined, candidate)
 
         if not combined:
             query_vector = self.embedder.embed(semantic_query)
-            for row, semantic_score in self._semantic_candidates(document_id, query_vector):
+            for row, semantic_score in self._semantic_candidates(
+                document_id,
+                query_vector,
+                limit=active_profile.semantic_limit,
+            ):
                 candidate = self._score_row(plan, row, lexical_score=0.0, semantic_score=semantic_score)
                 self._merge_candidate(combined, candidate)
 
@@ -159,7 +197,7 @@ class HybridRetriever:
                 lexical_score=candidate.lexical_score,
                 semantic_score=candidate.semantic_score,
             )
-            for candidate in sorted(combined.values(), key=lambda item: item.total_score, reverse=True)[:limit]
+            for candidate in sorted(combined.values(), key=lambda item: item.total_score, reverse=True)[: active_profile.result_limit]
         ]
         return ranked
 
@@ -246,7 +284,13 @@ class HybridRetriever:
                     return hits
         return hits
 
-    def _semantic_candidates(self, document_id: str, query_vector: list[float]) -> list[tuple[dict, float]]:
+    def _semantic_candidates(
+        self,
+        document_id: str,
+        query_vector: list[float],
+        *,
+        limit: int = MAX_SEMANTIC_SCAN,
+    ) -> list[tuple[dict, float]]:
         rows = self.store.iter_embeddings(document_id)
         scored: list[tuple[dict, float]] = []
         for row in rows:
@@ -254,7 +298,54 @@ class HybridRetriever:
             if semantic_score > 0:
                 scored.append((row, semantic_score))
         scored.sort(key=lambda item: item[1], reverse=True)
-        return scored[:MAX_SEMANTIC_SCAN]
+        return scored[:limit]
+
+    @staticmethod
+    def _resolve_profile(profile: str, limit: int | None) -> RetrievalProfile:
+        selected = DEEP_RETRIEVAL_PROFILE if profile == "deep" else DEFAULT_RETRIEVAL_PROFILE
+        if limit is None:
+            return selected
+        return RetrievalProfile(
+            name=selected.name,
+            result_limit=limit,
+            fts_limit=selected.fts_limit,
+            keyword_limit=selected.keyword_limit,
+            semantic_limit=selected.semantic_limit,
+            use_query_expansion=selected.use_query_expansion,
+        )
+
+    def _match_queries_for_profile(self, plan: QueryPlan, profile: RetrievalProfile) -> list[str]:
+        queries = list(build_match_queries(plan))
+        if not profile.use_query_expansion:
+            return queries
+        for variant in self._query_variants(plan):
+            queries.extend(build_match_queries(plan_query(variant)))
+        return self._dedupe_queries(queries)
+
+    def _fallback_queries_for_profile(self, plan: QueryPlan, profile: RetrievalProfile) -> list[str]:
+        queries = [build_like_fallback(plan)]
+        if not profile.use_query_expansion:
+            return [query for query in queries if query]
+        for variant in self._query_variants(plan):
+            queries.append(build_like_fallback(plan_query(variant)))
+        return self._dedupe_queries(queries)
+
+    def _query_variants(self, plan: QueryPlan) -> list[str]:
+        candidates = [plan.raw_query, plan.content_query]
+        candidates.extend(self._focus_phrases(plan.focus_terms))
+        return self._dedupe_queries(candidates)
+
+    @staticmethod
+    def _dedupe_queries(queries: list[str]) -> list[str]:
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for query in queries:
+            normalized = " ".join(str(query).split())
+            if not normalized or normalized.lower() in seen:
+                continue
+            seen.add(normalized.lower())
+            deduped.append(normalized)
+        return deduped
 
     @staticmethod
     def _row_vector(row: dict) -> list[float]:

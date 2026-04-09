@@ -1,5 +1,6 @@
 import json
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -72,7 +73,7 @@ def _write_model_dir(path: Path, architecture: str, *, include_vision: bool = Fa
 
 
 def _test_dir(label: str) -> Path:
-    base = Path(".tmp_test") / f"gemma_runtime_{label}_{uuid.uuid4().hex[:8]}"
+    base = Path(tempfile.gettempdir()) / "epc_smart_search_tests" / f"gemma_runtime_{label}_{uuid.uuid4().hex[:8]}"
     if base.exists():
         shutil.rmtree(base)
     base.mkdir(parents=True, exist_ok=True)

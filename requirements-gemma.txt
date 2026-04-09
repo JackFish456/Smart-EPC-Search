@@ -1,0 +1,6 @@
+Flask>=3.0
+requests>=2.31
+transformers>=4.49
+accelerate>=1.0
+safetensors>=0.4
+# Install torch separately for your hardware and CUDA stack.

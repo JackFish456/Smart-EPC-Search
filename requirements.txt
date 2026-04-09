@@ -1,7 +1,1 @@
-PySide6>=6.7
-PyMuPDF>=1.24
-Pillow>=10.0
-requests>=2.31
-pdfplumber>=0.11
-pypdf>=5.0
-
+-r requirements-runtime.txt

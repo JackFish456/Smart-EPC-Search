@@ -215,6 +215,58 @@ def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> 
     assert ranked[0].chunk_id == "motors"
 
 
+def test_deep_profile_prefers_specific_clause_over_generic_match() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_qna",
+                "4",
+                "Q: What insulation or trace heating is provided on pipework to ensure water does not freeze",
+                "A generic appendix answer about tracing and water tubing.",
+                99,
+            ),
+            _chunk(
+                "motors",
+                "4.4.3",
+                "Electric Motors",
+                "Electric motors must meet the design requirements for the project.",
+                12,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What does the contract say about electric motors?", profile="deep")
+
+    assert ranked
+    assert ranked[0].chunk_id == "motors"
+
+
+def test_deep_profile_keeps_direct_evidence_queries_stable() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "schedule_line",
+                "0",
+                "30-Jun-28",
+                "GEV - ST #1 Steam Bypass Valves - Delivered to Site",
+                132,
+            ),
+            _chunk(
+                "steam_valves",
+                "11.1",
+                "Steam Turbine Bypass Valves, Dump devices",
+                "Steam turbine bypass valves include one set of HP bypass valve per HRSG.",
+                1952,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What does the contract say about steam bypass valves?", profile="deep")
+
+    assert ranked
+    assert ranked[0].chunk_id == "steam_valves"
+
+
 def test_focus_terms_beat_generic_responsibility_language_for_equipment_requests() -> None:
     retriever = _seed_retriever(
         [

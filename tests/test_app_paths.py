@@ -1,4 +1,5 @@
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -60,7 +61,7 @@ def test_get_app_data_root_skips_unwritable_localappdata(monkeypatch) -> None:
 
 
 def _test_dir(label: str) -> Path:
-    base = Path(".tmp_test") / f"app_paths_{label}_{uuid.uuid4().hex[:8]}"
+    base = Path(tempfile.gettempdir()) / "epc_smart_search_tests" / f"app_paths_{label}_{uuid.uuid4().hex[:8]}"
     if base.exists():
         shutil.rmtree(base)
     base.mkdir(parents=True, exist_ok=True)

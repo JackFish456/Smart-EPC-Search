@@ -8,6 +8,7 @@ Windows-first local EPC contract assistant built around:
 - Local semantic-style reranking with stored hashing embeddings
 - A Kiewey desktop chat surface (PySide6)
 - Local Gemma generation through the **Gemma Test** environment
+- Preflight checks that warn when contract-bearing artifacts are left under the workspace
 
 ## Sensitive files and Git
 
@@ -24,7 +25,7 @@ What must **stay private** (never in the public remote) is **contract informatio
 
 `.gitignore` blocks all **`*.db`** files (plus journal/WAL/SHM) and **`/*.pdf`**, so indexed data and source PDFs are not pushed by mistake.
 
-Customer builds seed the runtime from a bundled **`contract_store.prebuilt.db`** that you distribute **with the installer or an internal release artifact**—not by cloning from GitHub.
+Customer builds seed the runtime from a bundled **`contract_store.prebuilt.db`** that you distribute **with the installer or an internal release artifact**. Keep contract-bearing artifacts outside the repo workspace whenever possible; the launcher and packager now warn if PDFs or populated DBs are detected under the workspace.
 
 ## Gemma runtime
 
@@ -48,21 +49,27 @@ Optional environment variables:
 ## Run
 
 1. Ensure the desktop **Gemma Test** project has its `.venv` and model files.
-2. For a full local run, place `assets/contract_store.prebuilt.db` on disk next to the project (it is **not** in Git; obtain it from your internal build or rebuild flow below).
-3. From this folder:
+2. Install the local app/runtime dependencies:
+
+```powershell
+py -3.12 -m pip install -r requirements-dev.txt
+```
+
+3. If you need a seeded contract DB for local runs, keep the source artifact outside the workspace and only copy it into the packaged app flow when needed.
+4. From this folder:
 
 ```powershell
 .\launch_epc_smart_search.ps1
 ```
 
-The app seeds the bundled prebuilt database into the local app data directory on first run. If the bundled contract data is missing or invalid, the UI fails closed and asks the user to contact support.
+The launcher now runs a preflight check before starting the UI. The app seeds the bundled prebuilt database into the local app data directory on first run. If the bundled contract data is missing or invalid, the UI fails closed and asks the user to contact support.
 
 ## Rebuild contract data
 
-Customer builds are read-only. To rebuild the contract data, use the internal CLI and write to a fresh output file:
+Customer builds are read-only. To rebuild the contract data, use the internal CLI and write to a fresh output file. The source PDF must be supplied explicitly via `--pdf` or `EPC_CONTRACT_PDF`, and it must live outside the repo workspace:
 
 ```powershell
-python -m epc_smart_search.rebuild_contract --pdf .\Clean Contract.pdf --out .\assets\contract_store.prebuilt.new.db
+python -m epc_smart_search.rebuild_contract --pdf C:\secure\contracts\Clean Contract.pdf --out C:\secure\builds\contract_store.prebuilt.new.db
 ```
 
 The rebuild utility:
@@ -73,22 +80,23 @@ The rebuild utility:
 
 Release flow (contract-bearing `.db` files are never committed to the public repo):
 
-1. Rebuild to a fresh `.db` path.
-2. Copy the validated output to `assets\contract_store.prebuilt.db` on your machine for packaging only.
-3. Repackage the EXE with `.\package_epc_smart_search.ps1` (the installer carries the DB; GitHub does not).
+1. Rebuild to a fresh `.db` path outside the workspace.
+2. Repackage the EXE with `.\package_epc_smart_search.ps1 -PrebuiltDbPath C:\secure\builds\contract_store.prebuilt.new.db`.
+3. The packager stages that external DB into the installer payload without requiring a contract-bearing `.db` to live in the repo workspace.
 
 ## Develop and test
 
 ```powershell
 python -m pytest
+python -m ruff check .
 ```
 
 ## Package
 
-For a Windows bundle (requires `pyinstaller`):
+For a Windows bundle (requires the dev requirements and an external prebuilt DB path):
 
 ```powershell
-.\package_epc_smart_search.ps1
+.\package_epc_smart_search.ps1 -PrebuiltDbPath C:\secure\builds\contract_store.prebuilt.new.db
 ```
 
 ## Notes
@@ -97,3 +105,4 @@ For a Windows bundle (requires `pyinstaller`):
 - **Data directory:** Typically `%LOCALAPPDATA%\EPC Smart Search\`; if that is unavailable, the app may use a `.epc_smart_search` folder under the repo (also ignored).
 - **OCR:** Fallback uses Windows WinRT OCR for weak or empty pages.
 - **Answers:** If retrieved evidence is weak, the assistant refuses instead of guessing.
+- **Dependencies:** `requirements-runtime.txt` covers the desktop/runtime surface, `requirements-dev.txt` adds test/lint/package tooling, and `requirements-gemma.txt` documents the Gemma service extras.

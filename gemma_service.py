@@ -63,6 +63,24 @@ def create_app() -> Flask:
                 "Use only the excerpts. If the excerpts do not fully support a summary, "
                 "respond exactly with: I can't verify that from the contract."
             )
+        elif response_style == "deep_answer":
+            system_prompt = (
+                f"{STRICT_SYSTEM_PROMPT} "
+                "Provide a direct, well-organized answer grounded only in the excerpts. "
+                "Prioritize resolving the user's exact question over listing generic keyword matches."
+            )
+            prompt = (
+                "Contract excerpts:\n"
+                f"{context}\n\n"
+                "User question:\n"
+                f"{question}\n\n"
+                "Answer the exact question first in plain English. "
+                "Synthesize obligations, conditions, dates, thresholds, exceptions, and dependencies that are supported by the excerpts. "
+                "Use short markdown-style headers and flat bullet lists when they improve readability. "
+                "Do not show analysis, numbered reasoning steps, or chain-of-thought. "
+                "Use only the excerpts. If the excerpts do not fully support the answer, "
+                "respond exactly with: I can't verify that from the contract."
+            )
         else:
             prompt = (
                 "Contract excerpts:\n"

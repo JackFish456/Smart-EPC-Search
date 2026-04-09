@@ -1,46 +1,19 @@
 from __future__ import annotations
 
-import atexit
 import html
-import subprocess
-import time
-from dataclasses import dataclass
-from pathlib import Path
 import re
+from dataclasses import dataclass
 from typing import Sequence
 
-import requests
-
-from epc_smart_search.answer_policy import (
-    AssistantAnswer as PolicyAssistantAnswer,
-    AnswerPolicy,
-    DEEP_CONTEXT_EXACT_HITS,
-    DEEP_CONTEXT_MAX_SECTIONS,
-    DEEP_ENABLE_THINKING,
-    DEEP_MAX_NEW_TOKENS,
-    DEEP_PAGE_CONTEXT_SECTIONS,
-    SUMMARY_CONTEXT_MAX_SECTIONS,
-    SUMMARY_ENABLE_THINKING,
-    SUMMARY_MAX_NEW_TOKENS,
-)
-from epc_smart_search.app_paths import DB_PATH, GEMMA_TEST_PYTHON, WORKSPACE_ROOT, seed_preloaded_db
-from epc_smart_search.config import GEMMA_SERVICE_HOST, GEMMA_SERVICE_PORT, SEARCH_SCHEMA_VERSION
-from epc_smart_search.gemma_client import GemmaServiceClient as ManagedGemmaServiceClient
 from epc_smart_search.query_planner import QueryPlan, plan_query
-from epc_smart_search.retrieval import Citation, ExactPageHit, HashingEmbedder, HybridRetriever, RankedChunk
-from epc_smart_search.storage import ContractStore
-
-
-AssistantAnswer = PolicyAssistantAnswer
+from epc_smart_search.retrieval import Citation, ExactPageHit, RankedChunk
 
 
 @dataclass(slots=True)
-class IndexValidationResult:
-    ready: bool
-    error: str | None
-    document_id: str | None
-    chunk_count: int = 0
-    feature_count: int = 0
+class AssistantAnswer:
+    text: str
+    citations: list[Citation]
+    refused: bool
 
 
 SUMMARY_MAX_NEW_TOKENS = 768
@@ -52,150 +25,104 @@ DEEP_ENABLE_THINKING = True
 DEEP_CONTEXT_MAX_SECTIONS = 8
 DEEP_CONTEXT_EXACT_HITS = 3
 DEEP_PAGE_CONTEXT_SECTIONS = 2
-DEEP_EXCERPT_LIMIT = 920
-INTERNAL_REBUILD_ERROR = "Contract rebuild is available only through the internal rebuild tool."
 
 
-def validate_contract_store(store: ContractStore) -> IndexValidationResult:
-    document = store.get_document()
-    if document is None:
-        return IndexValidationResult(False, "Bundled contract data is missing.", None)
-    document_id = str(document["document_id"])
-    if store.get_metadata("search_schema_version") != str(SEARCH_SCHEMA_VERSION):
-        return IndexValidationResult(False, "Bundled contract data uses an incompatible search schema.", document_id)
-    chunk_count = store.get_chunk_count(document_id)
-    if chunk_count <= 0:
-        return IndexValidationResult(False, "Bundled contract data does not contain searchable chunks.", document_id)
-    feature_count = store.get_feature_count(document_id)
-    if feature_count <= 0:
-        return IndexValidationResult(False, "Bundled contract data is missing search features.", document_id, chunk_count=chunk_count)
-    if feature_count != chunk_count:
-        return IndexValidationResult(
-            False,
-            "Bundled contract data is incomplete. Search features do not match the indexed chunks.",
-            document_id,
-            chunk_count=chunk_count,
-            feature_count=feature_count,
-        )
-    return IndexValidationResult(True, None, document_id, chunk_count=chunk_count, feature_count=feature_count)
+class AnswerPolicy:
+    def __init__(self, store, retriever) -> None:
+        self.store = store
+        self.retriever = retriever
 
-
-class GemmaServiceClient:
-    def __init__(self, host: str = GEMMA_SERVICE_HOST, port: int = GEMMA_SERVICE_PORT) -> None:
-        self.host = host
-        self.port = port
-        self.base_url = f"http://{host}:{port}"
-        self._process: subprocess.Popen[str] | None = None
-        atexit.register(self.stop)
-
-    def ensure_running(self) -> None:
-        if self._is_healthy():
-            return
-        if not GEMMA_TEST_PYTHON.exists():
-            raise RuntimeError(f"Gemma Python not found: {GEMMA_TEST_PYTHON}")
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        self._process = subprocess.Popen(
-            [str(GEMMA_TEST_PYTHON), str(WORKSPACE_ROOT / "gemma_service.py"), "--port", str(self.port)],
-            cwd=str(WORKSPACE_ROOT),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            creationflags=creation_flags,
-        )
-        deadline = time.time() + 90
-        while time.time() < deadline:
-            if self._is_healthy():
-                return
-            time.sleep(1.0)
-        raise RuntimeError("Gemma helper service did not become ready.")
-
-    def ask(
+    def answer(
         self,
         question: str,
-        context: str,
-        *,
-        enable_thinking: bool | None = None,
-        max_new_tokens: int | None = None,
-        response_style: str | None = None,
-    ) -> str:
-        self.ensure_running()
-        payload: dict[str, object] = {"question": question, "context": context}
-        if enable_thinking is not None:
-            payload["enable_thinking"] = enable_thinking
-        if max_new_tokens is not None:
-            payload["max_new_tokens"] = max_new_tokens
-        if response_style is not None:
-            payload["response_style"] = response_style
-        response = requests.post(
-            f"{self.base_url}/generate",
-            json=payload,
-            timeout=300,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return str(payload.get("answer", "")).strip()
-
-    def stop(self) -> None:
-        process = self._process
-        self._process = None
-        if process is None or process.poll() is not None:
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-
-    def _is_healthy(self) -> bool:
-        try:
-            response = requests.get(f"{self.base_url}/health", timeout=3)
-            return response.ok
-        except Exception:
-            return False
-
-
-class ContractAssistant:
-    def __init__(self, db_path: str | Path = DB_PATH) -> None:
-        seed_preloaded_db()
-        self.store = ContractStore(db_path)
-        self.retriever = HybridRetriever(self.store, HashingEmbedder())
-        self.gemma = ManagedGemmaServiceClient()
-        self.answer_policy = AnswerPolicy(self.store, self.retriever)
-
-    def _get_answer_policy(self) -> AnswerPolicy:
-        policy = getattr(self, "answer_policy", None)
-        if policy is None:
-            policy = AnswerPolicy(getattr(self, "store", None), self.retriever)
-            self.answer_policy = policy
-        return policy
-
-    def get_index_status(self) -> IndexValidationResult:
-        return validate_contract_store(self.store)
-
-    def is_index_ready(self) -> bool:
-        return self.get_index_status().ready
-
-    def build_index(self, progress_callback=None) -> dict[str, int | str]:
-        raise RuntimeError(INTERNAL_REBUILD_ERROR)
-
-    def ask(
-        self,
-        question: str,
-        history: Sequence[dict[str, str]] | None = None,
+        history: Sequence[dict[str, str]] | None,
+        gemma_client,
         *,
         deep_think: bool = False,
     ) -> AssistantAnswer:
-        return self._get_answer_policy().answer(question, history, self.gemma, deep_think=deep_think)
+        effective_question = self.resolve_question(question, history)
+        exact_hits = self.retriever.find_exact_page_hits(effective_question)
+        exact_answer = self.build_exact_answer(effective_question, exact_hits)
+        if exact_answer is not None and not deep_think:
+            return exact_answer
+
+        summary_request = self.prefers_generated_answer(question)
+        ranked = (
+            self.retriever.retrieve(effective_question, profile="deep")
+            if deep_think
+            else self.retriever.retrieve(effective_question)
+        )
+        citations = self.retriever.expand_with_context(ranked) if ranked else []
+        citations = self.limit_citations(citations) if citations else []
+
+        if not deep_think and not ranked:
+            return AssistantAnswer("I can't verify that from the contract.", [], True)
+        if not deep_think and not citations:
+            return AssistantAnswer("I can't verify that from the contract.", [], True)
+
+        best = ranked[0] if ranked else None
+        evidence_is_weak = best is None or (best.total_score < 0.16 and best.lexical_score < 0.05)
+        if evidence_is_weak and not deep_think:
+            return AssistantAnswer("I can't verify that from the contract.", citations, True)
+
+        reference_answer = self.build_reference_answer(effective_question, ranked, citations)
+        if reference_answer is not None and not summary_request and not deep_think:
+            return reference_answer
+
+        extractive_answer = self.build_extractive_answer(effective_question, ranked, citations)
+        if extractive_answer is not None and not summary_request and not deep_think:
+            return extractive_answer
+
+        if deep_think:
+            prompt_context = self.build_deep_prompt_context(effective_question, ranked, exact_hits)
+            if evidence_is_weak and not exact_hits:
+                if extractive_answer is not None:
+                    return extractive_answer
+                return AssistantAnswer("I can't verify that from the contract.", citations, True)
+            if not prompt_context:
+                if extractive_answer is not None:
+                    return extractive_answer
+                return AssistantAnswer("I can't verify that from the contract.", citations, True)
+        else:
+            prompt_context = (
+                self.build_summary_prompt_context(effective_question, ranked)
+                if summary_request
+                else self.retriever.build_evidence_pack(effective_question, ranked, citations)
+            )
+            if summary_request and not prompt_context:
+                if extractive_answer is not None:
+                    return extractive_answer
+                return AssistantAnswer("I can't verify that from the contract.", citations, True)
+
+        try:
+            answer_text = gemma_client.ask(
+                question,
+                prompt_context,
+                enable_thinking=DEEP_ENABLE_THINKING if deep_think else (SUMMARY_ENABLE_THINKING if summary_request else None),
+                max_new_tokens=DEEP_MAX_NEW_TOKENS if deep_think else (SUMMARY_MAX_NEW_TOKENS if summary_request else None),
+                response_style="deep_answer" if deep_think else ("detailed_summary" if summary_request else None),
+            )
+        except Exception:
+            if extractive_answer is not None:
+                return extractive_answer
+            answer_text = "I can't verify that from the contract."
+
+        answer_text = answer_text.strip() or "I can't verify that from the contract."
+        refused = answer_text == "I can't verify that from the contract."
+        if (summary_request or deep_think) and (refused or not answer_text):
+            if extractive_answer is not None:
+                return extractive_answer
+        return AssistantAnswer(answer_text, citations, refused)
 
     @classmethod
-    def _resolve_question(cls, question: str, history: Sequence[dict[str, str]] | None = None) -> str:
+    def resolve_question(cls, question: str, history: Sequence[dict[str, str]] | None = None) -> str:
         if not history:
             return question
         normalized = " ".join(question.lower().split())
         plan = plan_query(question)
-        if not cls._looks_like_follow_up(question, plan):
+        if not cls.looks_like_follow_up(question, plan):
             return question
-        anchor = cls._find_follow_up_anchor(history)
+        anchor = cls.find_follow_up_anchor(history)
         if not anchor:
             return question
         normalized_anchor = " ".join(anchor.lower().split())
@@ -213,7 +140,7 @@ class ContractAssistant:
         return f"{stem} regarding {anchor}"
 
     @classmethod
-    def _find_follow_up_anchor(cls, history: Sequence[dict[str, str]]) -> str:
+    def find_follow_up_anchor(cls, history: Sequence[dict[str, str]]) -> str:
         for turn in reversed(history):
             if str(turn.get("role", "")).strip() != "user":
                 continue
@@ -221,7 +148,7 @@ class ContractAssistant:
             if not content:
                 continue
             plan = plan_query(content)
-            if cls._looks_like_follow_up(content, plan):
+            if cls.looks_like_follow_up(content, plan):
                 continue
             anchor = re.sub(r"^(summari[sz]e|explain)\s+", "", plan.content_query.strip(" ?.!"), flags=re.IGNORECASE)
             anchor = re.sub(r"\s+in plain english$", "", anchor, flags=re.IGNORECASE)
@@ -230,7 +157,7 @@ class ContractAssistant:
         return ""
 
     @staticmethod
-    def _looks_like_follow_up(question: str, plan: QueryPlan) -> bool:
+    def looks_like_follow_up(question: str, plan: QueryPlan) -> bool:
         normalized = " ".join(question.lower().split())
         if not normalized:
             return False
@@ -253,16 +180,7 @@ class ContractAssistant:
             "and ",
             "also ",
         )
-        referential_terms = (
-            " it ",
-            " that ",
-            " this ",
-            " these ",
-            " those ",
-            " they ",
-            " them ",
-            " same ",
-        )
+        referential_terms = (" it ", " that ", " this ", " these ", " those ", " they ", " them ", " same ")
         wrapped = f" {normalized} "
         has_referential_term = any(term in wrapped for term in referential_terms)
         if plan.section_number:
@@ -277,45 +195,30 @@ class ContractAssistant:
             return False
         return has_referential_term
 
-    def _build_exact_answer(self, question: str, hits: list[ExactPageHit]) -> AssistantAnswer | None:
+    def build_exact_answer(self, question: str, hits: list[ExactPageHit]) -> AssistantAnswer | None:
         if not hits:
             return None
         lowered = " ".join(question.lower().split())
-        if not self._prefer_exact_answer(lowered):
+        if not self.prefer_exact_answer(lowered):
             return None
-        excerpts = []
-        for hit in hits[:4]:
-            excerpts.append(f"Page {hit.page_num}: {self._trim_page_excerpt(hit.page_text, lowered)}")
-        if self._is_count_question(lowered):
-            count = self._count_exact_items(lowered, hits)
+        excerpts = [f"Page {hit.page_num}: {self.trim_page_excerpt(hit.page_text, lowered)}" for hit in hits[:4]]
+        if self.is_count_question(lowered):
+            count = self.count_exact_items(lowered, hits)
             if count is not None:
-                body = (
-                    f"I found {count} matching items in the contract.\n\n"
-                    "Direct contract text:\n"
-                    + "\n\n".join(excerpts)
-                )
+                body = f"I found {count} matching items in the contract.\n\nDirect contract text:\n" + "\n\n".join(excerpts)
                 return AssistantAnswer(body, [], False)
-        body = "Direct contract text:\n" + "\n\n".join(excerpts)
-        return AssistantAnswer(body, [], False)
+        return AssistantAnswer("Direct contract text:\n" + "\n\n".join(excerpts), [], False)
 
     @staticmethod
-    def _is_count_question(question: str) -> bool:
+    def is_count_question(question: str) -> bool:
         return question.startswith("how many ")
 
     @staticmethod
-    def _prefer_exact_answer(question: str) -> bool:
-        prefixes = (
-            "how many ",
-            "show me ",
-            "find ",
-            "quote ",
-            "where does ",
-            "which page ",
-        )
-        return question.startswith(prefixes)
+    def prefer_exact_answer(question: str) -> bool:
+        return question.startswith(("how many ", "show me ", "find ", "quote ", "where does ", "which page "))
 
     @staticmethod
-    def _reference_lookup_kind(question: str) -> str | None:
+    def reference_lookup_kind(question: str) -> str | None:
         normalized = " ".join(question.lower().split())
         if normalized.startswith(("what section", "which section")):
             return "section"
@@ -324,7 +227,7 @@ class ContractAssistant:
         return None
 
     @staticmethod
-    def _count_exact_items(question: str, hits: list[ExactPageHit]) -> int | None:
+    def count_exact_items(question: str, hits: list[ExactPageHit]) -> int | None:
         item_phrase = question.removeprefix("how many ").strip(" ?.")
         if item_phrase.endswith("s"):
             item_phrase = item_phrase[:-1]
@@ -335,12 +238,10 @@ class ContractAssistant:
         for hit in hits:
             for match in pattern.finditer(hit.page_text):
                 seen_numbers.add(match.group(1))
-        if seen_numbers:
-            return len(seen_numbers)
-        return None
+        return len(seen_numbers) if seen_numbers else None
 
     @staticmethod
-    def _trim_page_excerpt(page_text: str, question: str, limit: int = 700) -> str:
+    def trim_page_excerpt(page_text: str, question: str, limit: int = 700) -> str:
         compact = " ".join(page_text.split())
         term = question.removeprefix("how many ").strip(" ?.")
         if term.endswith("s"):
@@ -354,36 +255,32 @@ class ContractAssistant:
         return excerpt if len(excerpt) < len(compact) else compact[:limit]
 
     @classmethod
-    def _build_reference_answer(
+    def build_reference_answer(
         cls,
         question: str,
         ranked: list[RankedChunk],
         citations: list[Citation],
     ) -> AssistantAnswer | None:
-        lookup_kind = cls._reference_lookup_kind(question)
+        lookup_kind = cls.reference_lookup_kind(question)
         if lookup_kind is None or not ranked:
             return None
         plan = plan_query(question)
         for chunk in ranked:
             if "...." in chunk.heading:
                 continue
-            excerpt = cls._extract_ranked_excerpt(chunk.full_text, plan, limit=520)
+            excerpt = cls.extract_ranked_excerpt(chunk.full_text, plan, limit=520)
             if not excerpt:
                 continue
             label = chunk.section_number or "Unnumbered clause"
-            pages = cls._format_page_range(chunk.page_start, chunk.page_end)
+            pages = cls.format_page_range(chunk.page_start, chunk.page_end)
             heading = " ".join(chunk.heading.split())
             intro = "Most relevant section:" if lookup_kind == "section" else "Most relevant pages:"
-            body = (
-                f"Section {label} - {heading}\n"
-                f"Pages: {pages}\n"
-                f"Contract text: {excerpt}"
-            )
+            body = f"Section {label} - {heading}\nPages: {pages}\nContract text: {excerpt}"
             return AssistantAnswer(f"{intro}\n\n{body}", citations, False)
         return None
 
     @staticmethod
-    def _limit_citations(citations: list[Citation], limit: int = 3) -> list[Citation]:
+    def limit_citations(citations: list[Citation], limit: int = 3) -> list[Citation]:
         limited: list[Citation] = []
         seen_pages: set[int] = set()
         for citation in citations:
@@ -397,7 +294,7 @@ class ContractAssistant:
         return limited
 
     @classmethod
-    def _build_extractive_answer(
+    def build_extractive_answer(
         cls,
         question: str,
         ranked: list[RankedChunk],
@@ -410,23 +307,19 @@ class ContractAssistant:
         plan = plan_query(question)
         blocks: list[str] = []
         seen_keys: set[tuple[str | None, int, int]] = set()
-        excerpt_limit = 900 if cls._is_value_or_requirement_question(plan) else 650
+        excerpt_limit = 900 if cls.is_value_or_requirement_question(plan) else 650
         for chunk in ranked:
             key = (chunk.section_number, chunk.page_start, chunk.page_end)
             if key in seen_keys:
                 continue
             seen_keys.add(key)
-            excerpt = cls._extract_ranked_excerpt(chunk.full_text, plan, limit=excerpt_limit)
-            if not excerpt or not cls._is_useful_extractive_block(chunk.heading, excerpt, plan):
+            excerpt = cls.extract_ranked_excerpt(chunk.full_text, plan, limit=excerpt_limit)
+            if not excerpt or not cls.is_useful_extractive_block(chunk.heading, excerpt, plan):
                 continue
             label = chunk.section_number or "Unnumbered clause"
-            pages = cls._format_page_range(chunk.page_start, chunk.page_end)
+            pages = cls.format_page_range(chunk.page_start, chunk.page_end)
             heading = " ".join(chunk.heading.split())
-            blocks.append(
-                f"Section {label} - {heading}\n"
-                f"Pages: {pages}\n"
-                f"Contract text: {excerpt}"
-            )
+            blocks.append(f"Section {label} - {heading}\nPages: {pages}\nContract text: {excerpt}")
             if len(blocks) >= max_sections:
                 break
         if not blocks:
@@ -434,23 +327,15 @@ class ContractAssistant:
         return AssistantAnswer("\n\n".join(blocks), citations, False)
 
     @staticmethod
-    def _prefers_generated_answer(question: str) -> bool:
+    def prefers_generated_answer(question: str) -> bool:
         normalized = " ".join(question.lower().split())
-        explicit_prefixes = (
-            "summarize ",
-            "summarise ",
-            "explain ",
-        )
-        explicit_phrases = (
-            " summarize ",
-            " summarise ",
-            " explain ",
-        )
         wrapped = f" {normalized} "
-        return normalized.startswith(explicit_prefixes) or any(phrase in wrapped for phrase in explicit_phrases)
+        return normalized.startswith(("summarize ", "summarise ", "explain ")) or any(
+            phrase in wrapped for phrase in (" summarize ", " summarise ", " explain ")
+        )
 
     @classmethod
-    def _build_summary_prompt_context(
+    def build_summary_prompt_context(
         cls,
         question: str,
         ranked: list[RankedChunk],
@@ -467,64 +352,52 @@ class ContractAssistant:
             if key in seen:
                 continue
             seen.add(key)
-            excerpt = cls._extract_ranked_excerpt(
+            excerpt = cls.extract_ranked_excerpt(
                 chunk.full_text,
                 plan,
                 limit=SUMMARY_EXCERPT_LIMIT,
                 surrounding_sentences=1,
             )
-            if not excerpt or not cls._is_useful_summary_block(chunk, excerpt, plan):
+            if not excerpt or not cls.is_useful_summary_block(chunk, excerpt, plan):
                 continue
             label = html.escape(chunk.section_number or "Unnumbered clause")
             heading = html.escape(" ".join(chunk.heading.split()))
-            pages = html.escape(cls._format_page_range(chunk.page_start, chunk.page_end))
-            blocks.append(
-                f"Section: {label}\n"
-                f"Heading: {heading}\n"
-                f"Pages: {pages}\n"
-                f"Excerpt: {excerpt}"
-            )
+            pages = html.escape(cls.format_page_range(chunk.page_start, chunk.page_end))
+            blocks.append(f"Section: {label}\nHeading: {heading}\nPages: {pages}\nExcerpt: {excerpt}")
             if len(blocks) >= max_sections:
                 break
         return "\n\n".join(blocks)
 
-    def _build_deep_prompt_context(
+    def build_deep_prompt_context(
         self,
         question: str,
         ranked: list[RankedChunk],
         exact_hits: list[ExactPageHit],
     ) -> str:
         sections: list[str] = []
-        ranked_blocks = self._build_summary_prompt_context(
-            question,
-            ranked,
-            max_sections=DEEP_CONTEXT_MAX_SECTIONS,
-        )
+        ranked_blocks = self.build_summary_prompt_context(question, ranked, max_sections=DEEP_CONTEXT_MAX_SECTIONS)
         if ranked_blocks:
             sections.append("Ranked contract sections:\n" + ranked_blocks)
 
-        exact_blocks = self._build_exact_hit_prompt_context(question, exact_hits)
+        exact_blocks = self.build_exact_hit_prompt_context(question, exact_hits)
         if exact_blocks:
             sections.append("Exact page hits:\n" + exact_blocks)
 
-        page_context = self._build_deep_page_context(ranked)
+        page_context = self.build_deep_page_context(ranked)
         if page_context:
             sections.append("Nearby page context:\n" + page_context)
 
         return "\n\n".join(section for section in sections if section).strip()
 
     @classmethod
-    def _build_exact_hit_prompt_context(cls, question: str, exact_hits: list[ExactPageHit]) -> str:
+    def build_exact_hit_prompt_context(cls, question: str, exact_hits: list[ExactPageHit]) -> str:
         lowered = " ".join(question.lower().split())
-        blocks: list[str] = []
-        for hit in exact_hits[:DEEP_CONTEXT_EXACT_HITS]:
-            excerpt = cls._trim_page_excerpt(hit.page_text, lowered)
-            blocks.append(f"Page {hit.page_num}: {cls._quote_excerpt(excerpt)}")
+        blocks = [f"Page {hit.page_num}: {cls.quote_excerpt(cls.trim_page_excerpt(hit.page_text, lowered))}" for hit in exact_hits[:DEEP_CONTEXT_EXACT_HITS]]
         return "\n\n".join(blocks)
 
-    def _build_deep_page_context(self, ranked: list[RankedChunk]) -> str:
+    def build_deep_page_context(self, ranked: list[RankedChunk]) -> str:
         document_id = self.retriever.resolve_document_id()
-        if not document_id or not ranked:
+        if not self.store or not document_id or not ranked:
             return ""
         seen_pages: set[tuple[int, int]] = set()
         blocks: list[str] = []
@@ -535,17 +408,11 @@ class ContractAssistant:
             seen_pages.add(page_key)
             label = chunk.section_number or "Unnumbered clause"
             heading = " ".join(chunk.heading.split())
-            rows = self.store.fetch_page_window(
-                document_id,
-                chunk.page_start,
-                chunk.page_end,
-                padding=0,
-                limit=2,
-            )
+            rows = self.store.fetch_page_window(document_id, chunk.page_start, chunk.page_end, padding=0, limit=2)
             if not rows:
                 continue
             page_lines = [
-                f"Page {int(row['page_num'])}: {self._quote_excerpt(self._truncate_text(str(row['page_text']), limit=500))}"
+                f"Page {int(row['page_num'])}: {self.quote_excerpt(self.truncate_text(str(row['page_text']), limit=500))}"
                 for row in rows
             ]
             blocks.append(f"Section {label} - {heading}\n" + "\n".join(page_lines))
@@ -554,18 +421,16 @@ class ContractAssistant:
         return "\n\n".join(blocks)
 
     @staticmethod
-    def _format_page_range(page_start: int, page_end: int) -> str:
-        if page_start == page_end:
-            return f"{page_start}"
-        return f"{page_start}-{page_end}"
+    def format_page_range(page_start: int, page_end: int) -> str:
+        return f"{page_start}" if page_start == page_end else f"{page_start}-{page_end}"
 
     @staticmethod
-    def _truncate_text(text: str, limit: int = 340) -> str:
+    def truncate_text(text: str, limit: int = 340) -> str:
         compact = " ".join(text.split())
         return compact if len(compact) <= limit else compact[: limit - 3] + "..."
 
     @classmethod
-    def _extract_ranked_excerpt(
+    def extract_ranked_excerpt(
         cls,
         text: str,
         plan: QueryPlan,
@@ -576,20 +441,17 @@ class ContractAssistant:
         compact = " ".join(text.split())
         if not compact:
             return ""
-        term_window = cls._extract_term_window(compact, plan, limit=limit)
+        term_window = cls.extract_term_window(compact, plan, limit=limit)
         if term_window:
-            return cls._quote_excerpt(term_window)
-        sentences = cls._split_sentences(compact)
+            return cls.quote_excerpt(term_window)
+        sentences = cls.split_sentences(compact)
         if not sentences:
-            return cls._quote_excerpt(compact[:limit].rstrip())
-        scored: list[tuple[float, int]] = []
-        for index, sentence in enumerate(sentences):
-            score = cls._score_sentence(sentence, plan)
-            scored.append((score, index))
+            return cls.quote_excerpt(compact[:limit].rstrip())
+        scored = [(cls.score_sentence(sentence, plan), index) for index, sentence in enumerate(sentences)]
         scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
         best_index = scored[0][1]
         selected_indices = {best_index}
-        if cls._is_value_or_requirement_question(plan):
+        if cls.is_value_or_requirement_question(plan):
             if best_index + 1 < len(sentences):
                 selected_indices.add(best_index + 1)
             elif best_index > 0:
@@ -608,15 +470,14 @@ class ContractAssistant:
                 excerpt = f"{excerpt} {sentences[best_index + 1]}".strip()
         if len(excerpt) > limit:
             excerpt = excerpt[: limit - 3].rstrip() + "..."
-        return cls._quote_excerpt(excerpt)
+        return cls.quote_excerpt(excerpt)
 
     @staticmethod
-    def _split_sentences(text: str) -> list[str]:
-        pieces = re.split(r"(?<=[.!?;:])\s+|\s{2,}", text)
-        return [piece.strip() for piece in pieces if piece.strip()]
+    def split_sentences(text: str) -> list[str]:
+        return [piece.strip() for piece in re.split(r"(?<=[.!?;:])\s+|\s{2,}", text) if piece.strip()]
 
     @classmethod
-    def _score_sentence(cls, sentence: str, plan: QueryPlan) -> float:
+    def score_sentence(cls, sentence: str, plan: QueryPlan) -> float:
         normalized = sentence.lower()
         score = 0.0
         if plan.content_query and plan.content_query in normalized:
@@ -624,20 +485,20 @@ class ContractAssistant:
         score += 1.5 * sum(1 for term in plan.focus_terms if term in normalized)
         score += 0.8 * sum(1 for term in plan.topic_terms + plan.action_terms if term in normalized)
         score += 0.5 * sum(1 for term in plan.actor_terms if term in normalized)
-        if cls._is_value_or_requirement_question(plan) and re.search(r"\d", sentence):
+        if cls.is_value_or_requirement_question(plan) and re.search(r"\d", sentence):
             score += 1.2
-        if cls._is_requirement_question(plan) and re.search(r"\b(shall|must|required|responsible|obligated)\b", normalized):
+        if cls.is_requirement_question(plan) and re.search(r"\b(shall|must|required|responsible|obligated)\b", normalized):
             score += 1.1
         if sentence.count("....") >= 2:
             score -= 2.0
         return score
 
     @staticmethod
-    def _is_value_or_requirement_question(plan: QueryPlan) -> bool:
-        return ContractAssistant._is_value_question(plan) or ContractAssistant._is_requirement_question(plan)
+    def is_value_or_requirement_question(plan: QueryPlan) -> bool:
+        return AnswerPolicy.is_value_question(plan) or AnswerPolicy.is_requirement_question(plan)
 
     @staticmethod
-    def _is_value_question(plan: QueryPlan) -> bool:
+    def is_value_question(plan: QueryPlan) -> bool:
         normalized = plan.normalized_query
         markers = (
             "how much",
@@ -664,7 +525,7 @@ class ContractAssistant:
         return any(marker in normalized for marker in markers)
 
     @staticmethod
-    def _is_requirement_question(plan: QueryPlan) -> bool:
+    def is_requirement_question(plan: QueryPlan) -> bool:
         normalized = plan.normalized_query
         return (
             plan.intent == "responsibility"
@@ -678,19 +539,17 @@ class ContractAssistant:
         )
 
     @staticmethod
-    def _quote_excerpt(text: str) -> str:
+    def quote_excerpt(text: str) -> str:
         cleaned = " ".join(text.split()).strip()
-        if not cleaned:
-            return ""
-        return f'"{cleaned}"'
+        return f'"{cleaned}"' if cleaned else ""
 
     @classmethod
-    def _extract_term_window(cls, text: str, plan: QueryPlan, *, limit: int) -> str:
+    def extract_term_window(cls, text: str, plan: QueryPlan, *, limit: int) -> str:
         lowered = text.lower()
         candidates: list[str] = []
         if plan.content_query:
             candidates.append(plan.content_query)
-        candidates.extend(cls._focus_phrases(plan.focus_terms))
+        candidates.extend(cls.focus_phrases(plan.focus_terms))
         candidates.extend(plan.focus_terms)
         candidates.extend(plan.topic_terms + plan.action_terms)
         seen: set[str] = set()
@@ -715,7 +574,7 @@ class ContractAssistant:
         return ""
 
     @staticmethod
-    def _is_useful_extractive_block(heading: str, excerpt: str, plan: QueryPlan) -> bool:
+    def is_useful_extractive_block(heading: str, excerpt: str, plan: QueryPlan) -> bool:
         normalized_heading = " ".join(heading.lower().split())
         cleaned = excerpt.strip().strip('"').strip()
         if not cleaned or len(cleaned) < 35:
@@ -732,42 +591,39 @@ class ContractAssistant:
         focus_candidates: list[str] = []
         if plan.content_query:
             focus_candidates.append(plan.content_query)
-        focus_candidates.extend(ContractAssistant._focus_phrases(plan.focus_terms))
+        focus_candidates.extend(AnswerPolicy.focus_phrases(plan.focus_terms))
         focus_candidates.extend(plan.focus_terms)
         focus_candidates.extend(plan.topic_terms + plan.action_terms)
         if focus_candidates and not any(candidate and candidate in combined for candidate in focus_candidates):
             return False
         lowered = cleaned.lower()
-        if ContractAssistant._is_requirement_question(plan) and not re.search(
+        if AnswerPolicy.is_requirement_question(plan) and not re.search(
             r"\b(shall|must|required|responsible|obligated|provide|perform|submit|deliver|maintain|comply)\b",
             lowered,
         ) and not re.search(r"\d", cleaned):
             return False
-        if ContractAssistant._is_value_question(plan) and not re.search(r"\d", cleaned):
+        if AnswerPolicy.is_value_question(plan) and not re.search(r"\d", cleaned):
             return False
         return True
 
     @classmethod
-    def _is_useful_summary_block(cls, chunk: RankedChunk, excerpt: str, plan: QueryPlan) -> bool:
-        heading = chunk.heading
-        if "...." in heading:
+    def is_useful_summary_block(cls, chunk: RankedChunk, excerpt: str, plan: QueryPlan) -> bool:
+        if "...." in chunk.heading:
             return False
         if chunk.total_score < 0.42:
             return False
-        cleaned_heading = " ".join(heading.split()).lower()
-        if cleaned_heading in {"front matter"}:
-            return False
+        cleaned_heading = " ".join(chunk.heading.split()).lower()
         cleaned_excerpt = excerpt.strip().strip('"').strip()
-        if len(cleaned_excerpt) < 60:
+        if cleaned_heading in {"front matter"} or len(cleaned_excerpt) < 60:
             return False
         if re.fullmatch(r"[A-Za-z0-9.()\- ]{1,28}", cleaned_excerpt):
             return False
         if cleaned_excerpt.lower().startswith("section ") and "agreement" in cleaned_excerpt.lower() and len(cleaned_excerpt) < 110:
             return False
-        return cls._is_useful_extractive_block(heading, excerpt, plan)
+        return cls.is_useful_extractive_block(chunk.heading, excerpt, plan)
 
     @staticmethod
-    def _focus_phrases(focus_terms: tuple[str, ...]) -> tuple[str, ...]:
+    def focus_phrases(focus_terms: tuple[str, ...]) -> tuple[str, ...]:
         if len(focus_terms) < 2:
             return ()
         phrases = [" ".join(focus_terms[index:index + 2]) for index in range(len(focus_terms) - 1)]

@@ -1,7 +1,7 @@
 Set-Location $PSScriptRoot
 
 $appScript = Join-Path $PSScriptRoot "epc_smart_search_app.py"
-$probeCode = "import PySide6"
+$probeCode = "import PySide6, requests"
 
 $candidates = @()
 
@@ -44,8 +44,13 @@ foreach ($candidate in $candidates) {
 }
 
 if ($null -eq $pythonCommand) {
-    Write-Error "Could not find a Python interpreter with PySide6 installed. Install requirements into a project .venv or run 'py -3.12 -m pip install -r requirements.txt'."
+    Write-Error "Could not find a Python interpreter with the runtime requirements installed. Install requirements into a project .venv or run 'py -3.12 -m pip install -r requirements-dev.txt'."
     exit 1
+}
+
+& $pythonCommand.FilePath @($pythonCommand.PrefixArgs + @("-m", "epc_smart_search.preflight", "--mode", "launch"))
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
 }
 
 & $pythonCommand.FilePath @($pythonCommand.PrefixArgs + @($appScript))

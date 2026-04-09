@@ -1,7 +1,8 @@
 from epc_smart_search.assistant import AssistantAnswer, ContractAssistant
+from epc_smart_search.assistant import DEEP_MAX_NEW_TOKENS
 from epc_smart_search.assistant import SUMMARY_ENABLE_THINKING
 from epc_smart_search.assistant import SUMMARY_MAX_NEW_TOKENS
-from epc_smart_search.retrieval import Citation
+from epc_smart_search.retrieval import Citation, ExactPageHit
 from epc_smart_search.retrieval import RankedChunk
 
 
@@ -369,6 +370,138 @@ def test_summary_request_does_not_change_following_normal_request_behavior() -> 
     assert "Most relevant contract text:" not in normal_answer.text
     assert len(assistant.gemma.calls) == 1
     assert assistant.gemma.calls[0]["response_style"] == "detailed_summary"
+
+
+def test_deep_think_routes_non_summary_questions_through_gemma() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.23",
+            heading="Fuel Gas Supply",
+            full_text=(
+                "The Fuel Gas System receives, conditions and transports natural gas supplied from an offsite pipeline. "
+                "Contractor shall supply and install the main fuel gas regulating station."
+            ),
+            page_start=270,
+            page_end=271,
+            ordinal_in_document=1,
+            total_score=3.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+    citations = [Citation("chunk1", "5.23", "Fuel Gas Supply", None, 270, 271, "quote")]
+    exact_hits = [ExactPageHit(page_num=270, snippet="fuel gas", page_text=ranked[0].full_text)]
+
+    class FakeRetriever:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def find_exact_page_hits(self, question: str):
+            self.calls.append({"kind": "exact", "question": question})
+            return exact_hits
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            self.calls.append({"kind": "retrieve", "question": question, "profile": profile})
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+        def resolve_document_id(self) -> str:
+            return "doc1"
+
+    class FakeStore:
+        def fetch_page_window(self, document_id: str, page_start: int, page_end: int, *, padding: int = 0, limit: int = 2):
+            return [{"page_num": 270, "page_text": ranked[0].full_text}]
+
+    class FakeGemma:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def ask(self, question: str, context: str, *, enable_thinking=None, max_new_tokens=None, response_style=None):
+            self.calls.append(
+                {
+                    "question": question,
+                    "context": context,
+                    "enable_thinking": enable_thinking,
+                    "max_new_tokens": max_new_tokens,
+                    "response_style": response_style,
+                }
+            )
+            return "## Answer\n- **Contractor** supplies the main regulating station."
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.store = FakeStore()
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+
+    answer = assistant.ask("What does the contract say about fuel gas supply?", deep_think=True)
+
+    assert answer.text.startswith("## Answer")
+    assert assistant.retriever.calls[1]["profile"] == "deep"
+    assert assistant.gemma.calls[0]["enable_thinking"] is True
+    assert assistant.gemma.calls[0]["max_new_tokens"] == DEEP_MAX_NEW_TOKENS
+    assert assistant.gemma.calls[0]["response_style"] == "deep_answer"
+    assert "Ranked contract sections:" in assistant.gemma.calls[0]["context"]
+    assert "Exact page hits:" in assistant.gemma.calls[0]["context"]
+
+
+def test_deep_think_falls_back_to_extractive_when_gemma_refuses() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.23",
+            heading="Fuel Gas Supply",
+            full_text=(
+                "The Fuel Gas System receives, conditions and transports natural gas supplied from an offsite pipeline. "
+                "Contractor shall supply and install the main fuel gas regulating station."
+            ),
+            page_start=270,
+            page_end=271,
+            ordinal_in_document=1,
+            total_score=3.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+    citations = [Citation("chunk1", "5.23", "Fuel Gas Supply", None, 270, 271, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+        def resolve_document_id(self) -> str:
+            return "doc1"
+
+    class FakeStore:
+        def fetch_page_window(self, document_id: str, page_start: int, page_end: int, *, padding: int = 0, limit: int = 2):
+            return [{"page_num": 270, "page_text": ranked[0].full_text}]
+
+    class FakeGemma:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def ask(self, question: str, context: str, *, enable_thinking=None, max_new_tokens=None, response_style=None):
+            self.calls += 1
+            return "I can't verify that from the contract."
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.store = FakeStore()
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+
+    answer = assistant.ask("What does the contract say about fuel gas supply?", deep_think=True)
+
+    assert assistant.gemma.calls == 1
+    assert "Section 5.23 - Fuel Gas Supply" in answer.text
+    assert not answer.refused
 
 
 def test_follow_up_after_summary_reuses_last_user_topic_for_retrieval() -> None:
