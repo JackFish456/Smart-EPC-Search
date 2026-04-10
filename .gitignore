@@ -11,6 +11,7 @@ venv/
 dist/
 build/
 *.spec
+.pyinstaller/
 
 # Tests / coverage
 .pytest_cache/

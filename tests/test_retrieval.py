@@ -1,15 +1,14 @@
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.ocr_support import PageText
 from epc_smart_search.query_planner import build_like_fallback, plan_query
-from epc_smart_search.retrieval import HashingEmbedder, HybridRetriever
+from epc_smart_search.retrieval import HybridRetriever
 from epc_smart_search.search_features import build_chunk_features
-from epc_smart_search.storage import ContractStore, pack_vector
+from epc_smart_search.storage import ContractStore
 
 
 def test_direct_section_lookup_wins() -> None:
     db_path = "file:retrieval_contract?mode=memory&cache=shared"
     store = ContractStore(db_path)
-    embedder = HashingEmbedder(dimension=16)
     chunk = ChunkRecord(
         chunk_id="chunk1",
         document_id="doc1",
@@ -32,11 +31,8 @@ def test_direct_section_lookup_wins() -> None:
         chunks=[chunk],
         pages=[PageText(page_num=12, text=chunk.full_text, ocr_used=False)],
         features=build_chunk_features([chunk]),
-        embeddings={"chunk1": pack_vector(embedder.embed(chunk.full_text))},
-        model_name=embedder.model_name,
-        dimension=embedder.dimension,
     )
-    retriever = HybridRetriever(store, embedder)
+    retriever = HybridRetriever(store)
     ranked = retriever.retrieve("section 14.2.1")
     assert ranked
     assert ranked[0].section_number == "14.2.1"
@@ -319,10 +315,69 @@ def test_date_like_schedule_noise_is_penalized_for_equipment_queries() -> None:
     assert ranked[0].chunk_id == "steam_valves"
 
 
+def test_typo_rescue_recovers_heading_when_primary_terms_are_misspelled() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "termination",
+                "12.1",
+                "Owner Termination for Convenience",
+                "Owner may terminate this Contract for convenience upon written notice.",
+                50,
+            ),
+            _chunk(
+                "receptacles",
+                "4.4.8.10",
+                "Convenience Receptacles",
+                "Convenience receptacles shall be installed in temporary facilities.",
+                88,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("terminat for convenience")
+
+    assert ranked
+    assert ranked[0].chunk_id == "termination"
+
+
+def test_rescue_search_is_skipped_when_primary_relevance_is_already_strong(monkeypatch) -> None:
+    db_path = "file:retrieval_rescue_gate?mode=memory&cache=shared"
+    store = ContractStore(db_path)
+    chunk = _chunk(
+        "motors",
+        "4.4.3",
+        "Electric Motors",
+        "Electric motors must meet the design requirements for the project.",
+        12,
+    )
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc",
+        page_count=1,
+        chunks=[chunk],
+        pages=[PageText(page_num=12, text=chunk.full_text, ocr_used=False)],
+        features=build_chunk_features([chunk]),
+    )
+    retriever = HybridRetriever(store)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("rescue search should not run for a strong lexical hit")
+
+    monkeypatch.setattr(store, "search_chunk_feature_rescue_fts", fail_if_called)
+
+    ranked = retriever.retrieve("What does the contract say about electric motors?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "motors"
+
+
 def _seed_retriever(chunks: list[ChunkRecord]) -> HybridRetriever:
     db_path = "file:retrieval_suite?mode=memory&cache=shared"
     store = ContractStore(db_path)
-    embedder = HashingEmbedder(dimension=16)
     pages = [PageText(page_num=chunk.page_start, text=chunk.full_text, ocr_used=False) for chunk in chunks]
     store.replace_document(
         document_id="doc1",
@@ -334,11 +389,8 @@ def _seed_retriever(chunks: list[ChunkRecord]) -> HybridRetriever:
         chunks=chunks,
         pages=pages,
         features=build_chunk_features(chunks),
-        embeddings={chunk.chunk_id: pack_vector(embedder.embed(chunk.full_text)) for chunk in chunks},
-        model_name=embedder.model_name,
-        dimension=embedder.dimension,
     )
-    return HybridRetriever(store, embedder)
+    return HybridRetriever(store)
 
 
 def _chunk(

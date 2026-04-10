@@ -19,7 +19,7 @@ from epc_smart_search.app_paths import DB_PATH, GEMMA_TEST_PYTHON, WORKSPACE_ROO
 from epc_smart_search.config import GEMMA_SERVICE_HOST, GEMMA_SERVICE_PORT, SEARCH_SCHEMA_VERSION
 from epc_smart_search.gemma_client import GemmaServiceClient as ManagedGemmaServiceClient
 from epc_smart_search.query_planner import QueryPlan, plan_query
-from epc_smart_search.retrieval import Citation, ExactPageHit, HashingEmbedder, HybridRetriever, RankedChunk
+from epc_smart_search.retrieval import Citation, ExactPageHit, HybridRetriever, RankedChunk
 from epc_smart_search.storage import ContractStore
 
 
@@ -33,6 +33,7 @@ class IndexValidationResult:
     document_id: str | None
     chunk_count: int = 0
     feature_count: int = 0
+    page_text_count: int = 0
 
 
 SUMMARY_MAX_NEW_TOKENS = 768
@@ -69,7 +70,24 @@ def validate_contract_store(store: ContractStore) -> IndexValidationResult:
             chunk_count=chunk_count,
             feature_count=feature_count,
         )
-    return IndexValidationResult(True, None, document_id, chunk_count=chunk_count, feature_count=feature_count)
+    page_text_count = store.get_page_text_count(document_id)
+    if page_text_count <= 0:
+        return IndexValidationResult(
+            False,
+            "Bundled contract data is missing page evidence.",
+            document_id,
+            chunk_count=chunk_count,
+            feature_count=feature_count,
+            page_text_count=page_text_count,
+        )
+    return IndexValidationResult(
+        True,
+        None,
+        document_id,
+        chunk_count=chunk_count,
+        feature_count=feature_count,
+        page_text_count=page_text_count,
+    )
 
 
 class GemmaServiceClient:
@@ -153,7 +171,7 @@ class ContractAssistant:
     def __init__(self, db_path: str | Path = DB_PATH) -> None:
         seed_preloaded_db()
         self.store = ContractStore(db_path)
-        self.retriever = HybridRetriever(self.store, HashingEmbedder())
+        self.retriever = HybridRetriever(self.store)
         self.gemma = ManagedGemmaServiceClient()
         self.answer_policy = AnswerPolicy(self.store, self.retriever)
 

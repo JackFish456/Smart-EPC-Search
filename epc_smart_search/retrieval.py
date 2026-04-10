@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-import hashlib
-import math
 import re
 from dataclasses import dataclass
 
-from epc_smart_search.config import MAX_EMBEDDING_DIM, MAX_SEARCH_RESULTS, MAX_SEMANTIC_SCAN
+from epc_smart_search.config import MAX_SEARCH_RESULTS
 from epc_smart_search.query_planner import (
     QueryPlan,
-    build_like_fallback,
     build_match_queries,
     has_term_overlap,
     plan_query,
 )
-from epc_smart_search.storage import ContractStore, unpack_vector
+from epc_smart_search.storage import ContractStore
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{1,}")
 
@@ -63,8 +60,7 @@ class RetrievalProfile:
     name: str
     result_limit: int
     fts_limit: int
-    keyword_limit: int
-    semantic_limit: int
+    rescue_limit: int
     use_query_expansion: bool = False
 
 
@@ -72,49 +68,15 @@ DEFAULT_RETRIEVAL_PROFILE = RetrievalProfile(
     name="normal",
     result_limit=MAX_SEARCH_RESULTS,
     fts_limit=24,
-    keyword_limit=18,
-    semantic_limit=MAX_SEMANTIC_SCAN,
+    rescue_limit=18,
 )
 DEEP_RETRIEVAL_PROFILE = RetrievalProfile(
     name="deep",
     result_limit=10,
     fts_limit=40,
-    keyword_limit=30,
-    semantic_limit=36,
+    rescue_limit=30,
     use_query_expansion=True,
 )
-
-
-class HashingEmbedder:
-    def __init__(self, dimension: int = MAX_EMBEDDING_DIM) -> None:
-        self.dimension = dimension
-        self.model_name = f"hashing-embedder-{dimension}"
-
-    def embed(self, text: str) -> list[float]:
-        vector = [0.0] * self.dimension
-        normalized = " ".join(text.lower().split())
-        tokens = TOKEN_RE.findall(normalized)
-        for token in tokens:
-            self._add_feature(vector, f"tok:{token}", 1.0)
-        collapsed = normalized.replace(" ", "_")
-        for index in range(max(0, len(collapsed) - 2)):
-            self._add_feature(vector, f"tri:{collapsed[index:index + 3]}", 0.35)
-        norm = math.sqrt(sum(value * value for value in vector))
-        if norm == 0:
-            return vector
-        return [value / norm for value in vector]
-
-    def _add_feature(self, vector: list[float], feature: str, weight: float) -> None:
-        digest = hashlib.sha1(feature.encode("utf-8")).digest()
-        index = int.from_bytes(digest[:4], "big") % self.dimension
-        sign = 1.0 if digest[4] % 2 == 0 else -1.0
-        vector[index] += sign * weight
-
-
-def cosine_similarity(left: list[float], right: list[float]) -> float:
-    if not left or not right:
-        return 0.0
-    return sum(a * b for a, b in zip(left, right))
 
 
 def build_match_query(query: str) -> str:
@@ -131,9 +93,8 @@ def build_match_query(query: str) -> str:
 
 
 class HybridRetriever:
-    def __init__(self, store: ContractStore, embedder: HashingEmbedder) -> None:
+    def __init__(self, store: ContractStore, embedder: object | None = None) -> None:
         self.store = store
-        self.embedder = embedder
 
     def resolve_document_id(self) -> str | None:
         document = self.store.get_document()
@@ -151,38 +112,36 @@ class HybridRetriever:
             return []
         plan = plan_query(query)
         active_profile = self._resolve_profile(profile, limit)
-        semantic_query = plan.content_query or query
         combined: dict[str, SearchCandidate] = {}
 
         if plan.section_number:
             for row in self.store.section_lookup(document_id, plan.section_number):
-                candidate = self._score_row(plan, row, lexical_score=1.0, semantic_score=0.85, bonus=0.9)
+                candidate = self._score_row(plan, row, lexical_score=1.0, bonus=1.15)
                 combined[str(row["chunk_id"])] = candidate
+
+        if plan.content_query:
+            for row in self.store.heading_lookup(document_id, plan.content_query):
+                candidate = self._score_row(plan, row, lexical_score=1.0, bonus=0.85)
+                self._merge_candidate(combined, candidate)
 
         for match_query in self._match_queries_for_profile(plan, active_profile):
             for row in self.store.search_chunk_feature_fts(document_id, match_query, limit=active_profile.fts_limit):
-                lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
-                semantic_score = self._semantic_for_row(semantic_query, row)
-                candidate = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
+                lexical_score = self._lexical_score_from_rank(row["rank_score"])
+                candidate = self._score_row(plan, row, lexical_score=lexical_score)
                 self._merge_candidate(combined, candidate)
 
-        if not combined:
-            for fallback_query in self._fallback_queries_for_profile(plan, active_profile):
-                for row in self.store.keyword_like_search(document_id, fallback_query, limit=active_profile.keyword_limit):
-                    lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
-                    semantic_score = self._semantic_for_row(semantic_query, row)
-                    candidate = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
+        if self._primary_evidence_is_weak(plan, combined):
+            for rescue_query in self._rescue_queries_for_profile(plan, active_profile):
+                for row in self.store.search_chunk_feature_rescue_fts(
+                    document_id,
+                    rescue_query,
+                    limit=active_profile.rescue_limit,
+                ):
+                    lexical_score = self._rescue_score(plan, row)
+                    if lexical_score <= 0.0:
+                        continue
+                    candidate = self._score_row(plan, row, lexical_score=lexical_score, bonus=-0.05)
                     self._merge_candidate(combined, candidate)
-
-        if not combined:
-            query_vector = self.embedder.embed(semantic_query)
-            for row, semantic_score in self._semantic_candidates(
-                document_id,
-                query_vector,
-                limit=active_profile.semantic_limit,
-            ):
-                candidate = self._score_row(plan, row, lexical_score=0.0, semantic_score=semantic_score)
-                self._merge_candidate(combined, candidate)
 
         ranked = [
             RankedChunk(
@@ -284,22 +243,6 @@ class HybridRetriever:
                     return hits
         return hits
 
-    def _semantic_candidates(
-        self,
-        document_id: str,
-        query_vector: list[float],
-        *,
-        limit: int = MAX_SEMANTIC_SCAN,
-    ) -> list[tuple[dict, float]]:
-        rows = self.store.iter_embeddings(document_id)
-        scored: list[tuple[dict, float]] = []
-        for row in rows:
-            semantic_score = cosine_similarity(query_vector, unpack_vector(row["vector_blob"]))
-            if semantic_score > 0:
-                scored.append((row, semantic_score))
-        scored.sort(key=lambda item: item[1], reverse=True)
-        return scored[:limit]
-
     @staticmethod
     def _resolve_profile(profile: str, limit: int | None) -> RetrievalProfile:
         selected = DEEP_RETRIEVAL_PROFILE if profile == "deep" else DEFAULT_RETRIEVAL_PROFILE
@@ -309,8 +252,7 @@ class HybridRetriever:
             name=selected.name,
             result_limit=limit,
             fts_limit=selected.fts_limit,
-            keyword_limit=selected.keyword_limit,
-            semantic_limit=selected.semantic_limit,
+            rescue_limit=selected.rescue_limit,
             use_query_expansion=selected.use_query_expansion,
         )
 
@@ -322,12 +264,13 @@ class HybridRetriever:
             queries.extend(build_match_queries(plan_query(variant)))
         return self._dedupe_queries(queries)
 
-    def _fallback_queries_for_profile(self, plan: QueryPlan, profile: RetrievalProfile) -> list[str]:
-        queries = [build_like_fallback(plan)]
-        if not profile.use_query_expansion:
-            return [query for query in queries if query]
-        for variant in self._query_variants(plan):
-            queries.append(build_like_fallback(plan_query(variant)))
+    def _rescue_queries_for_profile(self, plan: QueryPlan, profile: RetrievalProfile) -> list[str]:
+        rescue_sources = [plan.content_query]
+        rescue_sources.extend(plan.focus_terms)
+        rescue_sources.extend(self._focus_phrases(plan.focus_terms))
+        if profile.use_query_expansion:
+            rescue_sources.extend(self._query_variants(plan))
+        queries = [query for query in (self._build_trigram_query(source) for source in rescue_sources) if query]
         return self._dedupe_queries(queries)
 
     def _query_variants(self, plan: QueryPlan) -> list[str]:
@@ -346,11 +289,6 @@ class HybridRetriever:
             seen.add(normalized.lower())
             deduped.append(normalized)
         return deduped
-
-    @staticmethod
-    def _row_vector(row: dict) -> list[float]:
-        blob = row["vector_blob"] if "vector_blob" in row.keys() else None
-        return unpack_vector(blob) if blob else []
 
     @staticmethod
     def _short_quote(text: str, limit: int = 340) -> str:
@@ -416,11 +354,86 @@ class HybridRetriever:
             return f"Appendix {section_number.upper()}"
         return heading
 
-    def _semantic_for_row(self, query: str, row: dict) -> float:
-        vector = self._row_vector(row)
-        if vector:
-            return cosine_similarity(self.embedder.embed(query), vector)
-        return 0.0
+    @staticmethod
+    def _lexical_score_from_rank(rank_score: object) -> float:
+        return 1.0 / (1.0 + max(float(rank_score), 0.0))
+
+    def _primary_evidence_is_weak(self, plan: QueryPlan, combined: dict[str, SearchCandidate]) -> bool:
+        if not combined:
+            return True
+        top_candidates = sorted(combined.values(), key=lambda item: item.total_score, reverse=True)[:3]
+        for candidate in top_candidates:
+            if self._is_strong_match(plan, candidate):
+                return False
+        return True
+
+    def _is_strong_match(self, plan: QueryPlan, candidate: SearchCandidate) -> bool:
+        row = candidate.row
+        if row["section_number"] and row["section_number"] == plan.section_number:
+            return True
+        heading = str(row["heading"])
+        full_text = str(row["full_text"])
+        combined_text = " ".join([heading, full_text, str(row["parent_heading"] or "")])
+        if plan.content_query and (
+            has_term_overlap(heading, (plan.content_query,))
+            or has_term_overlap(full_text, (plan.content_query,))
+        ):
+            return True
+        if plan.focus_terms and self._term_hit_count(combined_text, plan.focus_terms) >= max(2, len(plan.focus_terms) - 1):
+            return True
+        return candidate.total_score >= 2.9
+
+    @staticmethod
+    def _build_trigram_query(text: str) -> str:
+        normalized = " ".join(text.lower().split())
+        cleaned = "".join(ch for ch in normalized if ch.isalnum() or ch.isspace()).strip()
+        if len(cleaned.replace(" ", "")) < 4:
+            return ""
+        trigrams: list[str] = []
+        collapsed = cleaned.replace(" ", "")
+        for index in range(len(collapsed) - 2):
+            trigram = collapsed[index:index + 3]
+            if trigram not in trigrams:
+                trigrams.append(trigram)
+        return " OR ".join(f'"{trigram}"' for trigram in trigrams[:24])
+
+    def _rescue_score(self, plan: QueryPlan, row: dict) -> float:
+        rescue_targets = [
+            str(row["heading"]),
+            str(row["parent_heading"] or ""),
+            str(row["rescue_text"] or ""),
+            str(row["topic_tags"] or ""),
+        ]
+        query_variants = [plan.content_query, *plan.focus_terms, *self._focus_phrases(plan.focus_terms)]
+        best_similarity = max(
+            (
+                self._trigram_similarity(query, target)
+                for query in query_variants
+                if query
+                for target in rescue_targets
+                if target
+            ),
+            default=0.0,
+        )
+        if best_similarity < 0.34:
+            return 0.0
+        return min(0.92, 0.34 + (best_similarity * 0.58))
+
+    @staticmethod
+    def _trigram_similarity(left: str, right: str) -> float:
+        left_set = HybridRetriever._trigram_set(left)
+        right_set = HybridRetriever._trigram_set(right)
+        if not left_set or not right_set:
+            return 0.0
+        overlap = len(left_set & right_set)
+        return (2.0 * overlap) / (len(left_set) + len(right_set))
+
+    @staticmethod
+    def _trigram_set(text: str) -> set[str]:
+        normalized = "".join(ch for ch in " ".join(text.lower().split()) if ch.isalnum())
+        if len(normalized) < 3:
+            return set()
+        return {normalized[index:index + 3] for index in range(len(normalized) - 2)}
 
     @staticmethod
     def _merge_candidate(combined: dict[str, SearchCandidate], candidate: SearchCandidate) -> None:
@@ -435,7 +448,6 @@ class HybridRetriever:
         row: dict,
         *,
         lexical_score: float,
-        semantic_score: float,
         bonus: float = 0.0,
     ) -> SearchCandidate:
         heading = str(row["heading"])
@@ -448,7 +460,7 @@ class HybridRetriever:
         combined_text = " ".join([heading, parent_heading, full_text, actor_tags, action_tags, topic_tags])
         focus_phrases = self._focus_phrases(plan.focus_terms)
 
-        score = lexical_score * 0.55 + semantic_score * 0.15 + bonus
+        score = lexical_score * 0.85 + bonus
         if row["section_number"] and row["section_number"] == plan.section_number:
             score += 1.2
         if plan.content_query:
@@ -480,7 +492,9 @@ class HybridRetriever:
         score += 0.16 * self._term_hit_count(combined_text, plan.focus_terms)
         score += 0.12 * self._term_hit_count(combined_text, plan.actor_terms + plan.action_terms + plan.topic_terms + plan.expansion_terms)
         if plan.intent == "definition" and clause_type == "definition":
-            score += 1.0
+            score += 1.35
+            if plan.content_query and has_term_overlap(full_text, (plan.content_query,)):
+                score += 0.65
         if plan.intent == "responsibility" and re.search(r"\b(shall|must|responsible|required)\b", full_text, re.IGNORECASE):
             score += 0.55
             if ("permit" in plan.action_terms or "permitting" in plan.topic_terms) and not has_term_overlap(
@@ -512,7 +526,7 @@ class HybridRetriever:
             row=row,
             total_score=score,
             lexical_score=lexical_score,
-            semantic_score=semantic_score,
+            semantic_score=0.0,
         )
 
     @staticmethod

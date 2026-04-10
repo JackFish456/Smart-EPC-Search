@@ -61,6 +61,18 @@ def test_validate_contract_store_rejects_missing_features() -> None:
     assert "missing search features" in (status.error or "").lower()
 
 
+def test_validate_contract_store_rejects_missing_page_evidence() -> None:
+    store = _seed_store(_memory_db_uri("no_pages"))
+    with store._connect() as connection:  # noqa: SLF001
+        connection.execute("DELETE FROM contract_pages WHERE document_id = ?", ("doc1",))
+        connection.commit()
+
+    status = validate_contract_store(store)
+
+    assert status.ready is False
+    assert "page evidence" in (status.error or "").lower()
+
+
 def test_contract_assistant_build_index_is_internal_only() -> None:
     assistant = ContractAssistant.__new__(ContractAssistant)
 
@@ -284,9 +296,6 @@ def _seed_store(db_path: str | Path, *, with_features: bool = True) -> ContractS
         chunks=[chunk],
         pages=[PageText(page_num=1, text=chunk.full_text, ocr_used=False)],
         features=features,
-        embeddings={"chunk1": b"\x00\x00\x00\x00"},
-        model_name="test",
-        dimension=1,
     )
     return store
 

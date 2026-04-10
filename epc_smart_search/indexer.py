@@ -8,9 +8,8 @@ import fitz
 
 from epc_smart_search.chunking import ChunkRecord, build_document_id, parse_chunks
 from epc_smart_search.ocr_support import extract_pages
-from epc_smart_search.retrieval import HashingEmbedder
 from epc_smart_search.search_features import build_chunk_features
-from epc_smart_search.storage import ContractStore, pack_vector
+from epc_smart_search.storage import ContractStore
 
 
 def _sha256(path: Path) -> str:
@@ -37,14 +36,6 @@ def build_index(
     if progress_callback:
         progress_callback("Parsing contract structure...")
     chunks = parse_chunks(pages, document_id)
-
-    if progress_callback:
-        progress_callback("Building local embeddings...")
-    embedder = HashingEmbedder()
-    embeddings = {
-        chunk.chunk_id: pack_vector(embedder.embed(f"{chunk.section_number or ''} {chunk.heading}\n{chunk.full_text}"))
-        for chunk in chunks
-    }
     features = build_chunk_features(chunks)
 
     if progress_callback:
@@ -62,9 +53,6 @@ def build_index(
         chunks=chunks,
         pages=pages,
         features=features,
-        embeddings=embeddings,
-        model_name=embedder.model_name,
-        dimension=embedder.dimension,
     )
     return {
         "document_id": document_id,

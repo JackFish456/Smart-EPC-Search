@@ -57,7 +57,7 @@ class ChunkFeatures:
     heading: str
     parent_heading: str
     search_text: str
-    normalized_text: str
+    rescue_text: str
     clause_type: str
     actor_tags: str
     action_tags: str
@@ -99,6 +99,15 @@ def build_chunk_features(chunks: list[ChunkRecord]) -> list[ChunkFeatures]:
         action_tags = _detect_tags(combined, ACTION_LEXICON)
         topic_tags = _detect_tags(combined, TOPIC_LEXICON)
         noise_flags = _noise_flags(chunk, normalized_heading, normalized_body)
+        rescue_text = _build_rescue_text(
+            chunk.section_number or "",
+            normalized_heading,
+            normalized_parent,
+            normalized_body,
+            actor_tags,
+            action_tags,
+            topic_tags,
+        )
         search_terms = _dedupe_preserve_order(
             [
                 chunk.section_number or "",
@@ -119,7 +128,7 @@ def build_chunk_features(chunks: list[ChunkRecord]) -> list[ChunkFeatures]:
                 heading=chunk.heading,
                 parent_heading=parent_heading,
                 search_text=" ".join(term for term in search_terms if term),
-                normalized_text=combined,
+                rescue_text=rescue_text,
                 clause_type=chunk.chunk_type,
                 actor_tags=actor_tags,
                 action_tags=action_tags,
@@ -150,6 +159,28 @@ def _noise_flags(chunk: ChunkRecord, normalized_heading: str, normalized_body: s
     if len(tokenize(normalized_heading)) <= 1 and len(tokenize(normalized_body)) <= 8:
         flags.append("thin")
     return flags
+
+
+def _build_rescue_text(
+    section_number: str,
+    normalized_heading: str,
+    normalized_parent: str,
+    normalized_body: str,
+    actor_tags: str,
+    action_tags: str,
+    topic_tags: str,
+) -> str:
+    body_tokens = tokenize(normalized_body)[:36]
+    parts = [
+        section_number,
+        normalized_heading,
+        normalized_parent,
+        " ".join(body_tokens),
+        actor_tags,
+        action_tags,
+        topic_tags,
+    ]
+    return " ".join(part for part in parts if part)
 
 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:

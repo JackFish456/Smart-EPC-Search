@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 from pathlib import Path
 
@@ -13,14 +14,20 @@ ASSETS_DIR = WORKSPACE_ROOT / "assets"
 GEMMA_TEST_ROOT = DESKTOP_ROOT / "Gemma Test"
 
 
+def _default_gemma_venv_python(gemma_root: Path) -> Path:
+    if sys.platform == "win32":
+        return gemma_root / ".venv" / "Scripts" / "python.exe"
+    return gemma_root / ".venv" / "bin" / "python"
+
+
 def resolve_gemma_test_python() -> Path:
     explicit_python = os.environ.get("EPC_GEMMA_PYTHON", "").strip()
     if explicit_python:
         return Path(explicit_python).expanduser()
     explicit_root = os.environ.get("EPC_GEMMA_TEST_ROOT", "").strip()
     if explicit_root:
-        return Path(explicit_root).expanduser() / ".venv" / "Scripts" / "python.exe"
-    return GEMMA_TEST_ROOT / ".venv" / "Scripts" / "python.exe"
+        return _default_gemma_venv_python(Path(explicit_root).expanduser())
+    return _default_gemma_venv_python(GEMMA_TEST_ROOT)
 
 
 def _supports_sqlite(candidate: Path) -> bool:

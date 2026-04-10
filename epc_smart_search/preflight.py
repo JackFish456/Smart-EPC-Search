@@ -110,8 +110,8 @@ def collect_package_preflight_issues(prebuilt_db_path: str | None) -> list[Prefl
                 severity="error",
                 code="missing_prebuilt_db",
                 message=(
-                    f"Provide a prebuilt contract database via -PrebuiltDbPath or {PREBUILT_DB_ENV_VAR}. "
-                    "Keep that file outside the workspace."
+                    f"Provide a prebuilt contract database via package script flags, --prebuilt-db, "
+                    f"or {PREBUILT_DB_ENV_VAR}. Keep that file outside the workspace."
                 ),
             )
         )
