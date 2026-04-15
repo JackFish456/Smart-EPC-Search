@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.ocr_support import PageText
-from epc_smart_search.retrieval import HybridRetriever
+from epc_smart_search.retrieval import HybridRetriever, SearchCoverageCase
 from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractStore
 
@@ -117,6 +117,23 @@ def test_typo_rescue_precision_does_not_promote_known_wrong_clauses() -> None:
 
     ranked = retriever.retrieve("substantive completion")
     assert ranked[0].chunk_id != "schedule_clause"
+
+
+def test_coverage_case_evaluation_tracks_stage_outcomes() -> None:
+    retriever = _seed_retriever()
+
+    results = retriever.evaluate_coverage_cases(
+        [
+            SearchCoverageCase(
+                label="permiting",
+                query="permiting",
+                expected_chunk_id="permit_clause",
+            )
+        ]
+    )
+
+    assert results[0].found is True
+    assert results[0].retrieval_stage in {"chunk_fts", "block_fts", "trigram_rescue"}
 
 
 def _seed_retriever() -> HybridRetriever:

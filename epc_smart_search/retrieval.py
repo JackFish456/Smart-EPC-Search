@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from epc_smart_search.config import MAX_SEARCH_RESULTS
 from epc_smart_search.query_planner import (
@@ -45,6 +45,9 @@ class RankedChunk:
     total_score: float
     lexical_score: float
     semantic_score: float
+    retrieval_stage: str = "unknown"
+    matched_block_count: int = 0
+    matched_terms: int = 0
 
 
 @dataclass(slots=True)
@@ -53,6 +56,10 @@ class SearchCandidate:
     total_score: float
     lexical_score: float
     semantic_score: float
+    retrieval_stage: str = "unknown"
+    matched_block_ids: set[str] = field(default_factory=set)
+    matched_terms: set[str] = field(default_factory=set)
+    supporting_stages: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True, frozen=True)
@@ -62,6 +69,23 @@ class RetrievalProfile:
     fts_limit: int
     rescue_limit: int
     use_query_expansion: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class SearchCoverageCase:
+    label: str
+    query: str
+    expected_chunk_id: str
+
+
+@dataclass(slots=True)
+class SearchCoverageResult:
+    label: str
+    query: str
+    expected_chunk_id: str
+    found: bool
+    top_chunk_id: str | None
+    retrieval_stage: str | None
 
 
 DEFAULT_RETRIEVAL_PROFILE = RetrievalProfile(
@@ -116,19 +140,28 @@ class HybridRetriever:
 
         if plan.section_number:
             for row in self.store.section_lookup(document_id, plan.section_number):
-                candidate = self._score_row(plan, row, lexical_score=1.0, bonus=1.15)
+                candidate = self._score_row(plan, row, lexical_score=1.0, bonus=1.15, retrieval_stage="exact_lookup")
                 combined[str(row["chunk_id"])] = candidate
 
         if plan.content_query:
             for row in self.store.heading_lookup(document_id, plan.content_query):
-                candidate = self._score_row(plan, row, lexical_score=1.0, bonus=0.85)
+                candidate = self._score_row(plan, row, lexical_score=1.0, bonus=0.85, retrieval_stage="exact_lookup")
                 self._merge_candidate(combined, candidate)
 
         for match_query in self._match_queries_for_profile(plan, active_profile):
             for row in self.store.search_chunk_feature_fts(document_id, match_query, limit=active_profile.fts_limit):
                 lexical_score = self._lexical_score_from_rank(row["rank_score"])
-                candidate = self._score_row(plan, row, lexical_score=lexical_score)
+                candidate = self._score_row(plan, row, lexical_score=lexical_score, retrieval_stage="chunk_fts")
                 self._merge_candidate(combined, candidate)
+
+        if self._primary_evidence_is_weak(plan, combined):
+            for block_query in self._block_queries_for_profile(plan, active_profile):
+                for row in self.store.search_block_fts(document_id, block_query, limit=active_profile.fts_limit):
+                    lexical_score = self._lexical_score_from_rank(row["rank_score"])
+                    candidate = self._score_block_row(plan, row, lexical_score=lexical_score, retrieval_stage="block_fts")
+                    if candidate is None:
+                        continue
+                    self._merge_candidate(combined, candidate)
 
         if self._primary_evidence_is_weak(plan, combined):
             for rescue_query in self._rescue_queries_for_profile(plan, active_profile):
@@ -140,7 +173,26 @@ class HybridRetriever:
                     lexical_score = self._rescue_score(plan, row)
                     if lexical_score <= 0.0:
                         continue
-                    candidate = self._score_row(plan, row, lexical_score=lexical_score, bonus=-0.05)
+                    candidate = self._score_row(
+                        plan,
+                        row,
+                        lexical_score=lexical_score,
+                        bonus=-0.05,
+                        retrieval_stage="trigram_rescue",
+                    )
+                    self._merge_candidate(combined, candidate)
+                for row in self.store.search_block_rescue_fts(document_id, rescue_query, limit=active_profile.rescue_limit):
+                    lexical_score = self._rescue_score(plan, row)
+                    if lexical_score <= 0.0:
+                        continue
+                    candidate = self._score_block_row(
+                        plan,
+                        row,
+                        lexical_score=lexical_score,
+                        retrieval_stage="trigram_rescue",
+                    )
+                    if candidate is None:
+                        continue
                     self._merge_candidate(combined, candidate)
 
         ranked = [
@@ -152,13 +204,37 @@ class HybridRetriever:
                 page_start=int(candidate.row["page_start"]),
                 page_end=int(candidate.row["page_end"]),
                 ordinal_in_document=int(candidate.row["ordinal_in_document"]),
-                total_score=candidate.total_score,
+                total_score=self._final_score(plan, candidate),
                 lexical_score=candidate.lexical_score,
                 semantic_score=candidate.semantic_score,
+                retrieval_stage=candidate.retrieval_stage,
+                matched_block_count=len(candidate.matched_block_ids),
+                matched_terms=len(candidate.matched_terms),
             )
-            for candidate in sorted(combined.values(), key=lambda item: item.total_score, reverse=True)[: active_profile.result_limit]
+            for candidate in sorted(
+                combined.values(),
+                key=lambda item: self._final_score(plan, item),
+                reverse=True,
+            )[: active_profile.result_limit]
         ]
         return ranked
+
+    def evaluate_coverage_cases(self, cases: list[SearchCoverageCase]) -> list[SearchCoverageResult]:
+        results: list[SearchCoverageResult] = []
+        for case in cases:
+            ranked = self.retrieve(case.query)
+            top = ranked[0] if ranked else None
+            results.append(
+                SearchCoverageResult(
+                    label=case.label,
+                    query=case.query,
+                    expected_chunk_id=case.expected_chunk_id,
+                    found=bool(top and top.chunk_id == case.expected_chunk_id),
+                    top_chunk_id=top.chunk_id if top else None,
+                    retrieval_stage=top.retrieval_stage if top else None,
+                )
+            )
+        return results
 
     def expand_with_context(self, ranked: list[RankedChunk]) -> list[Citation]:
         document_id = self.resolve_document_id()
@@ -241,6 +317,21 @@ class HybridRetriever:
                 )
                 if len(hits) >= limit:
                     return hits
+            block_rows = self.store.search_blocks_exact(document_id, match_query, limit=limit)
+            for row in block_rows:
+                page_num = int(row["page_num"])
+                if page_num in seen_pages:
+                    continue
+                seen_pages.add(page_num)
+                hits.append(
+                    ExactPageHit(
+                        page_num=page_num,
+                        snippet=self._clean_snippet(str(row["hit_snippet"])),
+                        page_text=str(row["block_text"]),
+                    )
+                )
+                if len(hits) >= limit:
+                    return hits
         return hits
 
     @staticmethod
@@ -262,6 +353,22 @@ class HybridRetriever:
             return queries
         for variant in self._query_variants(plan):
             queries.extend(build_match_queries(plan_query(variant)))
+        return self._dedupe_queries(queries)
+
+    def _block_queries_for_profile(self, plan: QueryPlan, profile: RetrievalProfile) -> list[str]:
+        queries: list[str] = []
+        candidates = [plan.content_query, *plan.focus_terms, *self._focus_phrases(plan.focus_terms)]
+        candidates.extend(plan.actor_terms)
+        candidates.extend(plan.action_terms)
+        candidates.extend(plan.topic_terms)
+        candidates.extend(plan.expansion_terms)
+        if profile.use_query_expansion:
+            candidates.extend(self._query_variants(plan))
+        queries.extend(
+            query
+            for query in (build_match_query(candidate) for candidate in candidates if candidate)
+            if query
+        )
         return self._dedupe_queries(queries)
 
     def _rescue_queries_for_profile(self, plan: QueryPlan, profile: RetrievalProfile) -> list[str]:
@@ -347,7 +454,7 @@ class HybridRetriever:
 
     @staticmethod
     def _normalize_attachment_heading(heading: str, section_number: str) -> str:
-        match = re.match(r"^(attachment|appendix|exhibit)\s+([A-Z0-9.\-]+)\b", heading, flags=re.IGNORECASE)
+        match = re.match(r"^(attachment|appendix|exhibit|annex|schedule)\s+([A-Z0-9.\-]+)\b", heading, flags=re.IGNORECASE)
         if match:
             return f"{match.group(1).title()} {match.group(2)}"
         if section_number and len(section_number) <= 4 and section_number.isalpha():
@@ -361,7 +468,7 @@ class HybridRetriever:
     def _primary_evidence_is_weak(self, plan: QueryPlan, combined: dict[str, SearchCandidate]) -> bool:
         if not combined:
             return True
-        top_candidates = sorted(combined.values(), key=lambda item: item.total_score, reverse=True)[:3]
+        top_candidates = sorted(combined.values(), key=lambda item: self._final_score(plan, item), reverse=True)[:3]
         for candidate in top_candidates:
             if self._is_strong_match(plan, candidate):
                 return False
@@ -381,7 +488,7 @@ class HybridRetriever:
             return True
         if plan.focus_terms and self._term_hit_count(combined_text, plan.focus_terms) >= max(2, len(plan.focus_terms) - 1):
             return True
-        return candidate.total_score >= 2.9
+        return self._final_score(plan, candidate) >= 2.9
 
     @staticmethod
     def _build_trigram_query(text: str) -> str:
@@ -398,10 +505,16 @@ class HybridRetriever:
         return " OR ".join(f'"{trigram}"' for trigram in trigrams[:24])
 
     def _rescue_score(self, plan: QueryPlan, row: dict) -> float:
+        row_keys = set(row.keys()) if hasattr(row, "keys") else set()
         rescue_targets = [
             str(row["heading"]),
             str(row["parent_heading"] or ""),
-            str(row["rescue_text"] or ""),
+            str(
+                row["rescue_text"] if "rescue_text" in row_keys else
+                row["normalized_text"] if "normalized_text" in row_keys else
+                row["block_text"] if "block_text" in row_keys else
+                ""
+            ),
             str(row["topic_tags"] or ""),
         ]
         query_variants = [plan.content_query, *plan.focus_terms, *self._focus_phrases(plan.focus_terms)]
@@ -439,8 +552,17 @@ class HybridRetriever:
     def _merge_candidate(combined: dict[str, SearchCandidate], candidate: SearchCandidate) -> None:
         chunk_id = str(candidate.row["chunk_id"])
         existing = combined.get(chunk_id)
-        if existing is None or candidate.total_score > existing.total_score:
+        if existing is None:
             combined[chunk_id] = candidate
+            return
+        existing.total_score = max(existing.total_score, candidate.total_score)
+        existing.lexical_score = max(existing.lexical_score, candidate.lexical_score)
+        existing.semantic_score = max(existing.semantic_score, candidate.semantic_score)
+        existing.matched_block_ids.update(candidate.matched_block_ids)
+        existing.matched_terms.update(candidate.matched_terms)
+        existing.supporting_stages.update(candidate.supporting_stages)
+        if HybridRetriever._stage_priority(candidate.retrieval_stage) > HybridRetriever._stage_priority(existing.retrieval_stage):
+            existing.retrieval_stage = candidate.retrieval_stage
 
     def _score_row(
         self,
@@ -449,6 +571,7 @@ class HybridRetriever:
         *,
         lexical_score: float,
         bonus: float = 0.0,
+        retrieval_stage: str,
     ) -> SearchCandidate:
         heading = str(row["heading"])
         parent_heading = str(row["parent_heading"] or "")
@@ -527,7 +650,83 @@ class HybridRetriever:
             total_score=score,
             lexical_score=lexical_score,
             semantic_score=0.0,
+            retrieval_stage=retrieval_stage,
+            matched_terms=self._matched_terms_in_text(plan, combined_text),
+            supporting_stages={retrieval_stage},
         )
+
+    def _score_block_row(
+        self,
+        plan: QueryPlan,
+        row: dict,
+        *,
+        lexical_score: float,
+        retrieval_stage: str,
+    ) -> SearchCandidate | None:
+        if not row["heading"] or not row["full_text"]:
+            return None
+        parent_candidate = self._score_row(
+            plan,
+            row,
+            lexical_score=max(0.08, lexical_score * 0.75),
+            bonus=-0.05,
+            retrieval_stage=retrieval_stage,
+        )
+        block_text = str(row["block_text"] or "")
+        block_type = str(row["block_type"] or "")
+        noise_flags = set(str(row["noise_flags"] or "").split()) | set(str(row["block_noise_flags"] or row["noise_flags"] or "").split())
+        block_bonus = 0.0
+        if plan.content_query and has_term_overlap(block_text, (plan.content_query,)):
+            block_bonus += 0.55
+        if has_term_overlap(block_text, plan.focus_terms):
+            block_bonus += 0.35
+        if block_type == "heading":
+            block_bonus += 0.28
+        if block_type == "table_row":
+            block_bonus += 0.18
+        if "table_like" in noise_flags:
+            block_bonus += 0.1
+        if "schedule_like" in noise_flags and plan.intent not in {"delay_schedule", "direct_text"}:
+            block_bonus -= 0.18
+        if "date_heading" in noise_flags:
+            block_bonus -= 0.12
+        parent_candidate.total_score += block_bonus
+        parent_candidate.matched_block_ids.add(str(row["block_id"]))
+        parent_candidate.matched_terms.update(self._matched_terms_in_text(plan, block_text))
+        return parent_candidate
+
+    def _final_score(self, plan: QueryPlan, candidate: SearchCandidate) -> float:
+        score = candidate.total_score
+        block_count = len(candidate.matched_block_ids)
+        if block_count:
+            score += min(0.9, 0.22 * block_count)
+        score += min(0.9, 0.14 * len(candidate.matched_terms))
+        if {"chunk_fts", "block_fts"} <= candidate.supporting_stages:
+            score += 0.18
+        if candidate.retrieval_stage == "exact_lookup":
+            score += 0.12
+        elif candidate.retrieval_stage == "block_fts":
+            score += 0.08
+        elif candidate.retrieval_stage == "trigram_rescue" and block_count == 0:
+            score -= 0.05
+        if candidate.row["parent_heading"] and has_term_overlap(str(candidate.row["parent_heading"]), plan.focus_terms):
+            score += 0.12
+        return score
+
+    @staticmethod
+    def _stage_priority(stage: str) -> int:
+        priorities = {
+            "trigram_rescue": 1,
+            "block_fts": 2,
+            "chunk_fts": 3,
+            "exact_lookup": 4,
+        }
+        return priorities.get(stage, 0)
+
+    def _matched_terms_in_text(self, plan: QueryPlan, text: str) -> set[str]:
+        normalized = text.lower()
+        terms = plan.focus_terms + plan.actor_terms + plan.action_terms + plan.topic_terms + plan.expansion_terms
+        return {term for term in terms if term and term.lower() in normalized}
 
     @staticmethod
     def _term_hit_count(text: str, terms: tuple[str, ...]) -> int:

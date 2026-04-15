@@ -1,7 +1,7 @@
 from epc_smart_search.chunking import ChunkRecord
-from epc_smart_search.ocr_support import PageText
+from epc_smart_search.ocr_support import ExtractedBlock, PageText
 from epc_smart_search.query_planner import build_like_fallback, plan_query
-from epc_smart_search.retrieval import HybridRetriever
+from epc_smart_search.retrieval import HybridRetriever, SearchCoverageCase
 from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractStore
 
@@ -373,6 +373,104 @@ def test_rescue_search_is_skipped_when_primary_relevance_is_already_strong(monke
 
     assert ranked
     assert ranked[0].chunk_id == "motors"
+
+
+def test_block_fallback_can_recover_table_like_evidence() -> None:
+    db_path = "file:retrieval_block_fallback?mode=memory&cache=shared"
+    store = ContractStore(db_path)
+    chunk = _chunk(
+        "equipment_matrix",
+        "8.4",
+        "Equipment Matrix",
+        "Contractor shall provide the listed equipment in the matrix.",
+        14,
+    )
+    page = PageText(
+        page_num=14,
+        text="Equipment Matrix",
+        ocr_used=False,
+        blocks=(
+            ExtractedBlock(1, "heading", "Equipment Matrix", 1),
+            ExtractedBlock(2, "table_row", "HRSG 1  Contractor", 1, ("table_like",)),
+        ),
+    )
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc",
+        page_count=1,
+        chunks=[chunk],
+        pages=[page],
+        features=build_chunk_features([chunk]),
+    )
+    retriever = HybridRetriever(store)
+
+    ranked = retriever.retrieve("Show me HRSG 1")
+
+    assert ranked
+    assert ranked[0].chunk_id == "equipment_matrix"
+    assert ranked[0].retrieval_stage == "block_fts"
+    assert ranked[0].matched_block_count >= 1
+
+
+def test_exact_page_hits_can_fall_back_to_block_matches() -> None:
+    db_path = "file:retrieval_exact_block?mode=memory&cache=shared"
+    store = ContractStore(db_path)
+    chunk = _chunk(
+        "fuel_summary",
+        "A",
+        "Appendix A Fuel Gas Summary",
+        "Appendix A contains the summary table.",
+        205,
+        chunk_type="exhibit",
+    )
+    page = PageText(
+        page_num=205,
+        text="Appendix A Fuel Gas Summary",
+        ocr_used=False,
+        blocks=(ExtractedBlock(1, "table_row", "Fuel Gas Summary  45 MMSCFD", 1, ("table_like",)),),
+    )
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc",
+        page_count=1,
+        chunks=[chunk],
+        pages=[page],
+        features=build_chunk_features([chunk]),
+    )
+    retriever = HybridRetriever(store)
+
+    hits = retriever.find_exact_page_hits("show me fuel gas summary")
+
+    assert hits
+    assert hits[0].page_num == 205
+
+
+def test_evaluate_coverage_cases_reports_stage_and_match_status() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "motors",
+                "4.4.3",
+                "Electric Motors",
+                "Electric motors must meet the design requirements for the project.",
+                12,
+            ),
+        ]
+    )
+
+    results = retriever.evaluate_coverage_cases(
+        [SearchCoverageCase(label="motors", query="electric motors", expected_chunk_id="motors")]
+    )
+
+    assert len(results) == 1
+    assert results[0].found is True
+    assert results[0].retrieval_stage in {"exact_lookup", "chunk_fts"}
 
 
 def _seed_retriever(chunks: list[ChunkRecord]) -> HybridRetriever:

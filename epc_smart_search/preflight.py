@@ -71,22 +71,23 @@ def collect_launch_preflight_issues() -> list[PreflightIssue]:
     if not GEMMA_TEST_PYTHON.exists():
         issues.append(
             PreflightIssue(
-                severity="error",
+                severity="warning",
                 code="missing_gemma_python",
                 message=(
                     f"Gemma helper Python was not found at {GEMMA_TEST_PYTHON}. "
-                    "Set EPC_GEMMA_PYTHON or EPC_GEMMA_TEST_ROOT before launching."
+                    "AI features will be unavailable; launch will continue in retrieval mode. "
+                    "Set EPC_GEMMA_PYTHON or EPC_GEMMA_TEST_ROOT to enable local Gemma."
                 ),
             )
         )
     elif _python_import_check(GEMMA_TEST_PYTHON, ("flask",)).returncode != 0:
         issues.append(
             PreflightIssue(
-                severity="error",
+                severity="warning",
                 code="missing_flask_in_gemma_env",
                 message=(
                     f"Gemma environment at {GEMMA_TEST_PYTHON} cannot import Flask. "
-                    "Install the Gemma service requirements into that environment."
+                    "AI features will be unavailable until the Gemma service requirements are installed."
                 ),
             )
         )

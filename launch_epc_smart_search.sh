@@ -23,5 +23,27 @@ PYTHON="$(pick_python)"
   exit 1
 }
 
+QT_PATHS="$("$PYTHON" - <<'PY'
+from PySide6.QtCore import QLibraryInfo
+
+print(QLibraryInfo.path(QLibraryInfo.PluginsPath))
+print(QLibraryInfo.path(QLibraryInfo.PrefixPath))
+PY
+)"
+QT_PLUGIN_PATH_ROOT="$(printf '%s\n' "$QT_PATHS" | sed -n '1p')"
+QT_PREFIX_PATH="$(printf '%s\n' "$QT_PATHS" | sed -n '2p')"
+
+if [[ -n "${QT_PLUGIN_PATH_ROOT}" && -d "${QT_PLUGIN_PATH_ROOT}" ]]; then
+  export QT_PLUGIN_PATH="${QT_PLUGIN_PATH_ROOT}"
+  if [[ -d "${QT_PLUGIN_PATH_ROOT}/platforms" ]]; then
+    export QT_QPA_PLATFORM_PLUGIN_PATH="${QT_PLUGIN_PATH_ROOT}/platforms"
+  fi
+fi
+
+if [[ "${OSTYPE:-}" == darwin* && -n "${QT_PREFIX_PATH}" && -d "${QT_PREFIX_PATH}/lib" ]]; then
+  export DYLD_FRAMEWORK_PATH="${QT_PREFIX_PATH}/lib${DYLD_FRAMEWORK_PATH:+:${DYLD_FRAMEWORK_PATH}}"
+  export DYLD_LIBRARY_PATH="${QT_PREFIX_PATH}/lib${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
+fi
+
 "$PYTHON" -m epc_smart_search.preflight --mode launch
 exec "$PYTHON" "$APP_SCRIPT"

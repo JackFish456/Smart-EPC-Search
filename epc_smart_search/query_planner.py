@@ -7,6 +7,7 @@ from epc_smart_search.search_features import (
     ACTION_LEXICON,
     ACTOR_LEXICON,
     TOPIC_LEXICON,
+    alias_terms_for_text,
     expand_query_phrases,
     normalize_text,
 )
@@ -98,7 +99,7 @@ def plan_query(query: str) -> QueryPlan:
     actor_terms = _match_labels(content_query, ACTOR_LEXICON)
     action_terms = _match_labels(content_query, ACTION_LEXICON)
     topic_terms = _match_labels(content_query, TOPIC_LEXICON)
-    expansion_terms = tuple(expand_query_phrases(normalized))
+    expansion_terms = _dedupe(tuple(expand_query_phrases(normalized) + alias_terms_for_text(content_query)))
     focus_terms = _focus_terms(content_query)
 
     intent = "general_topic"

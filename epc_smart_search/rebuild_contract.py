@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -27,11 +28,46 @@ def rebuild_contract(pdf_path: Path, out_path: Path, *, version_label: str = "v1
     return result, validation.document_id or ""
 
 
+def build_coverage_report(db_path: Path) -> dict[str, object]:
+    store = ContractStore(db_path)
+    status = validate_contract_store(store)
+    document_id = status.document_id or ""
+    diagnostics = store.get_ingest_diagnostics(document_id) if document_id else []
+    return {
+        "document_id": document_id,
+        "schema_version": store.get_metadata("search_schema_version"),
+        "index": {
+            "chunk_count": status.chunk_count,
+            "block_count": status.block_count,
+            "feature_count": status.feature_count,
+            "page_text_count": status.page_text_count,
+            "diagnostic_count": status.diagnostic_count,
+        },
+        "ingest_summary": store.get_ingest_diagnostic_summary(document_id) if document_id else {},
+        "page_diagnostics": [
+            {
+                "page_num": int(row["page_num"]),
+                "meaningful_chars": int(row["meaningful_chars"]),
+                "word_count": int(row["word_count"]),
+                "block_count": int(row["block_count"]),
+                "short_line_count": int(row["short_line_count"]),
+                "flags": str(row["flags"]).split(),
+            }
+            for row in diagnostics
+        ],
+        "validation": {
+            "ready": status.ready,
+            "error": status.error,
+        },
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build and validate a prebuilt EPC contract database.")
     parser.add_argument("--pdf", help=f"Path to the source contract PDF. If omitted, use {REBUILD_PDF_ENV_VAR}.")
     parser.add_argument("--out", required=True, help="Fresh output path for the rebuilt SQLite database.")
     parser.add_argument("--version-label", default="v1", help="Version label used for the generated document ID.")
+    parser.add_argument("--report-json", help="Optional path for a machine-readable rebuild coverage report.")
     return parser
 
 
@@ -44,16 +80,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     out_path = Path(args.out).expanduser().resolve()
+    report_path = Path(args.report_json).expanduser().resolve() if args.report_json else None
     try:
         result, document_id = rebuild_contract(pdf_path, out_path, version_label=args.version_label)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(build_coverage_report(out_path), indent=2), encoding="utf-8")
+
     print(f"Built contract database: {out_path}")
     print(f"Document ID: {document_id}")
     print(f"Pages: {result.get('page_count', '?')}")
     print(f"Chunks: {result.get('chunk_count', '?')}")
+    print(f"Blocks: {result.get('block_count', '?')}")
+    if report_path is not None:
+        print(f"Coverage report: {report_path}")
     return 0
 
 

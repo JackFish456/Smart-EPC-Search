@@ -1,5 +1,5 @@
 from epc_smart_search.chunking import ChunkRecord
-from epc_smart_search.ocr_support import PageText
+from epc_smart_search.ocr_support import ExtractedBlock, PageText
 from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractStore
 
@@ -81,3 +81,47 @@ def test_section_lookup_uses_composite_doc_section_ordinal_index() -> None:
 
     details = " ".join(str(row[3]) for row in rows)
     assert "idx_contract_chunks_doc_section_ordinal" in details
+
+
+def test_block_indexes_and_ingest_diagnostics_are_materialized() -> None:
+    db_path = "file:storage_contract_blocks?mode=memory&cache=shared"
+    store = ContractStore(db_path)
+    chunk = ChunkRecord(
+        chunk_id="chunk1",
+        document_id="doc1",
+        chunk_type="section",
+        section_number="8.4",
+        heading="Equipment Matrix",
+        full_text="Contractor shall provide the listed equipment.",
+        page_start=14,
+        page_end=14,
+        parent_chunk_id=None,
+        ordinal_in_document=1,
+    )
+    page = PageText(
+        page_num=14,
+        text="Equipment Matrix",
+        ocr_used=False,
+        blocks=(
+            ExtractedBlock(1, "heading", "Equipment Matrix", 1),
+            ExtractedBlock(2, "table_row", "HRSG 1  Contractor", 1, ("table_like",)),
+        ),
+    )
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc",
+        page_count=1,
+        chunks=[chunk],
+        pages=[page],
+        features=build_chunk_features([chunk]),
+    )
+
+    block_rows = store.search_block_fts("doc1", '"hrsg" OR "contractor"', limit=5)
+    assert block_rows
+    assert block_rows[0]["chunk_id"] == "chunk1"
+    assert store.get_block_count("doc1") == 2
+    diagnostics = store.get_ingest_diagnostic_summary("doc1")
+    assert diagnostics["table_like_pages"] == 1

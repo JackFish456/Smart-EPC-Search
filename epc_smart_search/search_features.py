@@ -39,6 +39,17 @@ TOPIC_LEXICON: dict[str, tuple[str, ...]] = {
     "definition": ("means", "shall mean", "defined as", "definition", "definitions"),
 }
 
+DOMAIN_ALIASES: dict[str, tuple[str, ...]] = {
+    "commercial operation date": ("cod", "commercial operations date"),
+    "substantial completion": ("sc",),
+    "heat recovery steam generator": ("hrsg",),
+    "gas turbine generator": ("gtg", "gas turbine"),
+    "balance of plant": ("bop",),
+    "lockout tagout": ("loto", "lock out tag out"),
+    "fuel gas system": ("gas system", "fuel gas"),
+    "piping and instrumentation diagram": ("p&id", "pid"),
+}
+
 QUERY_EXPANSIONS: dict[str, tuple[str, ...]] = {
     "responsible for": ("responsible", "obligation", "obligations", "shall", "must", "required"),
     "who is responsible": ("responsible", "obligation", "shall", "must"),
@@ -83,6 +94,19 @@ def expand_query_phrases(query: str) -> list[str]:
     return _dedupe_preserve_order(phrases)
 
 
+def alias_terms_for_text(text: str) -> list[str]:
+    normalized = normalize_text(text)
+    wrapped = f" {normalized} "
+    aliases: list[str] = []
+    for canonical, variants in DOMAIN_ALIASES.items():
+        canonical_normalized = normalize_text(canonical)
+        variant_matches = [normalize_text(variant) for variant in variants]
+        if canonical_normalized in normalized or any(f" {variant} " in wrapped for variant in variant_matches):
+            aliases.append(canonical_normalized)
+            aliases.extend(variant_matches)
+    return _dedupe_preserve_order(aliases)
+
+
 def build_chunk_features(chunks: list[ChunkRecord]) -> list[ChunkFeatures]:
     chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
     features: list[ChunkFeatures] = []
@@ -98,6 +122,7 @@ def build_chunk_features(chunks: list[ChunkRecord]) -> list[ChunkFeatures]:
         actor_tags = _detect_tags(combined, ACTOR_LEXICON)
         action_tags = _detect_tags(combined, ACTION_LEXICON)
         topic_tags = _detect_tags(combined, TOPIC_LEXICON)
+        alias_terms = alias_terms_for_text(combined)
         noise_flags = _noise_flags(chunk, normalized_heading, normalized_body)
         rescue_text = _build_rescue_text(
             chunk.section_number or "",
@@ -107,6 +132,7 @@ def build_chunk_features(chunks: list[ChunkRecord]) -> list[ChunkFeatures]:
             actor_tags,
             action_tags,
             topic_tags,
+            alias_terms,
         )
         search_terms = _dedupe_preserve_order(
             [
@@ -117,6 +143,7 @@ def build_chunk_features(chunks: list[ChunkRecord]) -> list[ChunkFeatures]:
                 actor_tags,
                 action_tags,
                 topic_tags,
+                " ".join(alias_terms),
                 chunk.chunk_type,
             ]
         )
@@ -169,6 +196,7 @@ def _build_rescue_text(
     actor_tags: str,
     action_tags: str,
     topic_tags: str,
+    alias_terms: list[str],
 ) -> str:
     body_tokens = tokenize(normalized_body)[:36]
     parts = [
@@ -179,6 +207,7 @@ def _build_rescue_text(
         actor_tags,
         action_tags,
         topic_tags,
+        " ".join(alias_terms),
     ]
     return " ".join(part for part in parts if part)
 

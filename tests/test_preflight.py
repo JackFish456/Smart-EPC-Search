@@ -37,7 +37,9 @@ def test_collect_launch_preflight_issues_reports_missing_gemma_python(monkeypatc
 
     issues = preflight.collect_launch_preflight_issues()
 
-    assert any(issue.code == "missing_gemma_python" for issue in issues)
+    issue = next(issue for issue in issues if issue.code == "missing_gemma_python")
+    assert issue.severity == "warning"
+    assert "retrieval mode" in issue.message
 
 
 def test_collect_package_preflight_issues_requires_external_prebuilt_db(monkeypatch) -> None:

@@ -8,7 +8,7 @@ from epc_smart_search.config import MAX_HEADING_LENGTH, MIN_HEADING_LENGTH
 from epc_smart_search.ocr_support import PageText
 
 ARTICLE_RE = re.compile(r"^ARTICLE\s+([A-Z0-9IVXLC\-]+)\b[:.\-]?\s*(.*)$", re.IGNORECASE)
-EXHIBIT_RE = re.compile(r"^(EXHIBIT|APPENDIX)\s+([A-Z0-9.\-]+)\b[:.\-]?\s*(.*)$", re.IGNORECASE)
+EXHIBIT_RE = re.compile(r"^(EXHIBIT|APPENDIX|ATTACHMENT|ANNEX|SCHEDULE)\s+([A-Z0-9.\-]+)\b[:.\-]?\s*(.*)$", re.IGNORECASE)
 SECTION_RE = re.compile(r"^(?:SECTION\s+)?(\d+(?:\.\d+){0,5})[.)]?\s+(.+)$", re.IGNORECASE)
 SECTION_ONLY_RE = re.compile(r"^(?:SECTION\s+)?(\d+(?:\.\d+){0,5})[.)]?$", re.IGNORECASE)
 DEFINITION_RE = re.compile(
@@ -58,6 +58,8 @@ def _clean_line(line: str) -> str:
 def _is_heading_text(text: str) -> bool:
     cleaned = _clean_line(text)
     if len(cleaned) < MIN_HEADING_LENGTH or len(cleaned) > MAX_HEADING_LENGTH:
+        return False
+    if cleaned.endswith((".", ";", ",")):
         return False
     if sum(ch.isalpha() for ch in cleaned) < 3:
         return False
@@ -134,19 +136,36 @@ def _match_section(lines: list[tuple[int, str]], index: int) -> tuple[str, str, 
     match = SECTION_RE.match(line)
     if match and _is_heading_text(match.group(2)):
         section_number = match.group(1)
-        if int(section_number.split(".", 1)[0]) <= 40:
-            return section_number, _clean_line(match.group(2)), index + 1
+        return section_number, _clean_line(match.group(2)), index + 1
     match = SECTION_ONLY_RE.match(line)
     if not match:
         return None
     section_number = match.group(1)
-    if int(section_number.split(".", 1)[0]) > 40:
-        return None
     for scan in range(index + 1, min(index + 4, len(lines))):
         _, candidate = lines[scan]
         if _is_heading_text(candidate):
             return section_number, candidate, scan + 1
     return None
+
+
+def _match_standalone_heading(
+    lines: list[tuple[int, str]],
+    index: int,
+    current: _ChunkBuilder | None,
+) -> tuple[str, int] | None:
+    if current is None or len(current.lines) < 1:
+        return None
+    _, line = lines[index]
+    if not _is_heading_text(line):
+        return None
+    if ARTICLE_RE.match(line) or EXHIBIT_RE.match(line) or SECTION_RE.match(line) or SECTION_ONLY_RE.match(line):
+        return None
+    if index + 1 >= len(lines):
+        return None
+    _, next_line = lines[index + 1]
+    if _is_heading_text(next_line):
+        return None
+    return _clean_line(line), index + 1
 
 
 def _set_page_end(chunks: list[ChunkRecord], lines: list[tuple[int, str]]) -> list[ChunkRecord]:
@@ -258,6 +277,13 @@ def parse_chunks(pages: list[PageText], document_id: str) -> list[ChunkRecord]:
             number, heading, next_index = section_match
             chunk_type = "section" if number.count(".") == 0 else "subsection"
             current = _ChunkBuilder(chunk_type, number, heading, page_num, [line], article_context=article_context)
+            index = next_index
+            continue
+        standalone_heading = _match_standalone_heading(lines, index, current)
+        if standalone_heading is not None:
+            ordinal = _flush_chunk(chunks, current, document_id, ordinal)
+            heading, next_index = standalone_heading
+            current = _ChunkBuilder("section", None, heading, page_num, [line], article_context=article_context)
             index = next_index
             continue
         if current is None:

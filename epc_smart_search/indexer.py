@@ -4,12 +4,14 @@ import hashlib
 from pathlib import Path
 from typing import Callable
 
-import fitz
-
 from epc_smart_search.chunking import ChunkRecord, build_document_id, parse_chunks
 from epc_smart_search.ocr_support import extract_pages
 from epc_smart_search.search_features import build_chunk_features
-from epc_smart_search.storage import ContractStore
+from epc_smart_search.storage import (
+    ContractStore,
+    build_block_records,
+    build_diagnostic_records,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -37,9 +39,13 @@ def build_index(
         progress_callback("Parsing contract structure...")
     chunks = parse_chunks(pages, document_id)
     features = build_chunk_features(chunks)
+    blocks = build_block_records(document_id, pages, chunks)
+    diagnostics = build_diagnostic_records(document_id, pages)
 
     if progress_callback:
         progress_callback("Writing SQLite index...")
+    import fitz
+
     with fitz.open(str(path)) as doc:
         page_count = doc.page_count
     store = ContractStore(db_path)
@@ -53,11 +59,14 @@ def build_index(
         chunks=chunks,
         pages=pages,
         features=features,
+        blocks=blocks,
+        diagnostics=diagnostics,
     )
     return {
         "document_id": document_id,
         "page_count": page_count,
         "chunk_count": len(chunks),
+        "block_count": len(blocks),
     }
 
 

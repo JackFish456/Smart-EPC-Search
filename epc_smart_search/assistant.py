@@ -32,8 +32,10 @@ class IndexValidationResult:
     error: str | None
     document_id: str | None
     chunk_count: int = 0
+    block_count: int = 0
     feature_count: int = 0
     page_text_count: int = 0
+    diagnostic_count: int = 0
 
 
 SUMMARY_MAX_NEW_TOKENS = 768
@@ -70,6 +72,16 @@ def validate_contract_store(store: ContractStore) -> IndexValidationResult:
             chunk_count=chunk_count,
             feature_count=feature_count,
         )
+    block_count = store.get_block_count(document_id)
+    if block_count <= 0:
+        return IndexValidationResult(
+            False,
+            "Bundled contract data is missing block-level search coverage.",
+            document_id,
+            chunk_count=chunk_count,
+            feature_count=feature_count,
+            block_count=block_count,
+        )
     page_text_count = store.get_page_text_count(document_id)
     if page_text_count <= 0:
         return IndexValidationResult(
@@ -77,16 +89,31 @@ def validate_contract_store(store: ContractStore) -> IndexValidationResult:
             "Bundled contract data is missing page evidence.",
             document_id,
             chunk_count=chunk_count,
+            block_count=block_count,
             feature_count=feature_count,
             page_text_count=page_text_count,
+        )
+    diagnostic_count = store.get_ingest_diagnostic_count(document_id)
+    if diagnostic_count != page_text_count:
+        return IndexValidationResult(
+            False,
+            "Bundled contract data is missing ingest diagnostics.",
+            document_id,
+            chunk_count=chunk_count,
+            block_count=block_count,
+            feature_count=feature_count,
+            page_text_count=page_text_count,
+            diagnostic_count=diagnostic_count,
         )
     return IndexValidationResult(
         True,
         None,
         document_id,
         chunk_count=chunk_count,
+        block_count=block_count,
         feature_count=feature_count,
         page_text_count=page_text_count,
+        diagnostic_count=diagnostic_count,
     )
 
 

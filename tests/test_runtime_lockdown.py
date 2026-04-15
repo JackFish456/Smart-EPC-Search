@@ -1,4 +1,5 @@
 import inspect
+import json
 import uuid
 import html
 import tempfile
@@ -71,6 +72,47 @@ def test_validate_contract_store_rejects_missing_page_evidence() -> None:
 
     assert status.ready is False
     assert "page evidence" in (status.error or "").lower()
+
+
+def test_validate_contract_store_rejects_missing_block_coverage() -> None:
+    store = _seed_store(_memory_db_uri("no_blocks"))
+    with store._connect() as connection:  # noqa: SLF001
+        connection.execute("DELETE FROM contract_blocks WHERE document_id = ?", ("doc1",))
+        connection.commit()
+
+    status = validate_contract_store(store)
+
+    assert status.ready is False
+    assert "block-level search coverage" in (status.error or "").lower()
+
+
+def test_validate_contract_store_rejects_missing_ingest_diagnostics() -> None:
+    store = _seed_store(_memory_db_uri("no_diagnostics"))
+    with store._connect() as connection:  # noqa: SLF001
+        connection.execute("DELETE FROM page_ingest_diagnostics WHERE document_id = ?", ("doc1",))
+        connection.commit()
+
+    status = validate_contract_store(store)
+
+    assert status.ready is False
+    assert "ingest diagnostics" in (status.error or "").lower()
+
+
+def test_validate_contract_store_backfills_legacy_block_coverage(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy_contract_store.db"
+    store = _seed_store(db_path)
+    with store._connect() as connection:  # noqa: SLF001
+        connection.execute("DELETE FROM contract_blocks WHERE document_id = ?", ("doc1",))
+        connection.execute("DELETE FROM page_ingest_diagnostics WHERE document_id = ?", ("doc1",))
+        connection.commit()
+
+    reopened_store = ContractStore(db_path)
+    status = validate_contract_store(reopened_store)
+
+    assert reopened_store.get_block_count("doc1") >= 1
+    assert reopened_store.get_ingest_diagnostic_count("doc1") == reopened_store.get_page_text_count("doc1")
+    assert status.ready is True
+    assert status.error is None
 
 
 def test_contract_assistant_build_index_is_internal_only() -> None:
@@ -254,6 +296,7 @@ def test_rebuild_cli_creates_and_validates_a_fresh_database(monkeypatch) -> None
     temp_root = Path(tempfile.gettempdir()) / "epc_smart_search_tests" / f"runtime_lockdown_{uuid.uuid4().hex[:8]}"
     pdf_path = temp_root / f"contract_{uuid.uuid4().hex[:8]}.pdf"
     out_path = temp_root / f"contract_store_{uuid.uuid4().hex[:8]}.db"
+    report_path = temp_root / f"contract_store_{uuid.uuid4().hex[:8]}.report.json"
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
     pdf_path.write_bytes(b"%PDF-1.4\n")
     memory_store = _seed_store(_memory_db_uri("cli"))
@@ -265,10 +308,15 @@ def test_rebuild_cli_creates_and_validates_a_fresh_database(monkeypatch) -> None
     monkeypatch.setattr(rebuild_contract_module, "build_index", fake_build_index)
     monkeypatch.setattr(rebuild_contract_module, "ContractStore", lambda path: memory_store)
 
-    exit_code = rebuild_contract_module.main(["--pdf", str(pdf_path), "--out", str(out_path)])
+    exit_code = rebuild_contract_module.main(
+        ["--pdf", str(pdf_path), "--out", str(out_path), "--report-json", str(report_path)]
+    )
 
     assert exit_code == 0
     assert out_path.exists()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["document_id"] == "doc1"
+    assert report["index"]["block_count"] >= 1
 
 
 def _seed_store(db_path: str | Path, *, with_features: bool = True) -> ContractStore:
