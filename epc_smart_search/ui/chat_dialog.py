@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from epc_smart_search.assistant import AssistantAnswer, ContractAssistant
+from epc_smart_search.assistant import AssistantAnswer, ContractAssistant, describe_semantic_status
 from epc_smart_search.config import GREETING
 
 
@@ -192,8 +192,13 @@ class ContractChatDialog(QDialog):
         QTimer.singleShot(0, self._ensure_index_ready)
 
     def _ensure_index_ready(self) -> None:
-        if self._assistant.is_index_ready():
-            self._clear_status()
+        status = self._assistant.get_index_status()
+        if status.ready:
+            semantic_status = describe_semantic_status(status)
+            if semantic_status:
+                self._set_status_message(semantic_status)
+            else:
+                self._clear_status()
             self._set_input_enabled(True)
             return
         self._append_message("assistant", CONTRACT_DATA_UNAVAILABLE_MESSAGE, count_toward_cap=False)

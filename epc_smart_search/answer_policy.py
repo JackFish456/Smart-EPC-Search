@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from epc_smart_search.query_planner import QueryPlan, plan_query
-from epc_smart_search.retrieval import Citation, ExactPageHit, RankedChunk
+from epc_smart_search.retrieval import Citation, ExactPageHit, RankedChunk, RetrievalEvidence
 
 
 @dataclass(slots=True)
@@ -63,9 +63,8 @@ class AnswerPolicy:
         if not deep_think and not citations:
             return AssistantAnswer("I can't verify that from the contract.", [], True)
 
-        best = ranked[0] if ranked else None
-        evidence_is_weak = best is None or (best.total_score < 0.16 and best.lexical_score < 0.05)
-        if evidence_is_weak and not deep_think:
+        evidence = self._assess_retrieval_evidence(effective_question, ranked)
+        if evidence.is_weak and not deep_think:
             return AssistantAnswer("I can't verify that from the contract.", citations, True)
 
         reference_answer = self.build_reference_answer(effective_question, ranked, citations)
@@ -78,7 +77,7 @@ class AnswerPolicy:
 
         if deep_think:
             prompt_context = self.build_deep_prompt_context(effective_question, ranked, exact_hits)
-            if evidence_is_weak and not exact_hits:
+            if evidence.is_weak and not exact_hits:
                 if extractive_answer is not None:
                     return extractive_answer
                 return AssistantAnswer("I can't verify that from the contract.", citations, True)
@@ -124,6 +123,19 @@ class AnswerPolicy:
             if extractive_answer is not None:
                 return extractive_answer
         return AssistantAnswer(answer_text, citations, refused)
+
+    def _assess_retrieval_evidence(self, question: str, ranked: list[RankedChunk]) -> RetrievalEvidence:
+        if hasattr(self.retriever, "assess_evidence"):
+            return self.retriever.assess_evidence(question, ranked)
+        best = ranked[0] if ranked else None
+        return RetrievalEvidence(
+            is_weak=best is None or (best.total_score < 0.16 and best.lexical_score < 0.05),
+            has_strong_match=bool(best and best.total_score >= 2.9),
+            top_retrieval_stage=best.retrieval_stage if best is not None else None,
+            top_lexical_score=best.lexical_score if best is not None else 0.0,
+            top_final_score=best.total_score if best is not None else 0.0,
+            rescue_only=bool(best and best.retrieval_stage == "trigram_rescue"),
+        )
 
     @classmethod
     def resolve_question(cls, question: str, history: Sequence[dict[str, str]] | None = None) -> str:

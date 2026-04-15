@@ -1,7 +1,7 @@
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.ocr_support import ExtractedBlock, PageText
 from epc_smart_search.query_planner import build_like_fallback, plan_query
-from epc_smart_search.retrieval import HybridRetriever, SearchCoverageCase
+from epc_smart_search.retrieval import HybridRetriever, RankedChunk, SearchCoverageCase
 from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractStore, build_block_records, pack_vector
 
@@ -556,6 +556,116 @@ def test_evaluate_coverage_cases_reports_stage_and_match_status() -> None:
     assert results[0].retrieval_stage in {"exact_lookup", "chunk_fts"}
 
 
+def test_assess_evidence_marks_block_only_generic_match_as_weak() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "motors",
+                "4.4.3",
+                "Electric Motors",
+                "Electric motors must meet the design requirements for the project.",
+                12,
+            ),
+        ]
+    )
+
+    evidence = retriever.assess_evidence(
+        "who is the moon",
+        [
+            RankedChunk(
+                chunk_id="motors",
+                section_number="4.4.3",
+                heading="Electric Motors",
+                full_text="Electric motors must meet the design requirements for the project.",
+                page_start=12,
+                page_end=12,
+                ordinal_in_document=12,
+                total_score=1.44,
+                lexical_score=0.75,
+                semantic_score=0.0,
+                retrieval_stage="block_fts",
+            )
+        ],
+    )
+
+    assert evidence.is_weak is True
+    assert evidence.has_strong_match is False
+    assert evidence.top_retrieval_stage == "block_fts"
+
+
+def test_assess_evidence_marks_rescue_only_result_as_weak() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "termination",
+                "12.1",
+                "Owner Termination for Convenience",
+                "Owner may terminate this Contract for convenience upon written notice.",
+                50,
+            ),
+        ]
+    )
+
+    evidence = retriever.assess_evidence(
+        "pipe insulation freeze tracing",
+        [
+            RankedChunk(
+                chunk_id="termination",
+                section_number="12.1",
+                heading="Owner Termination for Convenience",
+                full_text="Owner may terminate this Contract for convenience upon written notice.",
+                page_start=50,
+                page_end=50,
+                ordinal_in_document=50,
+                total_score=0.63,
+                lexical_score=0.55,
+                semantic_score=0.0,
+                retrieval_stage="trigram_rescue",
+            )
+        ],
+    )
+
+    assert evidence.is_weak is True
+    assert evidence.rescue_only is True
+
+
+def test_assess_evidence_keeps_strong_exact_match_nonweak() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "section_hit",
+                "14.2.1",
+                "Liquidated Damages",
+                "This clause covers liquidated damages.",
+                10,
+            ),
+        ]
+    )
+
+    evidence = retriever.assess_evidence(
+        "section 14.2.1",
+        [
+            RankedChunk(
+                chunk_id="section_hit",
+                section_number="14.2.1",
+                heading="Liquidated Damages",
+                full_text="This clause covers liquidated damages.",
+                page_start=10,
+                page_end=10,
+                ordinal_in_document=10,
+                total_score=4.27,
+                lexical_score=1.0,
+                semantic_score=0.0,
+                retrieval_stage="exact_lookup",
+            )
+        ],
+    )
+
+    assert evidence.is_weak is False
+    assert evidence.has_strong_match is True
+    assert evidence.top_retrieval_stage == "exact_lookup"
+
+
 def test_semantic_reranking_can_promote_paraphrase_match_in_deep_profile() -> None:
     chunks = [
         _chunk(
@@ -593,6 +703,7 @@ def test_semantic_reranking_can_promote_paraphrase_match_in_deep_profile() -> No
     assert lexical_ranked
     assert lexical_ranked[0].chunk_id == "notice"
     assert semantic_ranked[0].chunk_id == "termination"
+    assert [chunk.chunk_id for chunk in semantic_ranked[:2]] == ["termination", "notice"]
     assert semantic_ranked[0].semantic_score > 0.0
 
 

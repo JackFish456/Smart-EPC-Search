@@ -3,6 +3,7 @@ from epc_smart_search.assistant import DEEP_MAX_NEW_TOKENS
 from epc_smart_search.assistant import SUMMARY_ENABLE_THINKING
 from epc_smart_search.assistant import SUMMARY_MAX_NEW_TOKENS
 from epc_smart_search.retrieval import Citation, ExactPageHit
+from epc_smart_search.retrieval import RetrievalEvidence
 from epc_smart_search.retrieval import RankedChunk
 
 
@@ -370,6 +371,111 @@ def test_summary_request_does_not_change_following_normal_request_behavior() -> 
     assert "Most relevant contract text:" not in normal_answer.text
     assert len(assistant.gemma.calls) == 1
     assert assistant.gemma.calls[0]["response_style"] == "detailed_summary"
+
+
+def test_shared_retrieval_evidence_can_force_refusal_even_when_scores_are_high() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.23",
+            heading="Fuel Gas Supply",
+            full_text="Contractor shall provide the fuel gas supply equipment for the Work.",
+            page_start=270,
+            page_end=271,
+            ordinal_in_document=1,
+            total_score=5.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+            retrieval_stage="block_fts",
+            matched_block_count=1,
+        )
+    ]
+    citations = [Citation("chunk1", "5.23", "Fuel Gas Supply", None, 270, 271, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+        def assess_evidence(self, question: str, incoming_ranked):
+            return RetrievalEvidence(
+                is_weak=True,
+                has_strong_match=False,
+                top_retrieval_stage="block_fts",
+                top_lexical_score=1.0,
+                top_final_score=5.0,
+                rescue_only=False,
+            )
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called for weak evidence.")
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+
+    answer = assistant.ask("Who is the moon?")
+
+    assert answer.refused is True
+    assert answer.text == "I can't verify that from the contract."
+
+
+def test_shared_retrieval_evidence_can_allow_grounded_answer_even_when_scores_are_low() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.23",
+            heading="Fuel Gas Supply",
+            full_text="Contractor shall provide the fuel gas supply equipment for the Work.",
+            page_start=270,
+            page_end=271,
+            ordinal_in_document=1,
+            total_score=0.4,
+            lexical_score=0.1,
+            semantic_score=0.0,
+            retrieval_stage="chunk_fts",
+        )
+    ]
+    citations = [Citation("chunk1", "5.23", "Fuel Gas Supply", None, 270, 271, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+        def assess_evidence(self, question: str, incoming_ranked):
+            return RetrievalEvidence(
+                is_weak=False,
+                has_strong_match=True,
+                top_retrieval_stage="chunk_fts",
+                top_lexical_score=0.1,
+                top_final_score=0.4,
+                rescue_only=False,
+            )
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called for a grounded direct answer.")
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+
+    answer = assistant.ask("What does the contract say about fuel gas supply?")
+
+    assert answer.refused is False
+    assert "Section 5.23 - Fuel Gas Supply" in answer.text
 
 
 def test_deep_think_routes_non_summary_questions_through_gemma() -> None:

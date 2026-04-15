@@ -43,6 +43,7 @@ class IndexValidationResult:
     semantic_index_ready: bool = False
     semantic_runtime_available: bool = False
     semantic_ready: bool = False
+    semantic_status_reason: str | None = None
 
 
 SUMMARY_MAX_NEW_TOKENS = 768
@@ -56,6 +57,44 @@ DEEP_CONTEXT_EXACT_HITS = 3
 DEEP_PAGE_CONTEXT_SECTIONS = 2
 DEEP_EXCERPT_LIMIT = 920
 INTERNAL_REBUILD_ERROR = "Contract rebuild is available only through the internal rebuild tool."
+
+
+def _semantic_status_reason(
+    *,
+    chunk_count: int,
+    embedding_count: int,
+    semantic_model_name: str | None,
+    semantic_dimension: int | None,
+    runtime_model_name: str | None,
+    runtime_dimension: int | None,
+) -> str | None:
+    index_ready = (
+        embedding_count == chunk_count
+        and embedding_count > 0
+        and semantic_model_name is not None
+        and semantic_dimension is not None
+    )
+    if not index_ready:
+        return "missing_vectors"
+    if not runtime_model_name or not runtime_dimension:
+        return "missing_runtime_model"
+    if runtime_model_name != semantic_model_name:
+        return "model_name_mismatch"
+    if runtime_dimension != semantic_dimension:
+        return "dimension_mismatch"
+    return None
+
+
+def describe_semantic_status(status: IndexValidationResult) -> str | None:
+    messages = {
+        "missing_vectors": "Search is running in lexical-only mode because semantic vectors are missing or incomplete.",
+        "missing_runtime_model": "Search is running in lexical-only mode because the semantic model is unavailable at runtime.",
+        "model_name_mismatch": "Search is running in lexical-only mode because the runtime semantic model does not match the indexed vectors.",
+        "dimension_mismatch": "Search is running in lexical-only mode because the runtime semantic model dimension does not match the indexed vectors.",
+    }
+    if not status.ready:
+        return None
+    return messages.get(status.semantic_status_reason or "")
 
 
 def validate_contract_store(store: ContractStore) -> IndexValidationResult:
@@ -118,13 +157,15 @@ def validate_contract_store(store: ContractStore) -> IndexValidationResult:
     runtime_embedder = LocalEmbedder()
     runtime_model_name = runtime_embedder.model_name if runtime_embedder.is_available() else None
     runtime_dimension = runtime_embedder.dimension if runtime_embedder.is_available() else None
-    semantic_runtime_available = bool(
-        semantic_index_ready
-        and runtime_model_name
-        and runtime_dimension
-        and runtime_model_name == semantic_model_name
-        and runtime_dimension == semantic_dimension
+    semantic_status_reason = _semantic_status_reason(
+        chunk_count=chunk_count,
+        embedding_count=embedding_count,
+        semantic_model_name=semantic_model_name,
+        semantic_dimension=semantic_dimension,
+        runtime_model_name=runtime_model_name,
+        runtime_dimension=runtime_dimension,
     )
+    semantic_runtime_available = bool(semantic_index_ready and semantic_status_reason is None)
     return IndexValidationResult(
         True,
         None,
@@ -140,6 +181,7 @@ def validate_contract_store(store: ContractStore) -> IndexValidationResult:
         semantic_index_ready=semantic_index_ready,
         semantic_runtime_available=semantic_runtime_available,
         semantic_ready=semantic_runtime_available,
+        semantic_status_reason=semantic_status_reason,
     )
 
 

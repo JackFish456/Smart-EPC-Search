@@ -938,7 +938,7 @@ class HybridRetriever:
         if lexical_score >= 3.8:
             bonus *= 0.65
         cap = 0.82
-        if profile is not None and profile.name == "deep" and evidence_is_weak:
+        if profile is not None and profile.name == "deep":
             if semantic_score >= 0.78:
                 bonus += 0.35
             cap = 1.35

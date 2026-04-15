@@ -8,12 +8,14 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
+import epc_smart_search.assistant as assistant_module
 import epc_smart_search.rebuild_contract as rebuild_contract_module
 import epc_smart_search.ui.avatar_window as avatar_window_module
 import epc_smart_search.ui.chat_dialog as chat_dialog_module
 import epc_smart_search_app
 from epc_smart_search.assistant import INTERNAL_REBUILD_ERROR
 from epc_smart_search.assistant import ContractAssistant
+from epc_smart_search.assistant import describe_semantic_status
 from epc_smart_search.assistant import IndexValidationResult
 from epc_smart_search.assistant import validate_contract_store
 from epc_smart_search.chunking import ChunkRecord
@@ -40,6 +42,7 @@ def test_validate_contract_store_accepts_seeded_db_without_pdf_dependency() -> N
     assert status.semantic_index_ready is False
     assert status.semantic_runtime_available is False
     assert status.semantic_ready is False
+    assert status.semantic_status_reason == "missing_vectors"
 
 
 def test_validate_contract_store_rejects_wrong_schema_version() -> None:
@@ -174,6 +177,23 @@ def test_chat_dialog_clears_history_when_closed() -> None:
     assert dialog._deep_think_button.isChecked() is False  # noqa: SLF001
     first_label = dialog._content_layout.itemAt(0).widget()  # noqa: SLF001
     assert html.escape(GREETING.split(".")[0]) in first_label.text()
+
+
+def test_describe_semantic_status_reports_lexical_only_mode() -> None:
+    status = IndexValidationResult(
+        True,
+        None,
+        "doc1",
+        semantic_index_ready=True,
+        semantic_runtime_available=False,
+        semantic_ready=False,
+        semantic_status_reason="missing_runtime_model",
+    )
+
+    message = describe_semantic_status(status)
+
+    assert message is not None
+    assert "lexical-only mode" in message.lower()
 
 
 def test_chat_dialog_formats_summary_markdown_like_content() -> None:
@@ -323,7 +343,7 @@ def test_rebuild_cli_creates_and_validates_a_fresh_database(monkeypatch) -> None
     assert report["index"]["block_count"] >= 1
 
 
-def test_build_coverage_report_includes_optional_semantic_status(tmp_path: Path) -> None:
+def test_build_coverage_report_includes_optional_semantic_status(monkeypatch, tmp_path: Path) -> None:
     db_path = tmp_path / "semantic_report.db"
     store = ContractStore(db_path)
     chunk = ChunkRecord(
@@ -353,6 +373,15 @@ def test_build_coverage_report_includes_optional_semantic_status(tmp_path: Path)
         dimension=3,
     )
 
+    class MissingRuntimeEmbedder:
+        model_name = None
+        dimension = None
+
+        def is_available(self) -> bool:
+            return False
+
+    monkeypatch.setattr(assistant_module, "LocalEmbedder", lambda: MissingRuntimeEmbedder())
+
     report = rebuild_contract_module.build_coverage_report(db_path)
 
     assert report["index"]["embedding_count"] == 1
@@ -360,6 +389,54 @@ def test_build_coverage_report_includes_optional_semantic_status(tmp_path: Path)
     assert report["semantic"]["semantic_runtime_available"] is False
     assert report["semantic"]["semantic_ready"] is False
     assert report["semantic"]["semantic_model_name"] == "test-semantic"
+    assert report["semantic"]["semantic_status_reason"] == "missing_runtime_model"
+
+
+def test_validate_contract_store_reports_runtime_model_mismatch(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "semantic_mismatch.db"
+    store = ContractStore(db_path)
+    chunk = ChunkRecord(
+        chunk_id="chunk1",
+        document_id="doc1",
+        chunk_type="section",
+        section_number="1",
+        heading="General",
+        full_text="Contractor shall perform the work.",
+        page_start=1,
+        page_end=1,
+        parent_chunk_id=None,
+        ordinal_in_document=1,
+    )
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc123",
+        page_count=1,
+        chunks=[chunk],
+        pages=[PageText(page_num=1, text=chunk.full_text, ocr_used=False)],
+        features=build_chunk_features([chunk]),
+        embeddings={"chunk1": pack_vector([1.0, 0.0, 0.0])},
+        model_name="indexed-semantic",
+        dimension=3,
+    )
+
+    class FakeEmbedder:
+        model_name = "runtime-semantic"
+        dimension = 3
+
+        def is_available(self) -> bool:
+            return True
+
+    monkeypatch.setattr(assistant_module, "LocalEmbedder", lambda: FakeEmbedder())
+
+    status = validate_contract_store(store)
+
+    assert status.ready is True
+    assert status.semantic_index_ready is True
+    assert status.semantic_runtime_available is False
+    assert status.semantic_status_reason == "model_name_mismatch"
 
 
 def test_build_coverage_report_surfaces_numeric_and_priority_coverage(tmp_path: Path) -> None:
