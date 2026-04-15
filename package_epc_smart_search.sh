@@ -107,6 +107,7 @@ cp "$PREBUILT_DB_PATH" "$STAGE_ASSETS/contract_store.prebuilt.db"
   --name "EPC Smart Search Lite" \
   --osx-bundle-identifier com.epcsmartsearch.lite \
   --add-data "assets/kiewey.png:assets" \
+  --add-data "assets/semantic_model.json:assets" \
   --add-data "$STAGE_ASSETS/contract_store.prebuilt.db:assets" \
   epc_smart_search_app.py
 

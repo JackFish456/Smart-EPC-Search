@@ -80,6 +80,20 @@ ON contract_chunks(document_id, ordinal_in_document);
 CREATE INDEX IF NOT EXISTS idx_contract_chunks_doc_section_ordinal
 ON contract_chunks(document_id, section_number, ordinal_in_document);
 
+CREATE TABLE IF NOT EXISTS chunk_vectors (
+    vector_rowid INTEGER PRIMARY KEY,
+    chunk_id TEXT NOT NULL UNIQUE,
+    document_id TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    dimension INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    FOREIGN KEY (chunk_id) REFERENCES contract_chunks(chunk_id),
+    FOREIGN KEY (document_id) REFERENCES documents(document_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunk_vectors_doc
+ON chunk_vectors(document_id, chunk_id);
+
 CREATE TABLE IF NOT EXISTS contract_pages (
     page_rowid INTEGER PRIMARY KEY,
     document_id TEXT NOT NULL,
@@ -442,6 +456,7 @@ class ContractStore:
         with self._connect() as connection:
             connection.execute("DELETE FROM page_ingest_diagnostics WHERE document_id = ?", (document_id,))
             connection.execute("DELETE FROM contract_blocks WHERE document_id = ?", (document_id,))
+            connection.execute("DELETE FROM chunk_vectors WHERE document_id = ?", (document_id,))
             connection.execute("DELETE FROM chunk_search_features WHERE document_id = ?", (document_id,))
             connection.execute("DELETE FROM contract_chunks WHERE document_id = ?", (document_id,))
             connection.execute("DELETE FROM contract_pages WHERE document_id = ?", (document_id,))
@@ -483,6 +498,7 @@ class ContractStore:
             self._insert_blocks(connection, blocks)
             self._insert_diagnostics(connection, diagnostics)
             self._insert_features(connection, features)
+            self._insert_embeddings(connection, document_id, embeddings, model_name, dimension)
             connection.execute(
                 """
                 INSERT INTO app_metadata (key, value)
@@ -550,10 +566,54 @@ class ContractStore:
             ],
         )
 
+    @staticmethod
+    def _insert_embeddings(
+        connection: sqlite3.Connection,
+        document_id: str,
+        embeddings: dict[str, bytes] | None,
+        model_name: str | None,
+        dimension: int | None,
+    ) -> None:
+        if not embeddings or not model_name or not dimension:
+            return
+        connection.executemany(
+            """
+            INSERT INTO chunk_vectors (
+                chunk_id, document_id, model_name, dimension, vector
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (chunk_id, document_id, model_name, dimension, vector)
+                for chunk_id, vector in embeddings.items()
+                if vector
+            ],
+        )
+
     def replace_search_features(self, document_id: str, features: list[ChunkFeatures]) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM chunk_search_features WHERE document_id = ?", (document_id,))
             self._insert_features(connection, features)
+            connection.execute(
+                """
+                INSERT INTO app_metadata (key, value)
+                VALUES ('search_schema_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(SEARCH_SCHEMA_VERSION),),
+            )
+            connection.commit()
+
+    def replace_chunk_embeddings(
+        self,
+        document_id: str,
+        embeddings: dict[str, bytes] | None,
+        *,
+        model_name: str | None,
+        dimension: int | None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM chunk_vectors WHERE document_id = ?", (document_id,))
+            self._insert_embeddings(connection, document_id, embeddings, model_name, dimension)
             connection.execute(
                 """
                 INSERT INTO app_metadata (key, value)
@@ -623,6 +683,30 @@ class ContractStore:
                 (document_id,),
             ).fetchone()
         return int(row["page_count"]) if row else 0
+
+    def get_embedding_count(self, document_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS embedding_count FROM chunk_vectors WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+        return int(row["embedding_count"]) if row else 0
+
+    def get_embedding_metadata(self, document_id: str) -> tuple[str | None, int | None]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT model_name, dimension
+                FROM chunk_vectors
+                WHERE document_id = ?
+                ORDER BY vector_rowid
+                LIMIT 1
+                """,
+                (document_id,),
+            ).fetchone()
+        if row is None:
+            return None, None
+        return str(row["model_name"]), int(row["dimension"])
 
     def get_ingest_diagnostic_count(self, document_id: str) -> int:
         with self._connect() as connection:
@@ -1018,6 +1102,30 @@ class ContractStore:
                 """,
                 (document_id, page_start, page_end, limit),
             ).fetchall()
+
+    def fetch_chunk_vectors(self, document_id: str, chunk_ids: list[str]) -> dict[str, dict[str, object]]:
+        if not chunk_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in chunk_ids)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT chunk_id, model_name, dimension, vector
+                FROM chunk_vectors
+                WHERE document_id = ?
+                  AND chunk_id IN ({placeholders})
+                """,
+                (document_id, *chunk_ids),
+            ).fetchall()
+        return {
+            str(row["chunk_id"]): {
+                "chunk_id": str(row["chunk_id"]),
+                "model_name": str(row["model_name"]),
+                "dimension": int(row["dimension"]),
+                "vector": unpack_vector(bytes(row["vector"])),
+            }
+            for row in rows
+        }
 
     def fetch_blocks_on_pages(
         self,

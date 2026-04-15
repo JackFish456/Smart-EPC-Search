@@ -1,7 +1,8 @@
 from epc_smart_search.chunking import ChunkRecord
+from epc_smart_search.indexer import refresh_query_index
 from epc_smart_search.ocr_support import ExtractedBlock, PageText
 from epc_smart_search.search_features import build_chunk_features
-from epc_smart_search.storage import ContractStore
+from epc_smart_search.storage import ContractStore, pack_vector
 
 
 def test_fts_triggers_stay_in_sync() -> None:
@@ -125,3 +126,79 @@ def test_block_indexes_and_ingest_diagnostics_are_materialized() -> None:
     assert store.get_block_count("doc1") == 2
     diagnostics = store.get_ingest_diagnostic_summary("doc1")
     assert diagnostics["table_like_pages"] == 1
+
+
+def test_chunk_vectors_are_persisted_and_queryable() -> None:
+    db_path = "file:storage_contract_vectors?mode=memory&cache=shared"
+    store = ContractStore(db_path)
+    chunk = ChunkRecord(
+        chunk_id="chunk1",
+        document_id="doc1",
+        chunk_type="section",
+        section_number="8.2",
+        heading="Warranty Period",
+        full_text="The warranty period begins on substantial completion.",
+        page_start=18,
+        page_end=18,
+        parent_chunk_id=None,
+        ordinal_in_document=1,
+    )
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc",
+        page_count=1,
+        chunks=[chunk],
+        pages=[PageText(page_num=18, text=chunk.full_text, ocr_used=False)],
+        features=build_chunk_features([chunk]),
+        embeddings={"chunk1": pack_vector([1.0, 0.0, 0.0])},
+        model_name="test-semantic",
+        dimension=3,
+    )
+
+    assert store.get_embedding_count("doc1") == 1
+    assert store.get_embedding_metadata("doc1") == ("test-semantic", 3)
+    vectors = store.fetch_chunk_vectors("doc1", ["chunk1"])
+    assert vectors["chunk1"]["dimension"] == 3
+    assert vectors["chunk1"]["vector"] == [1.0, 0.0, 0.0]
+
+
+def test_refresh_query_index_rebuilds_semantic_vectors(monkeypatch) -> None:
+    db_path = "file:storage_refresh_vectors?mode=memory&cache=shared"
+    store = ContractStore(db_path)
+    chunk = ChunkRecord(
+        chunk_id="chunk1",
+        document_id="doc1",
+        chunk_type="section",
+        section_number="9.1",
+        heading="Termination",
+        full_text="Owner may terminate this Contract upon written notice.",
+        page_start=22,
+        page_end=22,
+        parent_chunk_id=None,
+        ordinal_in_document=1,
+    )
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc",
+        page_count=1,
+        chunks=[chunk],
+        pages=[PageText(page_num=22, text=chunk.full_text, ocr_used=False)],
+        features=build_chunk_features([chunk]),
+    )
+
+    monkeypatch.setattr(
+        "epc_smart_search.indexer.build_chunk_embeddings",
+        lambda chunks, features: ({"chunk1": pack_vector([0.0, 1.0, 0.0])}, "test-semantic", 3),
+    )
+
+    refreshed = refresh_query_index(store, "doc1")
+
+    assert refreshed == 1
+    assert store.get_embedding_count("doc1") == 1
+    assert store.get_embedding_metadata("doc1") == ("test-semantic", 3)

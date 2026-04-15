@@ -5,7 +5,7 @@ Windows-first local EPC contract assistant built around:
 - A bundled prebuilt contract database for the customer runtime
 - SQLite + FTS5 for read-heavy clause retrieval
 - Query planning and enriched chunk features for context-aware search
-- Local semantic-style reranking with stored hashing embeddings
+- SQLite + FTS5 candidate retrieval with optional local semantic reranking over top lexical hits
 - A Kiewey desktop chat surface (PySide6)
 - Local Gemma generation through the **Gemma Test** environment
 - Preflight checks that warn when contract-bearing artifacts are left under the workspace
@@ -14,7 +14,7 @@ Windows-first local EPC contract assistant built around:
 
 This repository can be **public** with respect to **how** search works: the SQLite **schema**, indexing pipeline, and Python in `epc_smart_search/` (including `storage.py`) describe the setup only—they do **not** contain contract text.
 
-What must **stay private** (never in the public remote) is **contract information**: full text, chunks, embeddings, and any derived index **inside** database files.
+What must **stay private** (never in the public remote) is **contract information**: full text, chunks, chunk vectors, and any derived index **inside** database files.
 
 | What | On GitHub (public)? |
 |------|---------------------|
@@ -74,7 +74,7 @@ python -m epc_smart_search.rebuild_contract --pdf C:\secure\contracts\Clean Cont
 
 The rebuild utility:
 
-- Uses the same chunking, feature, and embedding pipeline as the app
+- Uses the same chunking, feature, and optional chunk-vector pipeline as the app
 - Validates the rebuilt SQLite database before reporting success
 - Refuses to overwrite the live app database or an existing output file
 
@@ -121,4 +121,5 @@ For now, the EXE and bundled contract database can stay the same across both rel
 - **Data directory:** Typically `%LOCALAPPDATA%\EPC Smart Search\`; if that is unavailable, the app may use a `.epc_smart_search` folder under the repo (also ignored).
 - **OCR:** Fallback uses Windows WinRT OCR for weak or empty pages.
 - **Answers:** If retrieved evidence is weak, the assistant refuses instead of guessing.
+- **Semantic reranking:** Optional and offline; if the local semantic model asset or stored chunk vectors are missing, retrieval falls back to the lexical pipeline automatically.
 - **Dependencies:** `requirements-runtime.txt` covers the desktop/runtime surface, `requirements-dev.txt` adds test/lint/package tooling, and `requirements-gemma.txt` documents the Gemma service extras.

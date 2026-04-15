@@ -3,13 +3,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from epc_smart_search.config import MAX_SEARCH_RESULTS
+from epc_smart_search.config import MAX_SEARCH_RESULTS, MAX_SEMANTIC_SCAN
 from epc_smart_search.query_planner import (
     QueryPlan,
     build_match_queries,
     has_term_overlap,
     plan_query,
 )
+from epc_smart_search.semantic import LocalEmbedder, SemanticReranker, build_query_semantic_text
 from epc_smart_search.storage import ContractStore
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{1,}")
@@ -69,6 +70,9 @@ class RetrievalProfile:
     fts_limit: int
     rescue_limit: int
     use_query_expansion: bool = False
+    semantic_enabled: bool = True
+    semantic_on_weak_only: bool = True
+    semantic_scan_limit: int = MAX_SEMANTIC_SCAN
 
 
 @dataclass(slots=True, frozen=True)
@@ -100,6 +104,7 @@ DEEP_RETRIEVAL_PROFILE = RetrievalProfile(
     fts_limit=40,
     rescue_limit=30,
     use_query_expansion=True,
+    semantic_on_weak_only=False,
 )
 
 
@@ -117,8 +122,14 @@ def build_match_query(query: str) -> str:
 
 
 class HybridRetriever:
-    def __init__(self, store: ContractStore, embedder: object | None = None) -> None:
+    def __init__(
+        self,
+        store: ContractStore,
+        embedder: LocalEmbedder | None = None,
+        semantic_reranker: SemanticReranker | None = None,
+    ) -> None:
         self.store = store
+        self.semantic_reranker = semantic_reranker or SemanticReranker(store, embedder=embedder)
 
     def resolve_document_id(self) -> str | None:
         document = self.store.get_document()
@@ -195,6 +206,20 @@ class HybridRetriever:
                         continue
                     self._merge_candidate(combined, candidate)
 
+        lexical_ranked = sorted(
+            combined.values(),
+            key=lambda item: self._lexical_final_score(plan, item),
+            reverse=True,
+        )
+        evidence_is_weak = self._primary_evidence_is_weak(plan, combined)
+        reranked = self._apply_semantic_reranking(
+            document_id,
+            query,
+            plan,
+            lexical_ranked,
+            active_profile,
+            evidence_is_weak=evidence_is_weak,
+        )
         ranked = [
             RankedChunk(
                 chunk_id=str(candidate.row["chunk_id"]),
@@ -211,11 +236,7 @@ class HybridRetriever:
                 matched_block_count=len(candidate.matched_block_ids),
                 matched_terms=len(candidate.matched_terms),
             )
-            for candidate in sorted(
-                combined.values(),
-                key=lambda item: self._final_score(plan, item),
-                reverse=True,
-            )[: active_profile.result_limit]
+            for candidate in reranked[: active_profile.result_limit]
         ]
         return ranked
 
@@ -345,6 +366,9 @@ class HybridRetriever:
             fts_limit=selected.fts_limit,
             rescue_limit=selected.rescue_limit,
             use_query_expansion=selected.use_query_expansion,
+            semantic_enabled=selected.semantic_enabled,
+            semantic_on_weak_only=selected.semantic_on_weak_only,
+            semantic_scan_limit=selected.semantic_scan_limit,
         )
 
     def _match_queries_for_profile(self, plan: QueryPlan, profile: RetrievalProfile) -> list[str]:
@@ -468,7 +492,7 @@ class HybridRetriever:
     def _primary_evidence_is_weak(self, plan: QueryPlan, combined: dict[str, SearchCandidate]) -> bool:
         if not combined:
             return True
-        top_candidates = sorted(combined.values(), key=lambda item: self._final_score(plan, item), reverse=True)[:3]
+        top_candidates = sorted(combined.values(), key=lambda item: self._lexical_final_score(plan, item), reverse=True)[:3]
         for candidate in top_candidates:
             if self._is_strong_match(plan, candidate):
                 return False
@@ -488,7 +512,7 @@ class HybridRetriever:
             return True
         if plan.focus_terms and self._term_hit_count(combined_text, plan.focus_terms) >= max(2, len(plan.focus_terms) - 1):
             return True
-        return self._final_score(plan, candidate) >= 2.9
+        return self._lexical_final_score(plan, candidate) >= 2.9
 
     @staticmethod
     def _build_trigram_query(text: str) -> str:
@@ -695,7 +719,7 @@ class HybridRetriever:
         parent_candidate.matched_terms.update(self._matched_terms_in_text(plan, block_text))
         return parent_candidate
 
-    def _final_score(self, plan: QueryPlan, candidate: SearchCandidate) -> float:
+    def _lexical_final_score(self, plan: QueryPlan, candidate: SearchCandidate) -> float:
         score = candidate.total_score
         block_count = len(candidate.matched_block_ids)
         if block_count:
@@ -712,6 +736,52 @@ class HybridRetriever:
         if candidate.row["parent_heading"] and has_term_overlap(str(candidate.row["parent_heading"]), plan.focus_terms):
             score += 0.12
         return score
+
+    def _final_score(self, plan: QueryPlan, candidate: SearchCandidate) -> float:
+        return self._lexical_final_score(plan, candidate) + self._semantic_bonus(plan, candidate)
+
+    def _apply_semantic_reranking(
+        self,
+        document_id: str,
+        query: str,
+        plan: QueryPlan,
+        ranked: list[SearchCandidate],
+        profile: RetrievalProfile,
+        *,
+        evidence_is_weak: bool,
+    ) -> list[SearchCandidate]:
+        if not ranked or not profile.semantic_enabled:
+            return ranked
+        if profile.semantic_on_weak_only and not evidence_is_weak:
+            return ranked
+        semantic_window = ranked[: profile.semantic_scan_limit]
+        if not semantic_window:
+            return ranked
+        semantic_query = build_query_semantic_text(query, plan)
+        if not semantic_query:
+            return ranked
+        reranked = list(semantic_window)
+        if not self.semantic_reranker.rerank(document_id, semantic_query, reranked):
+            return ranked
+        reranked.sort(key=lambda item: self._final_score(plan, item), reverse=True)
+        return reranked + ranked[profile.semantic_scan_limit :]
+
+    def _semantic_bonus(self, plan: QueryPlan, candidate: SearchCandidate) -> float:
+        semantic_score = max(0.0, min(1.0, candidate.semantic_score))
+        if semantic_score <= 0.18:
+            return 0.0
+        row = candidate.row
+        if row["section_number"] and row["section_number"] == plan.section_number:
+            return 0.0
+        lexical_score = self._lexical_final_score(plan, candidate)
+        bonus = (semantic_score - 0.18) * 1.1
+        if candidate.retrieval_stage == "exact_lookup":
+            bonus *= 0.3
+        elif candidate.retrieval_stage == "trigram_rescue":
+            bonus *= 1.1
+        if lexical_score >= 3.8:
+            bonus *= 0.45
+        return min(0.82, bonus)
 
     @staticmethod
     def _stage_priority(stage: str) -> int:

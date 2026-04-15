@@ -20,6 +20,7 @@ from epc_smart_search.config import GEMMA_SERVICE_HOST, GEMMA_SERVICE_PORT, SEAR
 from epc_smart_search.gemma_client import GemmaServiceClient as ManagedGemmaServiceClient
 from epc_smart_search.query_planner import QueryPlan, plan_query
 from epc_smart_search.retrieval import Citation, ExactPageHit, HybridRetriever, RankedChunk
+from epc_smart_search.semantic import LocalEmbedder
 from epc_smart_search.storage import ContractStore
 
 
@@ -36,6 +37,12 @@ class IndexValidationResult:
     feature_count: int = 0
     page_text_count: int = 0
     diagnostic_count: int = 0
+    embedding_count: int = 0
+    semantic_model_name: str | None = None
+    semantic_dimension: int | None = None
+    semantic_index_ready: bool = False
+    semantic_runtime_available: bool = False
+    semantic_ready: bool = False
 
 
 SUMMARY_MAX_NEW_TOKENS = 768
@@ -105,6 +112,19 @@ def validate_contract_store(store: ContractStore) -> IndexValidationResult:
             page_text_count=page_text_count,
             diagnostic_count=diagnostic_count,
         )
+    embedding_count = store.get_embedding_count(document_id)
+    semantic_model_name, semantic_dimension = store.get_embedding_metadata(document_id)
+    semantic_index_ready = embedding_count == chunk_count and embedding_count > 0 and semantic_model_name is not None and semantic_dimension is not None
+    runtime_embedder = LocalEmbedder()
+    runtime_model_name = runtime_embedder.model_name if runtime_embedder.is_available() else None
+    runtime_dimension = runtime_embedder.dimension if runtime_embedder.is_available() else None
+    semantic_runtime_available = bool(
+        semantic_index_ready
+        and runtime_model_name
+        and runtime_dimension
+        and runtime_model_name == semantic_model_name
+        and runtime_dimension == semantic_dimension
+    )
     return IndexValidationResult(
         True,
         None,
@@ -114,6 +134,12 @@ def validate_contract_store(store: ContractStore) -> IndexValidationResult:
         feature_count=feature_count,
         page_text_count=page_text_count,
         diagnostic_count=diagnostic_count,
+        embedding_count=embedding_count,
+        semantic_model_name=semantic_model_name,
+        semantic_dimension=semantic_dimension,
+        semantic_index_ready=semantic_index_ready,
+        semantic_runtime_available=semantic_runtime_available,
+        semantic_ready=semantic_runtime_available,
     )
 
 

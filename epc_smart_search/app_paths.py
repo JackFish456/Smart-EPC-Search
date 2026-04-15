@@ -79,6 +79,7 @@ def get_app_data_root() -> Path:
 APP_DATA_ROOT = get_app_data_root()
 DB_PATH = APP_DATA_ROOT / "contract_store.db"
 PRELOADED_DB_PATH = ASSETS_DIR / "contract_store.prebuilt.db"
+SEMANTIC_MODEL_PATH = ASSETS_DIR / "semantic_model.json"
 LOG_PATH = APP_DATA_ROOT / "epc_smart_search.log"
 OCR_CACHE_DIR = APP_DATA_ROOT / "ocr_cache"
 OCR_CACHE_DIR.mkdir(parents=True, exist_ok=True)

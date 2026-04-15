@@ -20,7 +20,7 @@ from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.config import GREETING
 from epc_smart_search.ocr_support import PageText
 from epc_smart_search.search_features import build_chunk_features
-from epc_smart_search.storage import ContractStore
+from epc_smart_search.storage import ContractStore, pack_vector
 from epc_smart_search.ui.avatar_window import AvatarWindow
 from epc_smart_search.ui.chat_dialog import CONTRACT_DATA_UNAVAILABLE_MESSAGE
 from epc_smart_search.ui.chat_dialog import CONTRACT_DATA_UNAVAILABLE_STATUS
@@ -36,6 +36,9 @@ def test_validate_contract_store_accepts_seeded_db_without_pdf_dependency() -> N
     assert status.error is None
     assert status.chunk_count == 1
     assert status.feature_count == 1
+    assert status.semantic_index_ready is False
+    assert status.semantic_runtime_available is False
+    assert status.semantic_ready is False
 
 
 def test_validate_contract_store_rejects_wrong_schema_version() -> None:
@@ -317,6 +320,45 @@ def test_rebuild_cli_creates_and_validates_a_fresh_database(monkeypatch) -> None
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["document_id"] == "doc1"
     assert report["index"]["block_count"] >= 1
+
+
+def test_build_coverage_report_includes_optional_semantic_status(tmp_path: Path) -> None:
+    db_path = tmp_path / "semantic_report.db"
+    store = ContractStore(db_path)
+    chunk = ChunkRecord(
+        chunk_id="chunk1",
+        document_id="doc1",
+        chunk_type="section",
+        section_number="1",
+        heading="General",
+        full_text="Contractor shall perform the work.",
+        page_start=1,
+        page_end=1,
+        parent_chunk_id=None,
+        ordinal_in_document=1,
+    )
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc123",
+        page_count=1,
+        chunks=[chunk],
+        pages=[PageText(page_num=1, text=chunk.full_text, ocr_used=False)],
+        features=build_chunk_features([chunk]),
+        embeddings={"chunk1": pack_vector([1.0, 0.0, 0.0])},
+        model_name="test-semantic",
+        dimension=3,
+    )
+
+    report = rebuild_contract_module.build_coverage_report(db_path)
+
+    assert report["index"]["embedding_count"] == 1
+    assert report["semantic"]["semantic_index_ready"] is True
+    assert report["semantic"]["semantic_runtime_available"] is False
+    assert report["semantic"]["semantic_ready"] is False
+    assert report["semantic"]["semantic_model_name"] == "test-semantic"
 
 
 def _seed_store(db_path: str | Path, *, with_features: bool = True) -> ContractStore:

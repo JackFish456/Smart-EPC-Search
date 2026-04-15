@@ -73,6 +73,8 @@ try {
             "--add-data",
             "assets\kiewey.png;assets",
             "--add-data",
+            "assets\semantic_model.json;assets",
+            "--add-data",
             "$stagedDb;assets",
             "epc_smart_search_app.py"
         )

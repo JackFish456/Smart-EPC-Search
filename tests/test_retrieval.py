@@ -3,7 +3,7 @@ from epc_smart_search.ocr_support import ExtractedBlock, PageText
 from epc_smart_search.query_planner import build_like_fallback, plan_query
 from epc_smart_search.retrieval import HybridRetriever, SearchCoverageCase
 from epc_smart_search.search_features import build_chunk_features
-from epc_smart_search.storage import ContractStore
+from epc_smart_search.storage import ContractStore, pack_vector
 
 
 def test_direct_section_lookup_wins() -> None:
@@ -473,8 +473,167 @@ def test_evaluate_coverage_cases_reports_stage_and_match_status() -> None:
     assert results[0].retrieval_stage in {"exact_lookup", "chunk_fts"}
 
 
-def _seed_retriever(chunks: list[ChunkRecord]) -> HybridRetriever:
-    db_path = "file:retrieval_suite?mode=memory&cache=shared"
+def test_semantic_reranking_can_promote_paraphrase_match_in_deep_profile() -> None:
+    chunks = [
+        _chunk(
+            "notice",
+            "4.4",
+            "Owner Cancellation Agreement Notice",
+            "Owner shall issue an agreement cancellation notice for administrative filing.",
+            24,
+        ),
+        _chunk(
+            "termination",
+            "12.1",
+            "Owner Termination for Convenience",
+            "Owner may terminate this Contract for convenience at any time upon written notice.",
+            50,
+        ),
+    ]
+    lexical = _seed_retriever(chunks)
+    lexical_ranked = lexical.retrieve("Can the owner cancel the agreement?", profile="deep")
+    semantic = _seed_retriever(
+        chunks,
+        embeddings={
+            "notice": [0.0, 1.0, 0.0],
+            "termination": [1.0, 0.0, 0.0],
+        },
+        embedder=_FakeEmbedder(
+            {
+                "cancel the agreement": [1.0, 0.0, 0.0],
+            }
+        ),
+    )
+
+    semantic_ranked = semantic.retrieve("Can the owner cancel the agreement?", profile="deep")
+
+    assert lexical_ranked
+    assert lexical_ranked[0].chunk_id == "notice"
+    assert semantic_ranked[0].chunk_id == "termination"
+    assert semantic_ranked[0].semantic_score > 0.0
+
+
+def test_exact_section_lookup_is_not_displaced_by_semantic_similarity() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "section_hit",
+                "14.2.1",
+                "Liquidated Damages",
+                "This clause covers liquidated damages.",
+                10,
+            ),
+            _chunk(
+                "semantic_distractor",
+                "14.2.2",
+                "Delay Compensation",
+                "This section uses related delay language.",
+                11,
+            ),
+        ],
+        embeddings={
+            "section_hit": [0.0, 1.0, 0.0],
+            "semantic_distractor": [1.0, 0.0, 0.0],
+        },
+        embedder=_FakeEmbedder(
+            {
+                "14.2.1": [1.0, 0.0, 0.0],
+            }
+        ),
+    )
+
+    ranked = retriever.retrieve("section 14.2.1", profile="deep")
+
+    assert ranked
+    assert ranked[0].chunk_id == "section_hit"
+
+
+def test_semantic_reranking_falls_back_when_vector_dimensions_do_not_match() -> None:
+    chunks = [
+        _chunk(
+            "notice",
+            "4.4",
+            "Owner Cancellation Agreement Notice",
+            "Owner shall issue an agreement cancellation notice for administrative filing.",
+            24,
+        ),
+        _chunk(
+            "termination",
+            "12.1",
+            "Owner Termination for Convenience",
+            "Owner may terminate this Contract for convenience at any time upon written notice.",
+            50,
+        ),
+    ]
+    retriever = _seed_retriever(
+        chunks,
+        embeddings={
+            "notice": [0.0, 1.0],
+            "termination": [1.0, 0.0],
+        },
+        model_name="test-semantic",
+        dimension=2,
+        embedder=_FakeEmbedder(
+            {
+                "cancel the agreement": [1.0, 0.0, 0.0],
+            }
+        ),
+    )
+
+    ranked = retriever.retrieve("Can the owner cancel the agreement?", profile="deep")
+
+    assert ranked
+    assert ranked[0].chunk_id == "notice"
+    assert all(chunk.semantic_score == 0.0 for chunk in ranked)
+
+
+def test_normal_profile_only_uses_semantics_when_lexical_evidence_is_weak() -> None:
+    class FakeSemanticReranker:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def rerank(self, document_id: str, query_text: str, candidates) -> bool:
+            self.calls.append(query_text)
+            return False
+
+    reranker = FakeSemanticReranker()
+    retriever = HybridRetriever(
+        _seed_store_for_semantic_gate(
+            [
+                _chunk(
+                    "motors",
+                    "4.4.3",
+                    "Electric Motors",
+                    "Electric motors must meet the design requirements for the project.",
+                    12,
+                ),
+                _chunk(
+                    "walkdown",
+                    "4.4",
+                    "Contract Walkdown Checklist",
+                    "Company shall complete a contract walkdown checklist before turnover.",
+                    24,
+                ),
+                _chunk(
+                    "termination",
+                    "12.1",
+                    "Owner Termination for Convenience",
+                    "Owner may terminate this Contract for convenience at any time upon written notice.",
+                    50,
+                ),
+            ]
+        ),
+        semantic_reranker=reranker,
+    )
+
+    retriever.retrieve("What does the contract say about electric motors?")
+    retriever.retrieve("Can a party leave the agreement?")
+
+    assert len(reranker.calls) == 1
+
+
+def _seed_store_for_semantic_gate(chunks: list[ChunkRecord]) -> ContractStore:
+    db_path = "file:retrieval_semantic_gate?mode=memory&cache=shared"
     store = ContractStore(db_path)
     pages = [PageText(page_num=chunk.page_start, text=chunk.full_text, ocr_used=False) for chunk in chunks]
     store.replace_document(
@@ -488,7 +647,35 @@ def _seed_retriever(chunks: list[ChunkRecord]) -> HybridRetriever:
         pages=pages,
         features=build_chunk_features(chunks),
     )
-    return HybridRetriever(store)
+    return store
+
+
+def _seed_retriever(
+    chunks: list[ChunkRecord],
+    *,
+    embeddings: dict[str, list[float]] | None = None,
+    model_name: str = "test-semantic",
+    dimension: int | None = None,
+    embedder=None,
+) -> HybridRetriever:
+    db_path = "file:retrieval_suite?mode=memory&cache=shared"
+    store = ContractStore(db_path)
+    pages = [PageText(page_num=chunk.page_start, text=chunk.full_text, ocr_used=False) for chunk in chunks]
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc",
+        page_count=len(pages),
+        chunks=chunks,
+        pages=pages,
+        features=build_chunk_features(chunks),
+        embeddings={chunk_id: pack_vector(vector) for chunk_id, vector in (embeddings or {}).items()},
+        model_name=model_name if embeddings else None,
+        dimension=dimension or (len(next(iter(embeddings.values()))) if embeddings else None),
+    )
+    return HybridRetriever(store, embedder=embedder)
 
 
 def _chunk(
@@ -512,3 +699,30 @@ def _chunk(
         parent_chunk_id=None,
         ordinal_in_document=page_num,
     )
+
+
+class _FakeEmbedder:
+    def __init__(self, vectors: dict[str, list[float]], *, model_name: str = "test-semantic") -> None:
+        self.vectors = {key.lower(): value for key, value in vectors.items()}
+        self._model_name = model_name
+        first = next(iter(vectors.values()))
+        self._dimension = len(first)
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    def is_available(self) -> bool:
+        return True
+
+    def encode(self, texts) -> list[list[float]]:
+        encoded: list[list[float]] = []
+        for text in texts:
+            normalized = str(text).lower()
+            vector = next((value for key, value in self.vectors.items() if key in normalized), [0.0] * self._dimension)
+            encoded.append(vector)
+        return encoded

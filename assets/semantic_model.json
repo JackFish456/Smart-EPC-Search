@@ -1,0 +1,25 @@
+{
+  "model_name": "hashing-semantic-v1",
+  "dimension": 192,
+  "stopwords": [
+    "a",
+    "an",
+    "and",
+    "are",
+    "for",
+    "in",
+    "is",
+    "of",
+    "or",
+    "the",
+    "to",
+    "what"
+  ],
+  "synonyms": {
+    "terminate": ["termination", "cancel", "end the contract"],
+    "permit": ["permitting", "permits", "approval", "approvals", "license", "licenses"],
+    "payment": ["payments", "pay", "cost", "costs", "compensation"],
+    "delay": ["late", "lateness", "slippage"],
+    "substantial completion": ["commercial operation", "completion milestone"]
+  }
+}

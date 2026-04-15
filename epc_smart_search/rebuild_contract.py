@@ -42,6 +42,14 @@ def build_coverage_report(db_path: Path) -> dict[str, object]:
             "feature_count": status.feature_count,
             "page_text_count": status.page_text_count,
             "diagnostic_count": status.diagnostic_count,
+            "embedding_count": status.embedding_count,
+        },
+        "semantic": {
+            "semantic_model_name": status.semantic_model_name,
+            "semantic_dimension": status.semantic_dimension,
+            "semantic_index_ready": status.semantic_index_ready,
+            "semantic_runtime_available": status.semantic_runtime_available,
+            "semantic_ready": status.semantic_ready,
         },
         "ingest_summary": store.get_ingest_diagnostic_summary(document_id) if document_id else {},
         "page_diagnostics": [
