@@ -10,6 +10,7 @@ from epc_smart_search.query_planner import (
     has_term_overlap,
     plan_query,
 )
+from epc_smart_search.search_features import is_numericish_token, query_looks_numeric
 from epc_smart_search.semantic import LocalEmbedder, SemanticReranker, build_query_semantic_text
 from epc_smart_search.storage import ContractStore
 
@@ -92,6 +93,16 @@ class SearchCoverageResult:
     retrieval_stage: str | None
 
 
+@dataclass(slots=True, frozen=True)
+class RetrievalEvidence:
+    is_weak: bool
+    has_strong_match: bool
+    top_retrieval_stage: str | None
+    top_lexical_score: float
+    top_final_score: float
+    rescue_only: bool
+
+
 DEFAULT_RETRIEVAL_PROFILE = RetrievalProfile(
     name="normal",
     result_limit=MAX_SEARCH_RESULTS,
@@ -109,7 +120,7 @@ DEEP_RETRIEVAL_PROFILE = RetrievalProfile(
 
 
 def build_match_query(query: str) -> str:
-    tokens = [token for token in TOKEN_RE.findall(query.lower()) if len(token) > 2]
+    tokens = [token for token in TOKEN_RE.findall(query.lower()) if len(token) > 2 or is_numericish_token(token)]
     if not tokens:
         clean = query.strip().replace('"', "")
         return f'"{clean}"' if clean else ""
@@ -165,7 +176,8 @@ class HybridRetriever:
                 candidate = self._score_row(plan, row, lexical_score=lexical_score, retrieval_stage="chunk_fts")
                 self._merge_candidate(combined, candidate)
 
-        if self._primary_evidence_is_weak(plan, combined):
+        numeric_priority = self._should_prioritize_block_search(plan)
+        if self._primary_evidence_is_weak(plan, combined) or numeric_priority:
             for block_query in self._block_queries_for_profile(plan, active_profile):
                 for row in self.store.search_block_fts(document_id, block_query, limit=active_profile.fts_limit):
                     lexical_score = self._lexical_score_from_rank(row["rank_score"])
@@ -174,7 +186,7 @@ class HybridRetriever:
                         continue
                     self._merge_candidate(combined, candidate)
 
-        if self._primary_evidence_is_weak(plan, combined):
+        if self._primary_evidence_is_weak(plan, combined) or numeric_priority:
             for rescue_query in self._rescue_queries_for_profile(plan, active_profile):
                 for row in self.store.search_chunk_feature_rescue_fts(
                     document_id,
@@ -211,14 +223,14 @@ class HybridRetriever:
             key=lambda item: self._lexical_final_score(plan, item),
             reverse=True,
         )
-        evidence_is_weak = self._primary_evidence_is_weak(plan, combined)
+        evidence = self._assess_candidate_evidence(plan, lexical_ranked)
         reranked = self._apply_semantic_reranking(
             document_id,
             query,
             plan,
             lexical_ranked,
             active_profile,
-            evidence_is_weak=evidence_is_weak,
+            evidence_is_weak=evidence.is_weak,
         )
         ranked = [
             RankedChunk(
@@ -229,7 +241,12 @@ class HybridRetriever:
                 page_start=int(candidate.row["page_start"]),
                 page_end=int(candidate.row["page_end"]),
                 ordinal_in_document=int(candidate.row["ordinal_in_document"]),
-                total_score=self._final_score(plan, candidate),
+                total_score=self._final_score(
+                    plan,
+                    candidate,
+                    profile=active_profile,
+                    evidence_is_weak=evidence.is_weak,
+                ),
                 lexical_score=candidate.lexical_score,
                 semantic_score=candidate.semantic_score,
                 retrieval_stage=candidate.retrieval_stage,
@@ -239,6 +256,10 @@ class HybridRetriever:
             for candidate in reranked[: active_profile.result_limit]
         ]
         return ranked
+
+    def assess_evidence(self, query: str, ranked: list[RankedChunk]) -> RetrievalEvidence:
+        plan = plan_query(query)
+        return self._assess_ranked_evidence(plan, ranked)
 
     def evaluate_coverage_cases(self, cases: list[SearchCoverageCase]) -> list[SearchCoverageResult]:
         results: list[SearchCoverageResult] = []
@@ -490,13 +511,7 @@ class HybridRetriever:
         return 1.0 / (1.0 + max(float(rank_score), 0.0))
 
     def _primary_evidence_is_weak(self, plan: QueryPlan, combined: dict[str, SearchCandidate]) -> bool:
-        if not combined:
-            return True
-        top_candidates = sorted(combined.values(), key=lambda item: self._lexical_final_score(plan, item), reverse=True)[:3]
-        for candidate in top_candidates:
-            if self._is_strong_match(plan, candidate):
-                return False
-        return True
+        return self._assess_candidate_evidence(plan, combined.values()).is_weak
 
     def _is_strong_match(self, plan: QueryPlan, candidate: SearchCandidate) -> bool:
         row = candidate.row
@@ -513,6 +528,106 @@ class HybridRetriever:
         if plan.focus_terms and self._term_hit_count(combined_text, plan.focus_terms) >= max(2, len(plan.focus_terms) - 1):
             return True
         return self._lexical_final_score(plan, candidate) >= 2.9
+
+    def _is_strong_ranked_match(self, plan: QueryPlan, chunk: RankedChunk) -> bool:
+        if chunk.section_number and chunk.section_number == plan.section_number:
+            return True
+        combined_text = " ".join([chunk.heading, chunk.full_text])
+        if plan.content_query and (
+            has_term_overlap(chunk.heading, (plan.content_query,))
+            or has_term_overlap(chunk.full_text, (plan.content_query,))
+        ):
+            return True
+        if plan.focus_terms and self._term_hit_count(combined_text, plan.focus_terms) >= max(2, len(plan.focus_terms) - 1):
+            return True
+        return chunk.total_score >= 2.9
+
+    def _assess_candidate_evidence(
+        self,
+        plan: QueryPlan,
+        candidates,
+    ) -> RetrievalEvidence:
+        ordered = sorted(candidates, key=lambda item: self._lexical_final_score(plan, item), reverse=True)[:3]
+        if not ordered:
+            return RetrievalEvidence(
+                is_weak=True,
+                has_strong_match=False,
+                top_retrieval_stage=None,
+                top_lexical_score=0.0,
+                top_final_score=0.0,
+                rescue_only=False,
+            )
+        top = ordered[0]
+        top_final_score = self._lexical_final_score(plan, top)
+        has_strong_match = any(self._is_strong_match(plan, candidate) for candidate in ordered)
+        rescue_only = all(candidate.retrieval_stage == "trigram_rescue" for candidate in ordered)
+        return RetrievalEvidence(
+            is_weak=self._is_weak_evidence(
+                has_strong_match=has_strong_match,
+                top_retrieval_stage=top.retrieval_stage,
+                top_lexical_score=top.lexical_score,
+                top_final_score=top_final_score,
+                rescue_only=rescue_only,
+            ),
+            has_strong_match=has_strong_match,
+            top_retrieval_stage=top.retrieval_stage,
+            top_lexical_score=top.lexical_score,
+            top_final_score=top_final_score,
+            rescue_only=rescue_only,
+        )
+
+    def _assess_ranked_evidence(self, plan: QueryPlan, ranked: list[RankedChunk]) -> RetrievalEvidence:
+        top_ranked = ranked[:3]
+        if not top_ranked:
+            return RetrievalEvidence(
+                is_weak=True,
+                has_strong_match=False,
+                top_retrieval_stage=None,
+                top_lexical_score=0.0,
+                top_final_score=0.0,
+                rescue_only=False,
+            )
+        top = top_ranked[0]
+        has_strong_match = any(self._is_strong_ranked_match(plan, chunk) for chunk in top_ranked)
+        rescue_only = all(chunk.retrieval_stage == "trigram_rescue" for chunk in top_ranked)
+        return RetrievalEvidence(
+            is_weak=self._is_weak_evidence(
+                has_strong_match=has_strong_match,
+                top_retrieval_stage=top.retrieval_stage,
+                top_lexical_score=top.lexical_score,
+                top_final_score=top.total_score,
+                rescue_only=rescue_only,
+            ),
+            has_strong_match=has_strong_match,
+            top_retrieval_stage=top.retrieval_stage,
+            top_lexical_score=top.lexical_score,
+            top_final_score=top.total_score,
+            rescue_only=rescue_only,
+        )
+
+    @staticmethod
+    def _is_weak_evidence(
+        *,
+        has_strong_match: bool,
+        top_retrieval_stage: str | None,
+        top_lexical_score: float,
+        top_final_score: float,
+        rescue_only: bool,
+    ) -> bool:
+        if has_strong_match:
+            return False
+        if top_retrieval_stage is None:
+            return True
+        if rescue_only:
+            return top_final_score < 1.95 or top_lexical_score < 0.72
+        if top_retrieval_stage == "trigram_rescue":
+            return top_final_score < 1.95 or top_lexical_score < 0.72
+        if top_retrieval_stage == "block_fts":
+            return top_final_score < 1.65
+        return top_final_score < 1.8 or top_lexical_score < 0.45
+
+    def _should_prioritize_block_search(self, plan: QueryPlan) -> bool:
+        return query_looks_numeric(plan.raw_query) or any(is_numericish_token(term) for term in plan.focus_terms)
 
     @staticmethod
     def _build_trigram_query(text: str) -> str:
@@ -532,6 +647,9 @@ class HybridRetriever:
         row_keys = set(row.keys()) if hasattr(row, "keys") else set()
         rescue_targets = [
             str(row["heading"]),
+            str(row["numeric_text"] or ""),
+            str(row["hierarchy_path"] or ""),
+            str(row["priority_flags"] or ""),
             str(row["parent_heading"] or ""),
             str(
                 row["rescue_text"] if "rescue_text" in row_keys else
@@ -599,12 +717,17 @@ class HybridRetriever:
     ) -> SearchCandidate:
         heading = str(row["heading"])
         parent_heading = str(row["parent_heading"] or "")
+        hierarchy_path = str(row["hierarchy_path"] or "")
+        priority_flags = str(row["priority_flags"] or "")
+        numeric_text = str(row["numeric_text"] or "")
         full_text = str(row["full_text"])
         actor_tags = str(row["actor_tags"] or "")
         action_tags = str(row["action_tags"] or "")
         topic_tags = str(row["topic_tags"] or "")
         clause_type = str(row["clause_type"] or row["chunk_type"])
-        combined_text = " ".join([heading, parent_heading, full_text, actor_tags, action_tags, topic_tags])
+        combined_text = " ".join(
+            [heading, parent_heading, hierarchy_path, priority_flags, numeric_text, full_text, actor_tags, action_tags, topic_tags]
+        )
         focus_phrases = self._focus_phrases(plan.focus_terms)
 
         score = lexical_score * 0.85 + bonus
@@ -624,16 +747,22 @@ class HybridRetriever:
             score += 0.75
         if has_term_overlap(parent_heading, plan.focus_terms):
             score += 0.25
+        if has_term_overlap(hierarchy_path, plan.focus_terms):
+            score += 0.35
         if has_term_overlap(heading, plan.topic_terms + plan.action_terms):
             score += 0.8
         if has_term_overlap(parent_heading, plan.topic_terms):
             score += 0.4
+        if has_term_overlap(priority_flags, plan.focus_terms + plan.topic_terms + plan.expansion_terms):
+            score += 0.5
         if has_term_overlap(actor_tags, plan.actor_terms):
             score += 0.75
         if has_term_overlap(action_tags, plan.action_terms):
             score += 0.65
         if has_term_overlap(topic_tags, plan.topic_terms):
             score += 0.8
+        if has_term_overlap(numeric_text, plan.focus_terms + plan.expansion_terms):
+            score += 0.9 if query_looks_numeric(plan.raw_query) else 0.45
         if has_term_overlap(combined_text, plan.expansion_terms):
             score += 0.9
         score += 0.16 * self._term_hit_count(combined_text, plan.focus_terms)
@@ -704,10 +833,13 @@ class HybridRetriever:
             block_bonus += 0.55
         if has_term_overlap(block_text, plan.focus_terms):
             block_bonus += 0.35
+        if query_looks_numeric(plan.raw_query) and any(is_numericish_token(term) for term in plan.focus_terms):
+            if has_term_overlap(block_text, plan.focus_terms):
+                block_bonus += 0.4
         if block_type == "heading":
             block_bonus += 0.28
         if block_type == "table_row":
-            block_bonus += 0.18
+            block_bonus += 0.28 if query_looks_numeric(plan.raw_query) else 0.18
         if "table_like" in noise_flags:
             block_bonus += 0.1
         if "schedule_like" in noise_flags and plan.intent not in {"delay_schedule", "direct_text"}:
@@ -737,8 +869,20 @@ class HybridRetriever:
             score += 0.12
         return score
 
-    def _final_score(self, plan: QueryPlan, candidate: SearchCandidate) -> float:
-        return self._lexical_final_score(plan, candidate) + self._semantic_bonus(plan, candidate)
+    def _final_score(
+        self,
+        plan: QueryPlan,
+        candidate: SearchCandidate,
+        *,
+        profile: RetrievalProfile | None = None,
+        evidence_is_weak: bool = False,
+    ) -> float:
+        return self._lexical_final_score(plan, candidate) + self._semantic_bonus(
+            plan,
+            candidate,
+            profile=profile,
+            evidence_is_weak=evidence_is_weak,
+        )
 
     def _apply_semantic_reranking(
         self,
@@ -763,25 +907,42 @@ class HybridRetriever:
         reranked = list(semantic_window)
         if not self.semantic_reranker.rerank(document_id, semantic_query, reranked):
             return ranked
-        reranked.sort(key=lambda item: self._final_score(plan, item), reverse=True)
+        reranked.sort(
+            key=lambda item: self._final_score(
+                plan,
+                item,
+                profile=profile,
+                evidence_is_weak=evidence_is_weak,
+            ),
+            reverse=True,
+        )
         return reranked + ranked[profile.semantic_scan_limit :]
 
-    def _semantic_bonus(self, plan: QueryPlan, candidate: SearchCandidate) -> float:
+    def _semantic_bonus(
+        self,
+        plan: QueryPlan,
+        candidate: SearchCandidate,
+        *,
+        profile: RetrievalProfile | None = None,
+        evidence_is_weak: bool = False,
+    ) -> float:
         semantic_score = max(0.0, min(1.0, candidate.semantic_score))
         if semantic_score <= 0.18:
             return 0.0
-        row = candidate.row
-        if row["section_number"] and row["section_number"] == plan.section_number:
+        if candidate.retrieval_stage == "exact_lookup":
             return 0.0
         lexical_score = self._lexical_final_score(plan, candidate)
         bonus = (semantic_score - 0.18) * 1.1
-        if candidate.retrieval_stage == "exact_lookup":
-            bonus *= 0.3
-        elif candidate.retrieval_stage == "trigram_rescue":
+        if candidate.retrieval_stage == "trigram_rescue":
             bonus *= 1.1
         if lexical_score >= 3.8:
-            bonus *= 0.45
-        return min(0.82, bonus)
+            bonus *= 0.65
+        cap = 0.82
+        if profile is not None and profile.name == "deep" and evidence_is_weak:
+            if semantic_score >= 0.78:
+                bonus += 0.35
+            cap = 1.35
+        return min(cap, bonus)
 
     @staticmethod
     def _stage_priority(stage: str) -> int:

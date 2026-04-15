@@ -153,6 +153,9 @@ CREATE TABLE IF NOT EXISTS chunk_search_features (
     section_number TEXT,
     heading TEXT NOT NULL DEFAULT '',
     parent_heading TEXT NOT NULL DEFAULT '',
+    hierarchy_path TEXT NOT NULL DEFAULT '',
+    priority_flags TEXT NOT NULL DEFAULT '',
+    numeric_text TEXT NOT NULL DEFAULT '',
     search_text TEXT NOT NULL DEFAULT '',
     normalized_text TEXT NOT NULL DEFAULT '',
     rescue_text TEXT NOT NULL DEFAULT '',
@@ -180,7 +183,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS contract_pages_fts USING fts5(
 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_search_fts USING fts5(
     section_number,
     heading,
+    numeric_text,
+    hierarchy_path,
     parent_heading,
+    priority_flags,
     search_text,
     actor_tags,
     action_tags,
@@ -195,7 +201,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunk_search_fts USING fts5(
 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_search_rescue_fts USING fts5(
     section_number,
     heading,
+    numeric_text,
+    hierarchy_path,
     parent_heading,
+    priority_flags,
     rescue_text,
     actor_tags,
     action_tags,
@@ -317,71 +326,75 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS chunk_search_features_ai AFTER INSERT ON chunk_search_features BEGIN
   INSERT INTO chunk_search_fts(
-    rowid, section_number, heading, parent_heading, search_text,
-    actor_tags, action_tags, topic_tags, chunk_id, document_id
+    rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+    search_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
   ) VALUES (
-    new.feature_rowid, new.section_number, new.heading, new.parent_heading, new.search_text,
-    new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
+    new.feature_rowid, new.section_number, new.heading, new.numeric_text, new.hierarchy_path, new.parent_heading,
+    new.priority_flags, new.search_text, new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
   );
 
   INSERT INTO chunk_search_rescue_fts(
-    rowid, section_number, heading, parent_heading, rescue_text,
-    actor_tags, action_tags, topic_tags, chunk_id, document_id
+    rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+    rescue_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
   ) VALUES (
-    new.feature_rowid, new.section_number, new.heading, new.parent_heading, new.rescue_text,
-    new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
+    new.feature_rowid, new.section_number, new.heading, new.numeric_text, new.hierarchy_path, new.parent_heading,
+    new.priority_flags, new.rescue_text, new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
   );
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunk_search_features_ad AFTER DELETE ON chunk_search_features BEGIN
   INSERT INTO chunk_search_fts(
-    chunk_search_fts, rowid, section_number, heading, parent_heading, search_text,
-    actor_tags, action_tags, topic_tags, chunk_id, document_id
+    chunk_search_fts, rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+    search_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
   ) VALUES (
-    'delete', old.feature_rowid, old.section_number, old.heading, old.parent_heading, old.search_text,
-    old.actor_tags, old.action_tags, old.topic_tags, old.chunk_id, old.document_id
+    'delete', old.feature_rowid, old.section_number, old.heading, old.numeric_text, old.hierarchy_path,
+    old.parent_heading, old.priority_flags, old.search_text, old.actor_tags, old.action_tags, old.topic_tags,
+    old.chunk_id, old.document_id
   );
 
   INSERT INTO chunk_search_rescue_fts(
-    chunk_search_rescue_fts, rowid, section_number, heading, parent_heading, rescue_text,
-    actor_tags, action_tags, topic_tags, chunk_id, document_id
+    chunk_search_rescue_fts, rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+    rescue_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
   ) VALUES (
-    'delete', old.feature_rowid, old.section_number, old.heading, old.parent_heading, old.rescue_text,
-    old.actor_tags, old.action_tags, old.topic_tags, old.chunk_id, old.document_id
+    'delete', old.feature_rowid, old.section_number, old.heading, old.numeric_text, old.hierarchy_path,
+    old.parent_heading, old.priority_flags, old.rescue_text, old.actor_tags, old.action_tags, old.topic_tags,
+    old.chunk_id, old.document_id
   );
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunk_search_features_au AFTER UPDATE ON chunk_search_features BEGIN
   INSERT INTO chunk_search_fts(
-    chunk_search_fts, rowid, section_number, heading, parent_heading, search_text,
-    actor_tags, action_tags, topic_tags, chunk_id, document_id
+    chunk_search_fts, rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+    search_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
   ) VALUES (
-    'delete', old.feature_rowid, old.section_number, old.heading, old.parent_heading, old.search_text,
-    old.actor_tags, old.action_tags, old.topic_tags, old.chunk_id, old.document_id
+    'delete', old.feature_rowid, old.section_number, old.heading, old.numeric_text, old.hierarchy_path,
+    old.parent_heading, old.priority_flags, old.search_text, old.actor_tags, old.action_tags, old.topic_tags,
+    old.chunk_id, old.document_id
   );
 
   INSERT INTO chunk_search_rescue_fts(
-    chunk_search_rescue_fts, rowid, section_number, heading, parent_heading, rescue_text,
-    actor_tags, action_tags, topic_tags, chunk_id, document_id
+    chunk_search_rescue_fts, rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+    rescue_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
   ) VALUES (
-    'delete', old.feature_rowid, old.section_number, old.heading, old.parent_heading, old.rescue_text,
-    old.actor_tags, old.action_tags, old.topic_tags, old.chunk_id, old.document_id
+    'delete', old.feature_rowid, old.section_number, old.heading, old.numeric_text, old.hierarchy_path,
+    old.parent_heading, old.priority_flags, old.rescue_text, old.actor_tags, old.action_tags, old.topic_tags,
+    old.chunk_id, old.document_id
   );
 
   INSERT INTO chunk_search_fts(
-    rowid, section_number, heading, parent_heading, search_text,
-    actor_tags, action_tags, topic_tags, chunk_id, document_id
+    rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+    search_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
   ) VALUES (
-    new.feature_rowid, new.section_number, new.heading, new.parent_heading, new.search_text,
-    new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
+    new.feature_rowid, new.section_number, new.heading, new.numeric_text, new.hierarchy_path, new.parent_heading,
+    new.priority_flags, new.search_text, new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
   );
 
   INSERT INTO chunk_search_rescue_fts(
-    rowid, section_number, heading, parent_heading, rescue_text,
-    actor_tags, action_tags, topic_tags, chunk_id, document_id
+    rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+    rescue_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
   ) VALUES (
-    new.feature_rowid, new.section_number, new.heading, new.parent_heading, new.rescue_text,
-    new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
+    new.feature_rowid, new.section_number, new.heading, new.numeric_text, new.hierarchy_path, new.parent_heading,
+    new.priority_flags, new.rescue_text, new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
   );
 END;
 """
@@ -422,6 +435,7 @@ class ContractStore:
         with self._connect() as connection:
             connection.executescript(SCHEMA)
             _ensure_compat_columns(connection)
+            _ensure_chunk_feature_fts_schema(connection)
             _backfill_block_coverage(connection)
             connection.execute(
                 """
@@ -549,12 +563,12 @@ class ContractStore:
             """
             INSERT INTO chunk_search_features (
                 chunk_id, document_id, section_number, heading, parent_heading,
-                search_text, normalized_text, rescue_text, clause_type, actor_tags,
-                action_tags, topic_tags, noise_flags
+                hierarchy_path, priority_flags, numeric_text, search_text, normalized_text,
+                rescue_text, clause_type, actor_tags, action_tags, topic_tags, noise_flags
             ) VALUES (
                 :chunk_id, :document_id, :section_number, :heading, :parent_heading,
-                :search_text, :normalized_text, :rescue_text, :clause_type, :actor_tags,
-                :action_tags, :topic_tags, :noise_flags
+                :hierarchy_path, :priority_flags, :numeric_text, :search_text, :normalized_text,
+                :rescue_text, :clause_type, :actor_tags, :action_tags, :topic_tags, :noise_flags
             )
             """,
             [
@@ -660,6 +674,32 @@ class ContractStore:
             ).fetchone()
         return int(row["feature_count"]) if row else 0
 
+    def get_numeric_feature_count(self, document_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS feature_count
+                FROM chunk_search_features
+                WHERE document_id = ?
+                  AND trim(numeric_text) <> ''
+                """,
+                (document_id,),
+            ).fetchone()
+        return int(row["feature_count"]) if row else 0
+
+    def get_numeric_block_count(self, document_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS block_count
+                FROM contract_blocks
+                WHERE document_id = ?
+                  AND normalized_text GLOB '*[0-9]*'
+                """,
+                (document_id,),
+            ).fetchone()
+        return int(row["block_count"]) if row else 0
+
     def get_chunk_count(self, document_id: str) -> int:
         with self._connect() as connection:
             row = connection.execute(
@@ -762,6 +802,9 @@ class ContractStore:
                 SELECT
                     c.*,
                     f.parent_heading,
+                    f.hierarchy_path,
+                    f.priority_flags,
+                    f.numeric_text,
                     f.clause_type,
                     f.actor_tags,
                     f.action_tags,
@@ -785,6 +828,9 @@ class ContractStore:
                 SELECT
                     c.*,
                     f.parent_heading,
+                    f.hierarchy_path,
+                    f.priority_flags,
+                    f.numeric_text,
                     f.clause_type,
                     f.actor_tags,
                     f.action_tags,
@@ -814,6 +860,9 @@ class ContractStore:
                 SELECT
                     c.*,
                     f.parent_heading,
+                    f.hierarchy_path,
+                    f.priority_flags,
+                    f.numeric_text,
                     f.clause_type,
                     f.actor_tags,
                     f.action_tags,
@@ -822,13 +871,13 @@ class ContractStore:
                     f.search_text,
                     f.rescue_text,
                     rank AS rank_score,
-                    snippet(chunk_search_fts, 3, '[', ']', '...', 18) AS hit_snippet
+                    snippet(chunk_search_fts, 6, '[', ']', '...', 18) AS hit_snippet
                 FROM chunk_search_fts
                 JOIN chunk_search_features f ON f.feature_rowid = chunk_search_fts.rowid
                 JOIN contract_chunks c ON c.chunk_id = f.chunk_id
                 WHERE f.document_id = ?
                   AND chunk_search_fts MATCH ?
-                  AND rank MATCH 'bm25(10.0, 7.0, 4.0, 1.2, 4.0, 4.0, 4.0)'
+                  AND rank MATCH 'bm25(12.0, 9.0, 8.0, 6.5, 5.0, 4.5, 2.0, 2.8, 2.8, 2.8)'
                 ORDER BY rank
                 LIMIT ?
                 """,
@@ -842,6 +891,9 @@ class ContractStore:
                 SELECT
                     c.*,
                     f.parent_heading,
+                    f.hierarchy_path,
+                    f.priority_flags,
+                    f.numeric_text,
                     f.clause_type,
                     f.actor_tags,
                     f.action_tags,
@@ -855,7 +907,7 @@ class ContractStore:
                 JOIN contract_chunks c ON c.chunk_id = f.chunk_id
                 WHERE f.document_id = ?
                   AND chunk_search_rescue_fts MATCH ?
-                  AND rank MATCH 'bm25(6.0, 5.0, 3.0, 2.5, 3.0, 3.0, 3.0)'
+                  AND rank MATCH 'bm25(8.0, 7.0, 7.5, 6.0, 5.0, 4.5, 3.0, 2.8, 2.8, 2.8)'
                 ORDER BY rank
                 LIMIT ?
                 """,
@@ -885,6 +937,9 @@ class ContractStore:
                     c.page_end,
                     c.ordinal_in_document,
                     f.parent_heading,
+                    f.hierarchy_path,
+                    f.priority_flags,
+                    f.numeric_text,
                     f.clause_type,
                     f.actor_tags,
                     f.action_tags,
@@ -928,6 +983,9 @@ class ContractStore:
                     c.page_end,
                     c.ordinal_in_document,
                     f.parent_heading,
+                    f.hierarchy_path,
+                    f.priority_flags,
+                    f.numeric_text,
                     f.clause_type,
                     f.actor_tags,
                     f.action_tags,
@@ -955,6 +1013,9 @@ class ContractStore:
                 SELECT
                     c.*,
                     f.parent_heading,
+                    f.hierarchy_path,
+                    f.priority_flags,
+                    f.numeric_text,
                     f.clause_type,
                     f.actor_tags,
                     f.action_tags,
@@ -968,11 +1029,12 @@ class ContractStore:
                   AND (
                     c.heading LIKE ? OR c.full_text LIKE ? OR c.section_number LIKE ?
                     OR f.parent_heading LIKE ? OR f.search_text LIKE ? OR f.topic_tags LIKE ?
+                    OR f.numeric_text LIKE ? OR f.hierarchy_path LIKE ? OR f.priority_flags LIKE ?
                   )
                 ORDER BY c.ordinal_in_document
                 LIMIT ?
                 """,
-                (document_id, like, like, like, like, like, like, limit),
+                (document_id, like, like, like, like, like, like, like, like, like, limit),
             ).fetchall()
 
     def fetch_context_neighbors(self, document_id: str, ordinal: int) -> list[sqlite3.Row]:
@@ -982,6 +1044,9 @@ class ContractStore:
                 SELECT
                     c.*,
                     f.parent_heading,
+                    f.hierarchy_path,
+                    f.priority_flags,
+                    f.numeric_text,
                     f.clause_type,
                     f.actor_tags,
                     f.action_tags,
@@ -1005,6 +1070,9 @@ class ContractStore:
                 SELECT
                     c.*,
                     f.parent_heading,
+                    f.hierarchy_path,
+                    f.priority_flags,
+                    f.numeric_text,
                     f.clause_type,
                     f.actor_tags,
                     f.action_tags,
@@ -1026,6 +1094,9 @@ class ContractStore:
                 SELECT
                     c.*,
                     f.parent_heading,
+                    f.hierarchy_path,
+                    f.priority_flags,
+                    f.numeric_text,
                     f.clause_type,
                     f.actor_tags,
                     f.action_tags,
@@ -1046,6 +1117,18 @@ class ContractStore:
                 FROM contract_chunks
                 WHERE document_id = ?
                 ORDER BY ordinal_in_document
+                """,
+                (document_id,),
+            ).fetchall()
+
+    def fetch_document_blocks(self, document_id: str) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT *
+                FROM contract_blocks
+                WHERE document_id = ?
+                ORDER BY page_num, block_ordinal
                 """,
                 (document_id,),
             ).fetchall()
@@ -1088,6 +1171,9 @@ class ContractStore:
                 SELECT
                     c.*,
                     f.parent_heading,
+                    f.hierarchy_path,
+                    f.priority_flags,
+                    f.numeric_text,
                     f.clause_type,
                     f.actor_tags,
                     f.action_tags,
@@ -1297,6 +1383,11 @@ def _ensure_compat_columns(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE chunk_search_features ADD COLUMN normalized_text TEXT NOT NULL DEFAULT ''"
         )
+    for column in ("hierarchy_path", "priority_flags", "numeric_text"):
+        if column not in columns:
+            connection.execute(
+                f"ALTER TABLE chunk_search_features ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+            )
     connection.execute(
         """
         UPDATE chunk_search_features
@@ -1304,6 +1395,171 @@ def _ensure_compat_columns(connection: sqlite3.Connection) -> None:
         WHERE normalized_text = ''
         """
     )
+
+
+def _ensure_chunk_feature_fts_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = [
+        "section_number",
+        "heading",
+        "numeric_text",
+        "hierarchy_path",
+        "parent_heading",
+        "priority_flags",
+        "search_text",
+        "actor_tags",
+        "action_tags",
+        "topic_tags",
+        "chunk_id",
+        "document_id",
+    ]
+    expected_rescue_columns = [
+        "section_number",
+        "heading",
+        "numeric_text",
+        "hierarchy_path",
+        "parent_heading",
+        "priority_flags",
+        "rescue_text",
+        "actor_tags",
+        "action_tags",
+        "topic_tags",
+        "chunk_id",
+        "document_id",
+    ]
+    current_columns = [
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(chunk_search_fts)").fetchall()
+    ]
+    rescue_columns = [
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(chunk_search_rescue_fts)").fetchall()
+    ]
+    if current_columns == expected_columns and rescue_columns == expected_rescue_columns:
+        return
+    connection.executescript(
+        """
+        DROP TRIGGER IF EXISTS chunk_search_features_ai;
+        DROP TRIGGER IF EXISTS chunk_search_features_ad;
+        DROP TRIGGER IF EXISTS chunk_search_features_au;
+        DROP TABLE IF EXISTS chunk_search_fts;
+        DROP TABLE IF EXISTS chunk_search_rescue_fts;
+        """
+    )
+    connection.executescript(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunk_search_fts USING fts5(
+            section_number,
+            heading,
+            numeric_text,
+            hierarchy_path,
+            parent_heading,
+            priority_flags,
+            search_text,
+            actor_tags,
+            action_tags,
+            topic_tags,
+            chunk_id UNINDEXED,
+            document_id UNINDEXED,
+            content='chunk_search_features',
+            content_rowid='feature_rowid',
+            tokenize='porter unicode61 remove_diacritics 2'
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunk_search_rescue_fts USING fts5(
+            section_number,
+            heading,
+            numeric_text,
+            hierarchy_path,
+            parent_heading,
+            priority_flags,
+            rescue_text,
+            actor_tags,
+            action_tags,
+            topic_tags,
+            chunk_id UNINDEXED,
+            document_id UNINDEXED,
+            content='chunk_search_features',
+            content_rowid='feature_rowid',
+            tokenize='trigram'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS chunk_search_features_ai AFTER INSERT ON chunk_search_features BEGIN
+          INSERT INTO chunk_search_fts(
+            rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+            search_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
+          ) VALUES (
+            new.feature_rowid, new.section_number, new.heading, new.numeric_text, new.hierarchy_path, new.parent_heading,
+            new.priority_flags, new.search_text, new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
+          );
+
+          INSERT INTO chunk_search_rescue_fts(
+            rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+            rescue_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
+          ) VALUES (
+            new.feature_rowid, new.section_number, new.heading, new.numeric_text, new.hierarchy_path, new.parent_heading,
+            new.priority_flags, new.rescue_text, new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
+          );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS chunk_search_features_ad AFTER DELETE ON chunk_search_features BEGIN
+          INSERT INTO chunk_search_fts(
+            chunk_search_fts, rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+            search_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
+          ) VALUES (
+            'delete', old.feature_rowid, old.section_number, old.heading, old.numeric_text, old.hierarchy_path,
+            old.parent_heading, old.priority_flags, old.search_text, old.actor_tags, old.action_tags, old.topic_tags,
+            old.chunk_id, old.document_id
+          );
+
+          INSERT INTO chunk_search_rescue_fts(
+            chunk_search_rescue_fts, rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+            rescue_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
+          ) VALUES (
+            'delete', old.feature_rowid, old.section_number, old.heading, old.numeric_text, old.hierarchy_path,
+            old.parent_heading, old.priority_flags, old.rescue_text, old.actor_tags, old.action_tags, old.topic_tags,
+            old.chunk_id, old.document_id
+          );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS chunk_search_features_au AFTER UPDATE ON chunk_search_features BEGIN
+          INSERT INTO chunk_search_fts(
+            chunk_search_fts, rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+            search_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
+          ) VALUES (
+            'delete', old.feature_rowid, old.section_number, old.heading, old.numeric_text, old.hierarchy_path,
+            old.parent_heading, old.priority_flags, old.search_text, old.actor_tags, old.action_tags, old.topic_tags,
+            old.chunk_id, old.document_id
+          );
+
+          INSERT INTO chunk_search_rescue_fts(
+            chunk_search_rescue_fts, rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+            rescue_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
+          ) VALUES (
+            'delete', old.feature_rowid, old.section_number, old.heading, old.numeric_text, old.hierarchy_path,
+            old.parent_heading, old.priority_flags, old.rescue_text, old.actor_tags, old.action_tags, old.topic_tags,
+            old.chunk_id, old.document_id
+          );
+
+          INSERT INTO chunk_search_fts(
+            rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+            search_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
+          ) VALUES (
+            new.feature_rowid, new.section_number, new.heading, new.numeric_text, new.hierarchy_path, new.parent_heading,
+            new.priority_flags, new.search_text, new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
+          );
+
+          INSERT INTO chunk_search_rescue_fts(
+            rowid, section_number, heading, numeric_text, hierarchy_path, parent_heading, priority_flags,
+            rescue_text, actor_tags, action_tags, topic_tags, chunk_id, document_id
+          ) VALUES (
+            new.feature_rowid, new.section_number, new.heading, new.numeric_text, new.hierarchy_path, new.parent_heading,
+            new.priority_flags, new.rescue_text, new.actor_tags, new.action_tags, new.topic_tags, new.chunk_id, new.document_id
+          );
+        END;
+        """
+    )
+    connection.execute("INSERT INTO chunk_search_fts(chunk_search_fts) VALUES('rebuild')")
+    connection.execute("INSERT INTO chunk_search_rescue_fts(chunk_search_rescue_fts) VALUES('rebuild')")
 
 
 def _backfill_block_coverage(connection: sqlite3.Connection) -> None:

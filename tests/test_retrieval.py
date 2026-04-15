@@ -3,7 +3,7 @@ from epc_smart_search.ocr_support import ExtractedBlock, PageText
 from epc_smart_search.query_planner import build_like_fallback, plan_query
 from epc_smart_search.retrieval import HybridRetriever, SearchCoverageCase
 from epc_smart_search.search_features import build_chunk_features
-from epc_smart_search.storage import ContractStore, pack_vector
+from epc_smart_search.storage import ContractStore, build_block_records, pack_vector
 
 
 def test_direct_section_lookup_wins() -> None:
@@ -449,6 +449,89 @@ def test_exact_page_hits_can_fall_back_to_block_matches() -> None:
 
     assert hits
     assert hits[0].page_num == 205
+
+
+def test_numeric_query_prefers_table_backed_fuel_gas_value() -> None:
+    db_path = "file:retrieval_numeric_value?mode=memory&cache=shared"
+    store = ContractStore(db_path)
+    chunk = _chunk(
+        "fuel_summary",
+        "A",
+        "Appendix A Fuel Gas Summary",
+        "Appendix A contains the summary table for the fuel gas system.",
+        205,
+        chunk_type="exhibit",
+    )
+    page = PageText(
+        page_num=205,
+        text=chunk.full_text,
+        ocr_used=False,
+        blocks=(ExtractedBlock(1, "table_row", "Fuel Gas Summary  45 MMSCFD", 1, ("table_like",)),),
+    )
+    blocks = build_block_records("doc1", [page], [chunk])
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc",
+        page_count=1,
+        chunks=[chunk],
+        pages=[page],
+        features=build_chunk_features([chunk], blocks),
+        blocks=blocks,
+    )
+    retriever = HybridRetriever(store)
+
+    ranked = retriever.retrieve("45 MMSCFD")
+
+    assert ranked
+    assert ranked[0].chunk_id == "fuel_summary"
+    assert ranked[0].matched_block_count >= 1
+
+
+def test_numeric_query_finds_pressure_value_late_in_clause() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "fuel_pressure",
+                "5.23",
+                "Fuel Gas Supply",
+                (
+                    "The fuel gas system shall be designed for startup, commissioning, and performance testing. "
+                    "During those operations the required delivery pressure shall be maintained at 450 psi."
+                ),
+                270,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("450 psi")
+
+    assert ranked
+    assert ranked[0].chunk_id == "fuel_pressure"
+
+
+def test_numeric_phrase_query_finds_spelled_and_parenthetical_requirement() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "test_results",
+                "7.5.3",
+                "Air Permit Test Result",
+                (
+                    "Within twenty-four (24) hours after completion of a test, Contractor shall deliver the results "
+                    "with supporting calculations."
+                ),
+                83,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("twenty-four (24) hours")
+
+    assert ranked
+    assert ranked[0].chunk_id == "test_results"
 
 
 def test_evaluate_coverage_cases_reports_stage_and_match_status() -> None:

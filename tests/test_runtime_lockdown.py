@@ -19,8 +19,9 @@ from epc_smart_search.assistant import validate_contract_store
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.config import GREETING
 from epc_smart_search.ocr_support import PageText
+from epc_smart_search.priority_config import PriorityConfig, PrioritySectionRule
 from epc_smart_search.search_features import build_chunk_features
-from epc_smart_search.storage import ContractStore, pack_vector
+from epc_smart_search.storage import ContractStore, build_block_records, pack_vector
 from epc_smart_search.ui.avatar_window import AvatarWindow
 from epc_smart_search.ui.chat_dialog import CONTRACT_DATA_UNAVAILABLE_MESSAGE
 from epc_smart_search.ui.chat_dialog import CONTRACT_DATA_UNAVAILABLE_STATUS
@@ -304,7 +305,7 @@ def test_rebuild_cli_creates_and_validates_a_fresh_database(monkeypatch) -> None
     pdf_path.write_bytes(b"%PDF-1.4\n")
     memory_store = _seed_store(_memory_db_uri("cli"))
 
-    def fake_build_index(*, pdf_path, db_path, version_label="v1", progress_callback=None):
+    def fake_build_index(*, pdf_path, db_path, version_label="v1", priority_config=None, progress_callback=None):
         Path(db_path).write_bytes(b"stub")
         return {"document_id": "doc1", "page_count": 1, "chunk_count": 1}
 
@@ -359,6 +360,72 @@ def test_build_coverage_report_includes_optional_semantic_status(tmp_path: Path)
     assert report["semantic"]["semantic_runtime_available"] is False
     assert report["semantic"]["semantic_ready"] is False
     assert report["semantic"]["semantic_model_name"] == "test-semantic"
+
+
+def test_build_coverage_report_surfaces_numeric_and_priority_coverage(tmp_path: Path) -> None:
+    db_path = tmp_path / "priority_numeric_report.db"
+    store = ContractStore(db_path)
+    chunk = ChunkRecord(
+        chunk_id="chunk1",
+        document_id="doc1",
+        chunk_type="section",
+        section_number="5.23",
+        heading="Fuel Gas System",
+        full_text="The guaranteed delivery pressure shall be maintained at 450 psi.",
+        page_start=14,
+        page_end=14,
+        parent_chunk_id=None,
+        ordinal_in_document=1,
+    )
+    page = PageText(page_num=14, text=chunk.full_text, ocr_used=False)
+    blocks = build_block_records("doc1", [page], [chunk])
+    priority_config = PriorityConfig(
+        priority_sections=(
+            PrioritySectionRule(
+                label="Fuel Gas System",
+                section_numbers=("5.23",),
+                heading_terms=("fuel gas",),
+                focus_terms=("psi", "pressure"),
+            ),
+        )
+    )
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc123",
+        page_count=1,
+        chunks=[chunk],
+        pages=[page],
+        features=build_chunk_features([chunk], blocks, priority_config=priority_config),
+        blocks=blocks,
+    )
+
+    report = rebuild_contract_module.build_coverage_report(db_path, priority_config=priority_config)
+
+    assert report["numeric_coverage"]["chunks_with_numeric_evidence"] == 1
+    assert report["priority_coverage"]["matched_sections"] == ["Fuel Gas System"]
+    assert report["priority_coverage"]["missing_sections"] == []
+
+
+def test_build_coverage_report_flags_missing_priority_sections(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing_priority_report.db"
+    _seed_store(db_path)
+    priority_config = PriorityConfig(
+        priority_sections=(
+            PrioritySectionRule(
+                label="Fuel Gas System",
+                section_numbers=("5.23",),
+                heading_terms=("fuel gas",),
+                focus_terms=("mmscfd",),
+            ),
+        )
+    )
+
+    report = rebuild_contract_module.build_coverage_report(db_path, priority_config=priority_config)
+
+    assert report["priority_coverage"]["missing_sections"] == ["Fuel Gas System"]
 
 
 def _seed_store(db_path: str | Path, *, with_features: bool = True) -> ContractStore:

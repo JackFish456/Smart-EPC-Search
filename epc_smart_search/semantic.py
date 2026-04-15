@@ -17,6 +17,7 @@ from epc_smart_search.search_features import (
     DOMAIN_ALIASES,
     QUERY_EXPANSIONS,
     TOPIC_LEXICON,
+    is_numericish_token,
     normalize_text,
     tokenize,
 )
@@ -65,31 +66,67 @@ def load_semantic_model_config(explicit_path: str | Path | None = None) -> Seman
     )
 
 
+def _compose_semantic_text(
+    *,
+    identifier: str = "",
+    phrase: str = "",
+    context: str = "",
+    hierarchy: str = "",
+    priority: str = "",
+    numeric: str = "",
+    actor: str = "",
+    action: str = "",
+    topic: str = "",
+    body: str = "",
+) -> str:
+    parts = [
+        identifier,
+        phrase,
+        context,
+        hierarchy,
+        priority,
+        numeric,
+        actor,
+        action,
+        topic,
+        body,
+    ]
+    return " ".join(part for part in parts if part)
+
+
 def build_chunk_semantic_text(chunk, feature, *, max_body_tokens: int = 96) -> str:
     normalized_body = normalize_text(chunk.full_text)
     body_tokens = tokenize(normalized_body)[:max_body_tokens]
-    parts = [
-        chunk.section_number or "",
-        normalize_text(chunk.heading),
-        normalize_text(feature.parent_heading),
-        normalize_text(feature.actor_tags),
-        normalize_text(feature.action_tags),
-        normalize_text(feature.topic_tags),
-        " ".join(body_tokens),
-    ]
-    return " ".join(part for part in parts if part)
+    return _compose_semantic_text(
+        identifier=chunk.section_number or "",
+        phrase=normalize_text(chunk.heading),
+        context=normalize_text(feature.parent_heading),
+        hierarchy=normalize_text(feature.hierarchy_path),
+        priority=normalize_text(feature.priority_flags),
+        numeric=normalize_text(feature.numeric_text),
+        actor=normalize_text(feature.actor_tags),
+        action=normalize_text(feature.action_tags),
+        topic=normalize_text(feature.topic_tags),
+        body=" ".join(body_tokens),
+    )
 
 
 def build_query_semantic_text(query: str, plan: QueryPlan) -> str:
-    parts = [
-        plan.content_query or normalize_text(query),
-        " ".join(plan.focus_terms),
-        " ".join(plan.actor_terms),
-        " ".join(plan.action_terms),
-        " ".join(plan.topic_terms),
-        " ".join(plan.expansion_terms),
-    ]
-    return " ".join(part for part in parts if part)
+    normalized_query = normalize_text(query)
+    numeric_terms = " ".join(
+        term for term in (*plan.focus_terms, *plan.expansion_terms) if term and is_numericish_token(term)
+    )
+    return _compose_semantic_text(
+        identifier=plan.section_number or "",
+        phrase=plan.content_query or normalized_query,
+        context=" ".join(plan.focus_terms),
+        hierarchy=" ".join(plan.expansion_terms),
+        numeric=numeric_terms,
+        actor=" ".join(plan.actor_terms),
+        action=" ".join(plan.action_terms),
+        topic=" ".join(plan.topic_terms),
+        body=normalized_query,
+    )
 
 
 class LocalEmbedder:

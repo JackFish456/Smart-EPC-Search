@@ -63,6 +63,12 @@ GOLDEN_CASES = (
         "expected_top3": "appendix_a",
     },
     {
+        "label": "numeric_fuel_gas_value",
+        "query": "45 MMSCFD",
+        "query_class": "numeric_lookup",
+        "expected_top3": "appendix_a",
+    },
+    {
         "label": "typo_permitting",
         "query": "permiting",
         "query_class": "typo_fuzzy",
@@ -222,7 +228,7 @@ def _seed_retriever() -> HybridRetriever:
             "appendix_a",
             "A",
             "Appendix A Fuel Gas Summary",
-            "Appendix A provides the fuel gas system summary and interface data for the project.",
+            "Appendix A provides the fuel gas system summary and interface data for the project. The summary flow is 45 MMSCFD.",
             205,
             chunk_type="exhibit",
         ),

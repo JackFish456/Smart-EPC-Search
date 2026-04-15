@@ -2,12 +2,58 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from epc_smart_search.chunking import ChunkRecord
+from epc_smart_search.priority_config import PriorityConfig, PrioritySectionRule
+
+if TYPE_CHECKING:
+    from epc_smart_search.storage import ContractBlockRecord
 
 WORD_RE = re.compile(r"[a-z0-9][a-z0-9/&\-]{1,}")
 SPACE_RE = re.compile(r"\s+")
 DATE_LIKE_RE = re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{2}$")
+NUMERIC_WINDOW_RE = re.compile(
+    r"(?i)(?:[a-z]+(?:-[a-z]+){0,2}\s*\(\d+(?:[.,]\d+)?\)|\d+(?:[.,]\d+)?(?:\s*x\s*\d+(?:[.,]\d+)?)?\s*(?:%|[a-z]{1,8}/[a-z]{1,8}|[a-z]{1,8})?)"
+)
+NUMERIC_QUERY_HINTS = {
+    "%",
+    "amp",
+    "amps",
+    "bar",
+    "barg",
+    "bpd",
+    "days",
+    "degf",
+    "f",
+    "ft",
+    "gpm",
+    "hp",
+    "hours",
+    "hr",
+    "hz",
+    "in",
+    "kg",
+    "km",
+    "kpa",
+    "kv",
+    "kw",
+    "lb",
+    "mmscfd",
+    "mmbtu",
+    "mph",
+    "mw",
+    "mva",
+    "psi",
+    "psig",
+    "rpm",
+    "scfm",
+    "tons",
+    "tpd",
+    "vac",
+    "vdc",
+    "v",
+}
 
 ACTOR_LEXICON: dict[str, tuple[str, ...]] = {
     "owner": ("owner", "company", "purchaser", "buyer", "nrg"),
@@ -67,6 +113,9 @@ class ChunkFeatures:
     section_number: str | None
     heading: str
     parent_heading: str
+    hierarchy_path: str
+    priority_flags: str
+    numeric_text: str
     search_text: str
     rescue_text: str
     clause_type: str
@@ -83,6 +132,22 @@ def normalize_text(text: str) -> str:
 
 def tokenize(text: str) -> list[str]:
     return WORD_RE.findall(normalize_text(text))
+
+
+def is_numericish_token(token: str) -> bool:
+    normalized = normalize_text(token)
+    if not normalized:
+        return False
+    return any(ch.isdigit() for ch in normalized) or normalized in NUMERIC_QUERY_HINTS
+
+
+def query_looks_numeric(query: str) -> bool:
+    normalized = normalize_text(query)
+    if any(ch.isdigit() for ch in normalized):
+        return True
+    if any(term in normalized.split() for term in NUMERIC_QUERY_HINTS):
+        return True
+    return normalized.startswith(("how much", "how many", "what is the value", "what value", "what pressure", "what flow"))
 
 
 def expand_query_phrases(query: str) -> list[str]:
@@ -107,8 +172,22 @@ def alias_terms_for_text(text: str) -> list[str]:
     return _dedupe_preserve_order(aliases)
 
 
-def build_chunk_features(chunks: list[ChunkRecord]) -> list[ChunkFeatures]:
+def build_chunk_features(
+    chunks: list[ChunkRecord],
+    blocks: list[ContractBlockRecord] | None = None,
+    *,
+    priority_config: PriorityConfig | None = None,
+) -> list[ChunkFeatures]:
     chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+    hierarchy_by_id = {
+        chunk.chunk_id: _build_hierarchy_path(chunk, chunk_by_id)
+        for chunk in chunks
+    }
+    blocks_by_parent: dict[str, list[ContractBlockRecord]] = {}
+    for block in blocks or []:
+        if block.parent_chunk_id:
+            blocks_by_parent.setdefault(block.parent_chunk_id, []).append(block)
+
     features: list[ChunkFeatures] = []
     for chunk in chunks:
         parent_heading = ""
@@ -117,34 +196,45 @@ def build_chunk_features(chunks: list[ChunkRecord]) -> list[ChunkFeatures]:
             parent_heading = parent.heading
         normalized_heading = normalize_text(chunk.heading)
         normalized_parent = normalize_text(parent_heading)
+        hierarchy_path = hierarchy_by_id.get(chunk.chunk_id, "")
+        hierarchy_tokens = normalize_text(hierarchy_path)
         normalized_body = normalize_text(chunk.full_text)
-        combined = " ".join(part for part in [chunk.section_number or "", normalized_heading, normalized_parent, normalized_body] if part)
-        actor_tags = _detect_tags(combined, ACTOR_LEXICON)
-        action_tags = _detect_tags(combined, ACTION_LEXICON)
-        topic_tags = _detect_tags(combined, TOPIC_LEXICON)
-        alias_terms = alias_terms_for_text(combined)
+        actor_tags = _detect_tags(" ".join([normalized_heading, normalized_parent, normalized_body, hierarchy_tokens]), ACTOR_LEXICON)
+        action_tags = _detect_tags(" ".join([normalized_heading, normalized_parent, normalized_body, hierarchy_tokens]), ACTION_LEXICON)
+        topic_tags = _detect_tags(" ".join([normalized_heading, normalized_parent, normalized_body, hierarchy_tokens]), TOPIC_LEXICON)
+        alias_terms = alias_terms_for_text(" ".join([normalized_heading, normalized_parent, normalized_body, hierarchy_tokens]))
         noise_flags = _noise_flags(chunk, normalized_heading, normalized_body)
+        bulk_body = _searchable_body(chunk, normalized_body, noise_flags)
+        priority_flags = _priority_flags(chunk, hierarchy_path, bulk_body or normalized_body, priority_config)
+        numeric_windows = _collect_numeric_windows(chunk, blocks_by_parent.get(chunk.chunk_id, []))
+        numeric_text = " ".join(_dedupe_preserve_order([normalize_text(window) for window in numeric_windows if window]))
         rescue_text = _build_rescue_text(
-            chunk.section_number or "",
-            normalized_heading,
+            chunk,
+            hierarchy_tokens,
             normalized_parent,
-            normalized_body,
+            priority_flags,
+            numeric_text,
+            numeric_windows,
             actor_tags,
             action_tags,
             topic_tags,
             alias_terms,
+            bulk_body,
         )
         search_terms = _dedupe_preserve_order(
             [
+                chunk.chunk_type,
                 chunk.section_number or "",
+                hierarchy_tokens,
                 normalized_heading,
                 normalized_parent,
-                normalized_body,
+                priority_flags,
+                numeric_text,
                 actor_tags,
                 action_tags,
                 topic_tags,
                 " ".join(alias_terms),
-                chunk.chunk_type,
+                bulk_body,
             ]
         )
         features.append(
@@ -154,6 +244,9 @@ def build_chunk_features(chunks: list[ChunkRecord]) -> list[ChunkFeatures]:
                 section_number=chunk.section_number,
                 heading=chunk.heading,
                 parent_heading=parent_heading,
+                hierarchy_path=hierarchy_path,
+                priority_flags=priority_flags,
+                numeric_text=numeric_text,
                 search_text=" ".join(term for term in search_terms if term),
                 rescue_text=rescue_text,
                 clause_type=chunk.chunk_type,
@@ -188,28 +281,123 @@ def _noise_flags(chunk: ChunkRecord, normalized_heading: str, normalized_body: s
     return flags
 
 
+def _searchable_body(chunk: ChunkRecord, normalized_body: str, noise_flags: list[str]) -> str:
+    if "toc" in noise_flags:
+        return ""
+    if "date_heading" in noise_flags:
+        return ""
+    if "front_matter" in noise_flags and chunk.section_number is None:
+        return ""
+    return normalized_body
+
+
+def _build_hierarchy_path(chunk: ChunkRecord, chunk_by_id: dict[str, ChunkRecord]) -> str:
+    labels: list[str] = []
+    current: ChunkRecord | None = chunk
+    seen: set[str] = set()
+    while current is not None and current.chunk_id not in seen:
+        seen.add(current.chunk_id)
+        label_parts = [current.chunk_type]
+        if current.section_number:
+            label_parts.append(current.section_number)
+        if current.heading:
+            label_parts.append(current.heading)
+        labels.append(" ".join(part for part in label_parts if part))
+        current = chunk_by_id.get(current.parent_chunk_id or "")
+    labels.reverse()
+    return " > ".join(labels)
+
+
+def _priority_flags(
+    chunk: ChunkRecord,
+    hierarchy_path: str,
+    body_text: str,
+    priority_config: PriorityConfig | None,
+) -> str:
+    if priority_config is None:
+        return ""
+    matched: list[str] = []
+    searchable = " ".join(
+        normalize_text(part)
+        for part in (chunk.heading, hierarchy_path, body_text, chunk.section_number or "")
+        if part
+    )
+    wrapped = f" {searchable} "
+    for rule in priority_config.priority_sections:
+        if _rule_matches_chunk(rule, chunk, wrapped):
+            matched.append(normalize_text(rule.label))
+    return " ".join(_dedupe_preserve_order(matched))
+
+
+def _rule_matches_chunk(rule: PrioritySectionRule, chunk: ChunkRecord, wrapped_text: str) -> bool:
+    if chunk.section_number and chunk.section_number in rule.section_numbers:
+        return True
+    for term in rule.heading_terms + rule.focus_terms:
+        normalized_term = normalize_text(term)
+        if normalized_term and f" {normalized_term} " in wrapped_text:
+            return True
+    return False
+
+
+def _collect_numeric_windows(chunk: ChunkRecord, blocks: list[ContractBlockRecord]) -> list[str]:
+    numeric_windows: list[str] = []
+    numeric_windows.extend(_numeric_windows(chunk.full_text))
+    for block in blocks:
+        if block.block_type not in {"table_row", "list_item", "paragraph"}:
+            continue
+        numeric_windows.extend(_numeric_windows(block.block_text))
+    return _dedupe_preserve_order(numeric_windows)
+
+
+def _numeric_windows(text: str, *, window_radius: int = 44) -> list[str]:
+    windows: list[str] = []
+    if not text:
+        return windows
+    compact = " ".join(text.split())
+    for match in NUMERIC_WINDOW_RE.finditer(compact):
+        token = match.group(0).strip()
+        normalized_token = normalize_text(token)
+        if not normalized_token or not any(ch.isdigit() for ch in normalized_token):
+            continue
+        left = max(0, match.start() - window_radius)
+        right = min(len(compact), match.end() + window_radius)
+        window = compact[left:right].strip(" ,;")
+        windows.append(window)
+    return _dedupe_preserve_order(windows)
+
+
 def _build_rescue_text(
-    section_number: str,
-    normalized_heading: str,
+    chunk: ChunkRecord,
+    hierarchy_path: str,
     normalized_parent: str,
-    normalized_body: str,
+    priority_flags: str,
+    numeric_text: str,
+    numeric_windows: list[str],
     actor_tags: str,
     action_tags: str,
     topic_tags: str,
     alias_terms: list[str],
+    bulk_body: str,
 ) -> str:
-    body_tokens = tokenize(normalized_body)[:36]
+    first_numeric = normalize_text(numeric_windows[0]) if numeric_windows else ""
+    last_numeric = normalize_text(numeric_windows[-1]) if numeric_windows else ""
+    body_tokens = tokenize(bulk_body)
+    tail_tokens = " ".join(body_tokens[-18:]) if len(body_tokens) > 18 else " ".join(body_tokens)
     parts = [
-        section_number,
-        normalized_heading,
+        chunk.section_number or "",
+        normalize_text(chunk.heading),
+        hierarchy_path,
         normalized_parent,
-        " ".join(body_tokens),
+        priority_flags,
+        first_numeric,
+        last_numeric,
         actor_tags,
         action_tags,
         topic_tags,
         " ".join(alias_terms),
+        tail_tokens,
     ]
-    return " ".join(part for part in parts if part)
+    return " ".join(part for part in _dedupe_preserve_order(parts) if part)
 
 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -219,8 +407,9 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
         cleaned = SPACE_RE.sub(" ", str(item)).strip()
         if not cleaned:
             continue
-        if cleaned in seen:
+        lowered = cleaned.casefold()
+        if lowered in seen:
             continue
-        seen.add(cleaned)
+        seen.add(lowered)
         out.append(cleaned)
     return out

@@ -9,6 +9,7 @@ from epc_smart_search.search_features import (
     TOPIC_LEXICON,
     alias_terms_for_text,
     expand_query_phrases,
+    is_numericish_token,
     normalize_text,
 )
 
@@ -199,7 +200,9 @@ def _focus_terms(content_query: str) -> tuple[str, ...]:
     tokens = [
         token
         for token in TOKEN_RE.findall(content_query)
-        if len(token) > 2 and normalize_text(token) not in STOPWORDS and normalize_text(token) not in ACTOR_LEXICON
+        if (len(token) > 2 or is_numericish_token(token))
+        and normalize_text(token) not in STOPWORDS
+        and normalize_text(token) not in ACTOR_LEXICON
     ]
     return _dedupe(tuple(tokens))
 

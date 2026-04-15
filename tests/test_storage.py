@@ -2,7 +2,7 @@ from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.indexer import refresh_query_index
 from epc_smart_search.ocr_support import ExtractedBlock, PageText
 from epc_smart_search.search_features import build_chunk_features
-from epc_smart_search.storage import ContractStore, pack_vector
+from epc_smart_search.storage import ContractStore, build_block_records, pack_vector
 
 
 def test_fts_triggers_stay_in_sync() -> None:
@@ -202,3 +202,60 @@ def test_refresh_query_index_rebuilds_semantic_vectors(monkeypatch) -> None:
     assert refreshed == 1
     assert store.get_embedding_count("doc1") == 1
     assert store.get_embedding_metadata("doc1") == ("test-semantic", 3)
+
+
+def test_numeric_text_captures_late_body_values_and_table_rows() -> None:
+    db_path = "file:storage_numeric_features?mode=memory&cache=shared"
+    store = ContractStore(db_path)
+    chunk = ChunkRecord(
+        chunk_id="chunk1",
+        document_id="doc1",
+        chunk_type="section",
+        section_number="5.23",
+        heading="Fuel Gas System",
+        full_text=(
+            "The fuel gas system design basis is summarized in Appendix A. "
+            "During performance testing the required delivery pressure shall be maintained. "
+            "The guaranteed delivery pressure is 450 psi."
+        ),
+        page_start=14,
+        page_end=14,
+        parent_chunk_id=None,
+        ordinal_in_document=1,
+    )
+    page = PageText(
+        page_num=14,
+        text=chunk.full_text,
+        ocr_used=False,
+        blocks=(
+            ExtractedBlock(1, "heading", "Fuel Gas System", 1),
+            ExtractedBlock(2, "table_row", "Fuel Gas Summary  45 MMSCFD", 1, ("table_like",)),
+        ),
+    )
+    blocks = build_block_records("doc1", [page], [chunk])
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc",
+        page_count=1,
+        chunks=[chunk],
+        pages=[page],
+        features=build_chunk_features([chunk], blocks),
+        blocks=blocks,
+    )
+
+    with store._connect() as connection:  # noqa: SLF001
+        row = connection.execute(
+            """
+            SELECT hierarchy_path, numeric_text
+            FROM chunk_search_features
+            WHERE chunk_id = 'chunk1'
+            """
+        ).fetchone()
+
+    assert row is not None
+    assert "section 5.23 fuel gas system" in str(row["hierarchy_path"]).lower()
+    assert "450 psi" in str(row["numeric_text"]).lower()
+    assert "45 mmscfd" in str(row["numeric_text"]).lower()

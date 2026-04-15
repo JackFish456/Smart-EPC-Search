@@ -6,9 +6,11 @@ from typing import Callable
 
 from epc_smart_search.chunking import ChunkRecord, build_document_id, parse_chunks
 from epc_smart_search.ocr_support import extract_pages
+from epc_smart_search.priority_config import PriorityConfig
 from epc_smart_search.semantic import LocalEmbedder, build_chunk_semantic_text
 from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import (
+    ContractBlockRecord,
     ContractStore,
     build_block_records,
     build_diagnostic_records,
@@ -29,6 +31,7 @@ def build_index(
     pdf_path: str | Path,
     db_path: str | Path,
     version_label: str = "v1",
+    priority_config: PriorityConfig | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, int | str]:
     path = Path(pdf_path)
@@ -40,8 +43,8 @@ def build_index(
     if progress_callback:
         progress_callback("Parsing contract structure...")
     chunks = parse_chunks(pages, document_id)
-    features = build_chunk_features(chunks)
     blocks = build_block_records(document_id, pages, chunks)
+    features = build_chunk_features(chunks, blocks, priority_config=priority_config)
     diagnostics = build_diagnostic_records(document_id, pages)
     embeddings, model_name, dimension = build_chunk_embeddings(chunks, features)
 
@@ -100,6 +103,7 @@ def refresh_query_index(
     store: ContractStore,
     document_id: str,
     *,
+    priority_config: PriorityConfig | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> int:
     if progress_callback:
@@ -120,7 +124,23 @@ def refresh_query_index(
         )
         for row in rows
     ]
-    features = build_chunk_features(chunks)
+    block_rows = store.fetch_document_blocks(document_id)
+    blocks = [
+        ContractBlockRecord(
+            block_id=str(row["block_id"]),
+            document_id=str(row["document_id"]),
+            page_num=int(row["page_num"]),
+            block_ordinal=int(row["block_ordinal"]),
+            block_type=str(row["block_type"]),
+            block_text=str(row["block_text"]),
+            normalized_text=str(row["normalized_text"]),
+            alias_text=str(row["alias_text"]),
+            parent_chunk_id=str(row["parent_chunk_id"]) if row["parent_chunk_id"] else None,
+            noise_flags=str(row["noise_flags"] or ""),
+        )
+        for row in block_rows
+    ]
+    features = build_chunk_features(chunks, blocks, priority_config=priority_config)
     store.replace_search_features(document_id, features)
     if progress_callback:
         progress_callback("Refreshing semantic vectors...")
