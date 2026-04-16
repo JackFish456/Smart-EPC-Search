@@ -1,22 +1,30 @@
 from __future__ import annotations
 
 import argparse
+import os
 from flask import Flask, jsonify, request
 
+from epc_smart_search.app_paths import AI_DISABLE_ENV_VAR, MODEL_DIR_OVERRIDE_ENV_VAR
 from epc_smart_search.config import STRICT_SYSTEM_PROMPT
 from gemma_runtime import GemmaChatRuntime
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    runtime = GemmaChatRuntime(max_new_tokens=280, temperature=0.1, top_p=0.85, enable_thinking=False)
-    state: dict[str, object] = {"runtime": runtime, "ready": False, "error": None}
+    if os.environ.get(AI_DISABLE_ENV_VAR, "").strip().lower() in {"1", "true", "yes", "on"}:
+        runtime = None
+        state: dict[str, object] = {"runtime": None, "ready": False, "error": "AI mode is disabled for this app instance."}
+    else:
+        model_override = os.environ.get(MODEL_DIR_OVERRIDE_ENV_VAR, "").strip() or None
+        runtime = GemmaChatRuntime(model_path=model_override, max_new_tokens=280, temperature=0.1, top_p=0.85, enable_thinking=False)
+        state = {"runtime": runtime, "ready": False, "error": None}
 
-    try:
-        runtime.load()
-        state["ready"] = True
-    except Exception as exc:  # pragma: no cover - startup path
-        state["error"] = str(exc)
+    if runtime is not None:
+        try:
+            runtime.load()
+            state["ready"] = True
+        except Exception as exc:  # pragma: no cover - startup path
+            state["error"] = str(exc)
 
     @app.get("/health")
     def health():
@@ -113,7 +121,10 @@ def create_app() -> Flask:
                 "Answer using only the excerpts. If the excerpts do not fully support the answer, "
                 "respond exactly with: I can't verify that from the contract."
             )
-        result = runtime.generate(
+        active_runtime = state["runtime"]
+        if active_runtime is None:
+            return jsonify({"error": state["error"] or "Gemma runtime is unavailable."}), 503
+        result = active_runtime.generate(
             user_text=prompt,
             system_prompt=system_prompt,
             enable_thinking=enable_thinking,

@@ -38,6 +38,7 @@ DEFAULT_TEMPERATURE_PRESET = "balanced"
 DEFAULT_PERSONALITY_PRESET = "default"
 DEFAULT_CONFIDENCE_PRESET = "medium"
 DEFAULT_PREFER_TEXT_ONLY = True
+MODEL_DIR_OVERRIDE_ENV_VAR = "EPC_SMART_SEARCH_MODEL_DIR"
 CONFIDENCE_RESPONSE_HEADER_MARKER = "[[END_HEADER]]"
 CONFIDENCE_REFUSAL_MESSAGE = (
     "I can't answer that within the selected confidence setting. "
@@ -261,6 +262,10 @@ def resolve_model_spec(
 ) -> ResolvedModelSpec:
     if model_path is not None:
         return _resolve_model_candidate(Path(model_path).expanduser())
+
+    explicit_override = os.environ.get(MODEL_DIR_OVERRIDE_ENV_VAR, "").strip()
+    if explicit_override:
+        return _resolve_model_candidate(Path(explicit_override).expanduser())
 
     explicit_text_only = os.environ.get("GEMMA_TEXT_ONLY_MODEL_PATH", "").strip()
     if explicit_text_only:

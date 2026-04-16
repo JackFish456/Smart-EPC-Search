@@ -60,6 +60,53 @@ def test_get_app_data_root_skips_unwritable_localappdata(monkeypatch) -> None:
     assert chosen == temp_root / "EPC Smart Search"
 
 
+def test_resolve_gemma_launch_spec_respects_ai_disable(monkeypatch) -> None:
+    monkeypatch.setenv(app_paths.AI_DISABLE_ENV_VAR, "1")
+
+    resolved = app_paths.resolve_gemma_launch_spec()
+
+    assert resolved.available is False
+    assert resolved.mode == "disabled"
+    assert "disabled" in (resolved.reason or "").lower()
+
+
+def test_resolve_gemma_launch_spec_prefers_bundled_service_for_frozen_build(monkeypatch) -> None:
+    base = _test_dir("frozen_ai")
+    service_path = base / "ai_runtime" / "gemma_service.exe"
+    model_dir = base / "models" / "gemma"
+    service_path.parent.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    service_path.write_text("", encoding="utf-8")
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.delenv(app_paths.AI_DISABLE_ENV_VAR, raising=False)
+    monkeypatch.setattr(app_paths, "is_frozen_app", lambda: True)
+    monkeypatch.setattr(app_paths, "BUNDLED_GEMMA_SERVICE_PATH", service_path)
+    monkeypatch.setattr(app_paths, "BUNDLED_MODEL_DIR", model_dir)
+
+    resolved = app_paths.resolve_gemma_launch_spec()
+
+    assert resolved.available is True
+    assert resolved.mode == "bundled_service"
+    assert resolved.service_path == service_path
+    assert resolved.model_dir == model_dir
+
+
+def test_resolve_gemma_launch_spec_rejects_missing_model_override(monkeypatch) -> None:
+    fake_python = _test_dir("gemma_helper") / "python.exe"
+    fake_python.write_text("", encoding="utf-8")
+
+    monkeypatch.delenv(app_paths.AI_DISABLE_ENV_VAR, raising=False)
+    monkeypatch.setenv(app_paths.MODEL_DIR_OVERRIDE_ENV_VAR, str(fake_python.parent / "missing-model"))
+    monkeypatch.setattr(app_paths, "resolve_gemma_test_python", lambda: fake_python)
+
+    resolved = app_paths.resolve_gemma_launch_spec()
+
+    assert resolved.available is False
+    assert resolved.mode == "external_python"
+    assert "not found" in (resolved.reason or "").lower()
+
+
 def _test_dir(label: str) -> Path:
     base = Path(tempfile.gettempdir()) / "epc_smart_search_tests" / f"app_paths_{label}_{uuid.uuid4().hex[:8]}"
     if base.exists():

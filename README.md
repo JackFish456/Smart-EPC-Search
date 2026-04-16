@@ -7,7 +7,7 @@ Windows-first local EPC contract assistant built around:
 - Query planning and enriched chunk features for context-aware search
 - Local semantic-style reranking with stored hashing embeddings
 - A Kiewey desktop chat surface (PySide6)
-- Local Gemma generation through the **Gemma Test** environment
+- Optional local Gemma generation with graceful fallback to citation mode
 - Preflight checks that warn when contract-bearing artifacts are left under the workspace
 
 ## Sensitive files and Git
@@ -45,16 +45,18 @@ Optional environment variables:
 - `GEMMA_TEXT_ONLY_MODEL_PATH` — explicit text-only checkpoint path
 - `GEMMA_MODEL_PATH` — explicit multimodal checkpoint path
 - `GEMMA_PREFER_TEXT_ONLY=0` — force multimodal checkpoint
+- `EPC_SMART_SEARCH_MODEL_DIR` — explicit bundled AI model directory override
+- `EPC_SMART_SEARCH_DISABLE_AI=1` — force Lite behavior for troubleshooting
 
 ## Run
 
-1. Ensure the desktop **Gemma Test** project has its `.venv` and model files.
-2. Install the local app/runtime dependencies:
+1. Install the local app/runtime dependencies:
 
 ```powershell
 py -3.12 -m pip install -r requirements-dev.txt
 ```
 
+2. If you want local AI during development, make a Gemma runtime available either through the external **Gemma Test** environment or a direct `EPC_SMART_SEARCH_MODEL_DIR` override.
 3. If you need a seeded contract DB for local runs, keep the source artifact outside the workspace and only copy it into the packaged app flow when needed.
 4. From this folder:
 
@@ -62,7 +64,7 @@ py -3.12 -m pip install -r requirements-dev.txt
 .\launch_epc_smart_search.ps1
 ```
 
-The launcher now runs a preflight check before starting the UI. The app seeds the bundled prebuilt database into the local app data directory on first run. If the bundled contract data is missing or invalid, the UI fails closed and asks the user to contact support.
+The launcher now runs a preflight check before starting the UI. The app seeds the bundled prebuilt database into the local app data directory on first run. If the bundled contract data is missing or invalid, the UI fails closed and asks the user to contact support. If AI is unavailable, the app still launches in citation mode and disables generation-only controls.
 
 ## Rebuild contract data
 
@@ -81,7 +83,13 @@ The rebuild utility:
 Release flow (contract-bearing `.db` files are never committed to the public repo):
 
 1. Rebuild to a fresh `.db` path outside the workspace.
-2. Repackage the EXE with `.\package_epc_smart_search.ps1 -PrebuiltDbPath C:\secure\builds\contract_store.prebuilt.new.db`.
+2. Repackage the customer bundles with either:
+
+```powershell
+.\package_epc_smart_search.ps1 -Profile Lite -PrebuiltDbPath C:\secure\builds\contract_store.prebuilt.new.db
+.\package_epc_smart_search.ps1 -Profile AI -PrebuiltDbPath C:\secure\builds\contract_store.prebuilt.new.db -ModelDir C:\secure\models\gemma-4-e2b-it-text-only\1
+```
+
 3. The packager stages that external DB into the installer payload without requiring a contract-bearing `.db` to live in the repo workspace.
 
 ## Develop and test
@@ -93,27 +101,23 @@ python -m ruff check .
 
 ## Package
 
-For a Windows bundle (requires the dev requirements and an external prebuilt DB path):
+For Windows portable bundles:
 
 ```powershell
-.\package_epc_smart_search.ps1 -PrebuiltDbPath C:\secure\builds\contract_store.prebuilt.new.db
+.\package_epc_smart_search.ps1 -Profile Lite -PrebuiltDbPath C:\secure\builds\contract_store.prebuilt.new.db
+.\package_epc_smart_search.ps1 -Profile AI -PrebuiltDbPath C:\secure\builds\contract_store.prebuilt.new.db -ModelDir C:\secure\models\gemma-4-e2b-it-text-only\1
 ```
 
 The target customer packaging direction for Lite and AI portable bundles is documented in `PACKAGING_PLAN.md`.
 
 ## Release profiles
 
-The current packaging flow supports one Windows app bundle plus two **Gemma runtime/model profiles**:
+The current packaging flow supports two portable `--onedir` zip profiles:
 
-- **GPU-capable profile** — ship the packaged app with the CUDA-enabled **Gemma Test** environment, a preferred **text-only** checkpoint, and the CUDA PyTorch + `bitsandbytes` stack so Gemma can run in 4-bit NF4 on a dedicated GPU.
-- **CPU / no dedicated GPU profile** — ship the same packaged app with a **text-only** checkpoint and a CPU-compatible Gemma environment. This works without a dedicated GPU, but responses will be slower.
+- **Lite** — packaged app, assets, and bundled contract DB only. Retrieval and extractive answers always work. No local AI runtime is bundled.
+- **AI** — Lite contents plus a bundled Gemma helper executable and bundled text-only model assets. If AI cannot start on the machine, the app degrades to Lite behavior automatically.
 
-Recommended internal release naming:
-
-- `EPC Smart Search - GPU`
-- `EPC Smart Search - Standard`
-
-For now, the EXE and bundled contract database can stay the same across both releases. The practical difference is the accompanying Gemma environment and model payload, not the PyInstaller app itself.
+For now, the bundled contract database flow stays the same across both releases. The practical difference is whether the bundle includes the local AI runtime and text-only Gemma assets.
 
 ## Notes
 

@@ -7,10 +7,12 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from epc_smart_search.app_paths import GEMMA_TEST_PYTHON, WORKSPACE_ROOT, find_workspace_sensitive_artifacts
+from epc_smart_search.app_paths import WORKSPACE_ROOT, find_workspace_sensitive_artifacts, resolve_gemma_launch_spec, resolve_gemma_test_python
+from gemma_runtime import infer_model_mode_from_config
 
 REBUILD_PDF_ENV_VAR = "EPC_CONTRACT_PDF"
 PREBUILT_DB_ENV_VAR = "EPC_PREBUILT_DB_PATH"
+MODEL_DIR_ENV_VAR = "EPC_SMART_SEARCH_MODEL_DIR"
 DB_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
 
 
@@ -68,32 +70,48 @@ def collect_launch_preflight_issues() -> list[PreflightIssue]:
                     message=f"Current app environment is missing required module '{module_name}'.",
                 )
             )
-    if not GEMMA_TEST_PYTHON.exists():
-        issues.append(
-            PreflightIssue(
-                severity="error",
-                code="missing_gemma_python",
-                message=(
-                    f"Gemma helper Python was not found at {GEMMA_TEST_PYTHON}. "
-                    "Set EPC_GEMMA_PYTHON or EPC_GEMMA_TEST_ROOT before launching."
-                ),
-            )
-        )
-    elif _python_import_check(GEMMA_TEST_PYTHON, ("flask",)).returncode != 0:
-        issues.append(
-            PreflightIssue(
-                severity="error",
-                code="missing_flask_in_gemma_env",
-                message=(
-                    f"Gemma environment at {GEMMA_TEST_PYTHON} cannot import Flask. "
-                    "Install the Gemma service requirements into that environment."
-                ),
-            )
-        )
+    issues.extend(_collect_local_ai_launch_warnings())
     return issues
 
 
-def collect_package_preflight_issues(prebuilt_db_path: str | None) -> list[PreflightIssue]:
+def _collect_local_ai_launch_warnings() -> list[PreflightIssue]:
+    launch_spec = resolve_gemma_launch_spec()
+    if launch_spec.mode in {"disabled", "bundled_service"}:
+        return []
+
+    helper_python = launch_spec.service_path or resolve_gemma_test_python()
+    if not launch_spec.available:
+        return [
+            PreflightIssue(
+                severity="warning",
+                code="local_ai_unavailable",
+                message=(
+                    (launch_spec.reason or f"Gemma helper Python was not found: {helper_python}")
+                    + " Retrieval mode is still available."
+                ),
+            )
+        ]
+
+    if _python_import_check(helper_python, ("flask",)).returncode != 0:
+        return [
+            PreflightIssue(
+                severity="warning",
+                code="missing_flask_in_gemma_env",
+                message=(
+                    f"Gemma environment at {helper_python} cannot import Flask. "
+                    "AI mode may not start, but retrieval mode is still available."
+                ),
+            )
+        ]
+    return []
+
+
+def collect_package_preflight_issues(
+    prebuilt_db_path: str | None,
+    *,
+    profile: str = "Lite",
+    model_dir: str | None = None,
+) -> list[PreflightIssue]:
     issues = collect_workspace_artifact_warnings()
     if importlib.util.find_spec("PyInstaller") is None:
         issues.append(
@@ -137,6 +155,65 @@ def collect_package_preflight_issues(prebuilt_db_path: str | None) -> list[Prefl
                 message=f"Prebuilt contract database is empty: {resolved}",
             )
         )
+    if profile.strip().lower() == "ai":
+        raw_model_dir = (model_dir or os.environ.get(MODEL_DIR_ENV_VAR, "")).strip()
+        if not raw_model_dir:
+            issues.append(
+                PreflightIssue(
+                    severity="error",
+                    code="missing_model_dir",
+                    message=(
+                        f"Provide a bundled AI model directory via -ModelDir or {MODEL_DIR_ENV_VAR}. "
+                        "Keep that folder outside the workspace."
+                    ),
+                )
+            )
+            return issues
+        try:
+            resolved_model = validate_external_artifact_path(raw_model_dir, label="Bundled AI model directory")
+        except Exception as exc:
+            issues.append(PreflightIssue(severity="error", code="invalid_model_dir", message=str(exc)))
+            return issues
+        if not resolved_model.is_dir():
+            issues.append(
+                PreflightIssue(
+                    severity="error",
+                    code="model_dir_not_directory",
+                    message=f"Bundled AI model directory must be a folder: {resolved_model}",
+                )
+            )
+            return issues
+        config_path = resolved_model / "config.json"
+        if not config_path.exists():
+            issues.append(
+                PreflightIssue(
+                    severity="error",
+                    code="missing_model_config",
+                    message=f"Bundled AI model directory is missing config.json: {resolved_model}",
+                )
+            )
+            return issues
+        try:
+            import json
+
+            model_mode = infer_model_mode_from_config(json.loads(config_path.read_text(encoding="utf-8")))
+        except Exception as exc:
+            issues.append(
+                PreflightIssue(
+                    severity="error",
+                    code="invalid_model_config",
+                    message=f"Could not parse bundled AI model config at {config_path}: {exc}",
+                )
+            )
+            return issues
+        if model_mode != "text_only":
+            issues.append(
+                PreflightIssue(
+                    severity="error",
+                    code="model_not_text_only",
+                    message=f"Bundled AI model must be a text-only Gemma checkpoint: {resolved_model}",
+                )
+            )
     return issues
 
 
@@ -163,8 +240,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run EPC Smart Search preflight checks.")
     parser.add_argument("--mode", choices=("launch", "package"), required=True)
     parser.add_argument("--prebuilt-db")
+    parser.add_argument("--profile", default="Lite")
+    parser.add_argument("--model-dir")
     args = parser.parse_args(argv)
-    issues = collect_launch_preflight_issues() if args.mode == "launch" else collect_package_preflight_issues(args.prebuilt_db)
+    issues = (
+        collect_launch_preflight_issues()
+        if args.mode == "launch"
+        else collect_package_preflight_issues(args.prebuilt_db, profile=args.profile, model_dir=args.model_dir)
+    )
     return report_issues(issues)
 
 

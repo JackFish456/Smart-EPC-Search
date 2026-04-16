@@ -2,6 +2,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from epc_smart_search.app_paths import GemmaLaunchSpec
 import epc_smart_search.gemma_client as gemma_client
 
 
@@ -30,7 +31,17 @@ def test_ensure_running_surfaces_exit_and_log_tail(monkeypatch) -> None:
         def kill(self) -> None:
             return None
 
-    monkeypatch.setattr(gemma_client, "GEMMA_TEST_PYTHON", fake_python)
+    monkeypatch.setattr(
+        gemma_client,
+        "resolve_gemma_launch_spec",
+        lambda: GemmaLaunchSpec(
+            mode="external_python",
+            service_path=fake_python,
+            model_dir=None,
+            available=True,
+            reason=None,
+        ),
+    )
     monkeypatch.setattr(gemma_client.requests, "get", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("down")))
     monkeypatch.setattr(gemma_client.subprocess, "Popen", FakeProcess)
     monkeypatch.setattr(gemma_client.time, "sleep", lambda seconds: None)
@@ -48,3 +59,24 @@ def test_ensure_running_surfaces_exit_and_log_tail(monkeypatch) -> None:
         assert stderr_text in message
     else:
         raise AssertionError("Expected ensure_running() to report the service startup failure")
+
+
+def test_get_availability_reports_disabled_ai(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gemma_client,
+        "resolve_gemma_launch_spec",
+        lambda: GemmaLaunchSpec(
+            mode="disabled",
+            service_path=None,
+            model_dir=None,
+            available=False,
+            reason="AI mode is disabled for this app instance.",
+        ),
+    )
+
+    client = gemma_client.GemmaServiceClient()
+    availability = client.get_availability()
+
+    assert availability.available is False
+    assert availability.mode == "disabled"
+    assert "disabled" in availability.message.lower()
