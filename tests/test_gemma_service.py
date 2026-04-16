@@ -43,9 +43,9 @@ def test_generate_accepts_summary_overrides(monkeypatch) -> None:
     assert response.get_json()["answer"] == "Summary"
     assert calls[0]["enable_thinking"] is True
     assert calls[0]["max_new_tokens"] == 448
-    assert "Write a detailed contract-grounded summary in plain English." in calls[0]["user_text"]
-    assert "Prefer short markdown-style section headers and bullet lists" in calls[0]["user_text"]
-    assert "provide a detailed, well-organized synthesis" in calls[0]["system_prompt"]
+    assert "Write a short contract-grounded answer in plain English." in calls[0]["user_text"]
+    assert "Start with one direct answer sentence." in calls[0]["user_text"]
+    assert "keep the answer short, grounded, and specific" in calls[0]["system_prompt"]
 
 
 def test_generate_defaults_do_not_force_summary_overrides(monkeypatch) -> None:
@@ -125,8 +125,8 @@ def test_generate_accepts_deep_answer_overrides(monkeypatch) -> None:
     assert calls[0]["enable_thinking"] is True
     assert calls[0]["max_new_tokens"] == 896
     assert "Answer the exact question first in plain English." in calls[0]["user_text"]
-    assert "Use short markdown-style headers and flat bullet lists" in calls[0]["user_text"]
-    assert "Prioritize resolving the user's exact question" in calls[0]["system_prompt"]
+    assert "After the answer, include the most relevant section/page location" in calls[0]["user_text"]
+    assert "cite the best-supported location instead of listing generic matches" in calls[0]["system_prompt"]
 
 
 def test_generate_accepts_expand_answer_overrides(monkeypatch) -> None:
@@ -170,5 +170,5 @@ def test_generate_accepts_expand_answer_overrides(monkeypatch) -> None:
     assert calls[0]["enable_thinking"] is None
     assert calls[0]["max_new_tokens"] == 896
     assert "Earlier answer already shown to the user:" in calls[0]["user_text"]
-    assert "Do not repeat the earlier answer verbatim" in calls[0]["user_text"]
+    assert "Keep it compact, and include the most relevant section/page location" in calls[0]["user_text"]
     assert "explicitly asked for more detail" in calls[0]["system_prompt"]

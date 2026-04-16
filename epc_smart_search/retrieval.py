@@ -510,6 +510,7 @@ class HybridRetriever:
                 raw = raw[len(prefix):]
                 break
         raw = raw.strip(" ?.")
+        raw = re.sub(r"\b(do we have|do we use|are we using|are there|is there|do we need|do we require)$", "", raw).strip()
         variants: list[str] = []
         if raw:
             variants.append(raw)
@@ -593,6 +594,8 @@ class HybridRetriever:
                 score += 0.7
             elif has_term_overlap(parent_heading, (plan.content_query,)):
                 score += 0.35
+            elif has_term_overlap(full_text, (plan.content_query,)):
+                score += 0.45
         for phrase in focus_phrases:
             if has_term_overlap(heading, (phrase,)):
                 score += 0.55
@@ -617,15 +620,18 @@ class HybridRetriever:
         score += 0.16 * self._term_hit_count(combined_text, plan.focus_terms)
         score += 0.12 * self._term_hit_count(combined_text, plan.actor_terms + plan.action_terms + plan.topic_terms + plan.expansion_terms)
         if exact_system_match and attribute_match:
-            score += 1.0
+            score += 1.25
         elif plan.system_phrase and plan.attribute_terms:
-            score -= 0.65
+            if exact_system_match or attribute_match:
+                score -= 0.95
+            else:
+                score -= 1.35
         elif plan.system_phrase and not exact_system_match:
             score -= 1.05
         elif plan.attribute_terms and not attribute_match:
             score -= 0.55
         if search_pass_name in {"exact_system_attribute", "heading_system_attribute"} and not (exact_system_match and attribute_match):
-            score -= 0.85
+            score -= 1.25
         if search_pass_name == "exact_system_heading" and not exact_system_match:
             score -= 0.75
         if plan.intent == "definition" and clause_type == "definition":
@@ -733,6 +739,12 @@ class HybridRetriever:
             if re.search(r"\bsize\b|\bdiameter\b|\brating\b|\b(?:inch|inches|mm|ft)\b", lowered_full_text):
                 score += 0.95
                 matched = True
+        elif label == "power":
+            if re.search(r"\bhorse\s*power\b|\bhp\b|\bkw\b|\bkilowatt", lowered_full_text):
+                score += 1.2
+                matched = True
+            value_hits = len(re.findall(r"\b\d+(?:\.\d+)?\s*(?:hp|kw|kilowatt(?:s)?)\b", full_text, re.IGNORECASE))
+            score += min(0.9, value_hits * 0.25)
         elif label == "function":
             if re.search(r"\b(receives|supplies|provides|distributes|used to|serves to|operates)\b", lowered_full_text):
                 score += 0.8

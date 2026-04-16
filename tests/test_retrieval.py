@@ -302,6 +302,58 @@ def test_hierarchical_search_prefers_exact_design_conditions_clause() -> None:
     assert ranked[0].chunk_id == "compressor_conditions"
 
 
+def test_hierarchical_search_prefers_exact_power_clause_over_random_pump_schedule() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "random_schedule",
+                "6.9",
+                "KV - 480 V",
+                "02-CCW-PMP-01A TRAIN 2 CLOSED COOLING WATER PUMP MOTOR 1A 1200 01-BFW-PMP-01A TRAIN 1 BOILER FEEDWATER PUMP MOTOR 1A 4750 HP.",
+                359,
+            ),
+            _chunk(
+                "fire_water_pump",
+                "8.4.2",
+                "Fire Water Pump",
+                "Each fire water pump shall be rated at 350 HP for the project fire water service.",
+                412,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what is the fire water pump horse power")
+
+    assert ranked
+    assert ranked[0].chunk_id == "fire_water_pump"
+
+
+def test_hierarchical_search_prefers_exact_function_clause() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "install_clause",
+                "5.1",
+                "Fuel Gas System Installation",
+                "Contractor shall install the fuel gas system in accordance with the project drawings.",
+                20,
+            ),
+            _chunk(
+                "function_clause",
+                "5.2",
+                "Fuel Gas System Description",
+                "The fuel gas system receives natural gas from the pipeline, conditions the gas, and distributes it to the combustion turbines.",
+                21,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("How does the fuel gas system work?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "function_clause"
+
+
 def test_deep_profile_prefers_specific_clause_over_generic_match() -> None:
     retriever = _seed_retriever(
         [

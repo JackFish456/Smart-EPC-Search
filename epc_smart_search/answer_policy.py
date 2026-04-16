@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Sequence
 
-from epc_smart_search.query_planner import QueryPlan, plan_query
+from epc_smart_search.query_planner import QueryPlan, has_term_overlap, plan_query
 from epc_smart_search.retrieval import Citation, ExactPageHit, RankedChunk
 
 
@@ -16,16 +16,16 @@ class AssistantAnswer:
     refused: bool
 
 
-SUMMARY_MAX_NEW_TOKENS = 768
+SUMMARY_MAX_NEW_TOKENS = 224
 SUMMARY_ENABLE_THINKING = False
-SUMMARY_CONTEXT_MAX_SECTIONS = 6
-SUMMARY_EXCERPT_LIMIT = 760
-EXPAND_MAX_NEW_TOKENS = 896
-DEEP_MAX_NEW_TOKENS = 896
+SUMMARY_CONTEXT_MAX_SECTIONS = 4
+SUMMARY_EXCERPT_LIMIT = 520
+EXPAND_MAX_NEW_TOKENS = 320
+DEEP_MAX_NEW_TOKENS = 384
 DEEP_ENABLE_THINKING = True
-DEEP_CONTEXT_MAX_SECTIONS = 8
-DEEP_CONTEXT_EXACT_HITS = 3
-DEEP_PAGE_CONTEXT_SECTIONS = 2
+DEEP_CONTEXT_MAX_SECTIONS = 5
+DEEP_CONTEXT_EXACT_HITS = 2
+DEEP_PAGE_CONTEXT_SECTIONS = 1
 
 
 class AnswerPolicy:
@@ -44,6 +44,7 @@ class AnswerPolicy:
         previous_answer: str | None = None,
     ) -> AssistantAnswer:
         effective_question = self.resolve_question(question, history)
+        plan = plan_query(effective_question)
         exact_hits = self.retriever.find_exact_page_hits(effective_question)
         exact_answer = None if expand_answer else self.build_exact_answer(effective_question, exact_hits)
         if exact_answer is not None and not deep_think:
@@ -64,13 +65,21 @@ class AnswerPolicy:
             return AssistantAnswer("I can't verify that from the contract.", [], True)
 
         best = ranked[0] if ranked else None
-        evidence_is_weak = best is None or (best.total_score < 0.16 and best.lexical_score < 0.05)
+        evidence_is_weak = (
+            best is None
+            or (best.total_score < 0.16 and best.lexical_score < 0.05)
+            or (self.requires_strict_grounding(plan) and not self.is_strong_question_match(plan, best))
+        )
         if evidence_is_weak and not deep_think:
             return AssistantAnswer("I can't verify that from the contract.", citations, True)
 
         reference_answer = self.build_reference_answer(effective_question, ranked, citations)
         if reference_answer is not None and not summary_request and not deep_think and not expand_answer:
             return reference_answer
+
+        compact_answer = self.build_compact_answer(effective_question, ranked, citations)
+        if compact_answer is not None and not summary_request and not deep_think and not expand_answer:
+            return compact_answer
 
         extractive_answer = self.build_extractive_answer(effective_question, ranked, citations)
         if extractive_answer is not None and not summary_request and not deep_think and not expand_answer:
@@ -214,9 +223,9 @@ class AnswerPolicy:
             return None
         excerpts = [f"Page {hit.page_num}: {self.trim_page_excerpt(hit.page_text, lowered)}" for hit in hits[:4]]
         if self.is_count_question(lowered):
-            count = self.count_exact_items(lowered, hits)
-            if count is not None:
-                body = f"I found {count} matching items in the contract.\n\nDirect contract text:\n" + "\n\n".join(excerpts)
+            quantity = self.extract_count_value(lowered, hits)
+            if quantity is not None:
+                body = f"Answer: {quantity}\n\nDirect contract text:\n" + "\n\n".join(excerpts)
                 return AssistantAnswer(body, [], False)
         return AssistantAnswer("Direct contract text:\n" + "\n\n".join(excerpts), [], False)
 
@@ -250,6 +259,40 @@ class AnswerPolicy:
             for match in pattern.finditer(hit.page_text):
                 seen_numbers.add(match.group(1))
         return len(seen_numbers) if seen_numbers else None
+
+    @classmethod
+    def extract_count_value(cls, question: str, hits: list[ExactPageHit]) -> str | None:
+        item_phrase = cls.count_item_phrase(question)
+        if not item_phrase:
+            return None
+        patterns = cls.count_value_patterns(item_phrase)
+        for hit in hits:
+            compact = " ".join(hit.page_text.split())
+            for pattern in patterns:
+                match = pattern.search(compact)
+                if match:
+                    return " ".join(match.group(1).split())
+        count = cls.count_exact_items(question, hits)
+        return str(count) if count is not None else None
+
+    @staticmethod
+    def count_item_phrase(question: str) -> str:
+        item_phrase = question.removeprefix("how many ").strip(" ?.")
+        item_phrase = re.sub(r"\b(do we have|do we use|are there|is there|do we need|do we require)$", "", item_phrase).strip()
+        return item_phrase
+
+    @staticmethod
+    def count_value_patterns(item_phrase: str) -> list[re.Pattern[str]]:
+        phrase = re.escape(item_phrase)
+        singular = re.escape(item_phrase[:-1]) if item_phrase.endswith("s") and len(item_phrase) > 4 else phrase
+        return [
+            re.compile(rf"((?:\w+\s+)?\(?\d+\)?\s*x\s*\d+%[^.]*?{phrase})", re.IGNORECASE),
+            re.compile(rf"((?:\w+\s+)?\(?\d+\)?\s*x\s*\d+%[^.]*?{singular})", re.IGNORECASE),
+            re.compile(rf"((?:one|two|three|four|five|six|seven|eight|nine|ten|\(?\d+\)?)[^.]*?{phrase})", re.IGNORECASE),
+            re.compile(rf"((?:one|two|three|four|five|six|seven|eight|nine|ten|\(?\d+\)?)[^.]*?{singular})", re.IGNORECASE),
+            re.compile(rf"({phrase}[^.]*?\(?\d+\)?\s*x\s*\d+%)", re.IGNORECASE),
+            re.compile(rf"({singular}[^.]*?\(?\d+\)?\s*x\s*\d+%)", re.IGNORECASE),
+        ]
 
     @staticmethod
     def trim_page_excerpt(page_text: str, question: str, limit: int = 700) -> str:
@@ -311,11 +354,12 @@ class AnswerPolicy:
         ranked: list[RankedChunk],
         citations: list[Citation],
         *,
-        max_sections: int = 3,
+        max_sections: int | None = None,
     ) -> AssistantAnswer | None:
         if not ranked:
             return None
         plan = plan_query(question)
+        active_max_sections = cls.default_extractive_sections(plan) if max_sections is None else max_sections
         blocks: list[str] = []
         seen_keys: set[tuple[str | None, int, int]] = set()
         excerpt_limit = 900 if cls.is_value_or_requirement_question(plan) else 650
@@ -331,11 +375,48 @@ class AnswerPolicy:
             pages = cls.format_page_range(chunk.page_start, chunk.page_end)
             heading = " ".join(chunk.heading.split())
             blocks.append(f"Section {label} - {heading}\nPages: {pages}\nContract text: {excerpt}")
-            if len(blocks) >= max_sections:
+            if len(blocks) >= active_max_sections:
                 break
         if not blocks:
             return None
         return AssistantAnswer("\n\n".join(blocks), citations, False)
+
+    @staticmethod
+    def default_extractive_sections(plan: QueryPlan) -> int:
+        if (
+            plan.direct_text_question
+            or plan.count_question
+            or plan.system_phrase
+            or plan.attribute_label is not None
+            or AnswerPolicy.is_value_or_requirement_question(plan)
+        ):
+            return 1
+        return 2
+
+    @classmethod
+    def build_compact_answer(
+        cls,
+        question: str,
+        ranked: list[RankedChunk],
+        citations: list[Citation],
+    ) -> AssistantAnswer | None:
+        if not ranked:
+            return None
+        plan = plan_query(question)
+        if not cls.prefers_compact_answer(plan):
+            return None
+        for chunk in ranked:
+            if not cls.is_strong_question_match(plan, chunk):
+                continue
+            answer_line = cls.extract_attribute_answer(chunk.full_text, plan)
+            if not answer_line:
+                continue
+            label = chunk.section_number or "Unnumbered clause"
+            heading = " ".join(chunk.heading.split())
+            pages = cls.format_page_range(chunk.page_start, chunk.page_end)
+            body = f"{answer_line}\nSection {label} - {heading}\nPages: {pages}"
+            return AssistantAnswer(body, citations, False)
+        return None
 
     @staticmethod
     def prefers_generated_answer(question: str) -> bool:
@@ -343,6 +424,14 @@ class AnswerPolicy:
         wrapped = f" {normalized} "
         return normalized.startswith(("summarize ", "summarise ", "explain ")) or any(
             phrase in wrapped for phrase in (" summarize ", " summarise ", " explain ")
+        )
+
+    @staticmethod
+    def prefers_compact_answer(plan: QueryPlan) -> bool:
+        return bool(
+            plan.attribute_label
+            or plan.intent in {"definition", "responsibility"}
+            or (plan.system_phrase and plan.attribute_terms)
         )
 
     @classmethod
@@ -470,6 +559,9 @@ class AnswerPolicy:
         compact = " ".join(text.split())
         if not compact:
             return ""
+        attribute_excerpt = cls.extract_attribute_excerpt(compact, plan, limit=limit)
+        if attribute_excerpt:
+            return cls.quote_excerpt(attribute_excerpt)
         term_window = cls.extract_term_window(compact, plan, limit=limit)
         if term_window:
             return cls.quote_excerpt(term_window)
@@ -501,9 +593,63 @@ class AnswerPolicy:
             excerpt = excerpt[: limit - 3].rstrip() + "..."
         return cls.quote_excerpt(excerpt)
 
+    @classmethod
+    def extract_attribute_excerpt(cls, text: str, plan: QueryPlan, *, limit: int) -> str:
+        if not plan.attribute_label and not plan.system_phrase:
+            return ""
+        sentences = cls.split_sentences(text)
+        if not sentences:
+            return ""
+        scored = [(cls.score_attribute_sentence(sentence, plan), index) for index, sentence in enumerate(sentences)]
+        scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        best_score, best_index = scored[0]
+        if best_score < 1.4:
+            return ""
+        selected_indices = {best_index}
+        label = plan.attribute_label or ""
+        if label in {"design_conditions", "function"}:
+            selected_indices.update(cls.expand_related_sentences(sentences, best_index, plan, limit=2))
+        elif label in {"configuration", "type", "size", "capacity", "pressure", "temperature", "flow"}:
+            if best_index + 1 < len(sentences) and cls.score_attribute_sentence(sentences[best_index + 1], plan) >= 1.0:
+                selected_indices.add(best_index + 1)
+        excerpt = " ".join(sentences[index] for index in sorted(selected_indices)).strip()
+        if len(excerpt) > limit:
+            excerpt = excerpt[: limit - 3].rstrip() + "..."
+        return excerpt
+
     @staticmethod
     def split_sentences(text: str) -> list[str]:
         return [piece.strip() for piece in re.split(r"(?<=[.!?;:])\s+|\s{2,}", text) if piece.strip()]
+
+    @classmethod
+    def extract_attribute_answer(cls, text: str, plan: QueryPlan, *, limit: int = 320) -> str:
+        compact = " ".join(text.split())
+        if not compact:
+            return ""
+        sentences = cls.split_sentences(compact)
+        if not sentences:
+            return ""
+        scored = [(cls.score_attribute_sentence(sentence, plan), index) for index, sentence in enumerate(sentences)]
+        scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+        best_score, best_index = scored[0]
+        if best_score <= 0.0:
+            fallback = cls.extract_ranked_excerpt(compact, plan, limit=limit)
+            return fallback.strip().strip('"')
+        selected = [sentences[best_index].strip()]
+        if plan.attribute_label == "design_conditions":
+            for direction in (1, -1):
+                neighbor_index = best_index + direction
+                if 0 <= neighbor_index < len(sentences):
+                    neighbor = sentences[neighbor_index].strip()
+                    if cls.score_attribute_sentence(neighbor, plan) >= 1.25 and len(" ".join(selected + [neighbor])) <= limit:
+                        if direction < 0:
+                            selected.insert(0, neighbor)
+                        else:
+                            selected.append(neighbor)
+        excerpt = " ".join(selected).strip()
+        if len(excerpt) > limit:
+            excerpt = excerpt[: limit - 3].rstrip() + "..."
+        return cls.quote_excerpt(excerpt)
 
     @classmethod
     def score_sentence(cls, sentence: str, plan: QueryPlan) -> float:
@@ -511,6 +657,10 @@ class AnswerPolicy:
         score = 0.0
         if plan.content_query and plan.content_query in normalized:
             score += 4.0
+        if plan.system_phrase and plan.system_phrase in normalized:
+            score += 2.2
+        score += 1.0 * sum(1 for term in plan.system_terms if term in normalized)
+        score += 1.0 * sum(1 for term in plan.attribute_terms if term in normalized)
         score += 1.5 * sum(1 for term in plan.focus_terms if term in normalized)
         score += 0.8 * sum(1 for term in plan.topic_terms + plan.action_terms if term in normalized)
         score += 0.5 * sum(1 for term in plan.actor_terms if term in normalized)
@@ -522,6 +672,70 @@ class AnswerPolicy:
             score -= 2.0
         return score
 
+    @classmethod
+    def score_attribute_sentence(cls, sentence: str, plan: QueryPlan) -> float:
+        normalized = sentence.lower()
+        score = cls.score_sentence(sentence, plan)
+        label = plan.attribute_label or ""
+        if label == "design_conditions":
+            if re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", normalized):
+                score += 2.4
+            score += min(2.0, cls.numeric_value_count(sentence) * 0.4)
+        elif label == "configuration":
+            if re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b|\bduplex\b|\bredun", normalized):
+                score += 2.1
+        elif label == "type":
+            if re.search(r"\bmodel\b|\btype\b|\bselected\b|\bvendor\b|\bmanufacturer\b|\buse\b|\busing\b", normalized):
+                score += 2.2
+            if re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b", sentence):
+                score += 2.0
+        elif label == "size":
+            if re.search(r"\bsize\b|\bdiameter\b|\brating\b|\b(?:inch|inches|mm|ft)\b", normalized):
+                score += 2.0
+            score += min(1.6, cls.numeric_value_count(sentence) * 0.35)
+        elif label == "power":
+            score += min(1.8, cls.numeric_value_count(sentence) * 0.35)
+            if re.search(r"\bhorse\s*power\b|\bhp\b|\bkw\b|\bkilowatt", normalized):
+                score += 1.8
+        elif label in {"capacity", "pressure", "temperature", "flow"}:
+            score += min(1.8, cls.numeric_value_count(sentence) * 0.35)
+            if any(term in normalized for term in plan.attribute_terms):
+                score += 1.6
+        elif label == "responsibility":
+            if re.search(r"\b(shall|must|required|responsible|provide|furnish|supply|perform|deliver)\b", normalized):
+                score += 2.0
+        elif label == "definition" or plan.intent == "definition":
+            if re.search(r"\bmeans\b|\bdefined as\b|\bdefinition\b", normalized):
+                score += 2.2
+        elif label == "function":
+            if re.search(r"\b(receives|supplies|provides|distributes|conditions|transports|serves|used to|operates)\b", normalized):
+                score += 2.0
+        return score
+
+    @classmethod
+    def expand_related_sentences(
+        cls,
+        sentences: list[str],
+        anchor_index: int,
+        plan: QueryPlan,
+        *,
+        limit: int = 2,
+    ) -> set[int]:
+        selected: set[int] = set()
+        for offset in range(1, limit + 1):
+            next_index = anchor_index + offset
+            if next_index < len(sentences) and cls.score_attribute_sentence(sentences[next_index], plan) >= 1.0:
+                selected.add(next_index)
+            prev_index = anchor_index - offset
+            if prev_index >= 0 and cls.score_attribute_sentence(sentences[prev_index], plan) >= 1.0:
+                selected.add(prev_index)
+        return selected
+
+    @staticmethod
+    def numeric_value_count(text: str) -> int:
+        pattern = r"\b\d+(?:\.\d+)?\s*(?:psi|psig|psia|degf|deg c|gpm|lb/hr|scfm|mw|mva|hp|%|inch|inches|mm|ft)?\b"
+        return len(re.findall(pattern, text, re.IGNORECASE))
+
     @staticmethod
     def is_value_or_requirement_question(plan: QueryPlan) -> bool:
         return AnswerPolicy.is_value_question(plan) or AnswerPolicy.is_requirement_question(plan)
@@ -529,6 +743,10 @@ class AnswerPolicy:
     @staticmethod
     def is_value_question(plan: QueryPlan) -> bool:
         normalized = plan.normalized_query
+        if plan.count_question:
+            return True
+        if plan.attribute_label in {"design_conditions", "size", "capacity", "power", "pressure", "temperature", "flow"}:
+            return True
         markers = (
             "how much",
             "amount",
@@ -573,12 +791,90 @@ class AnswerPolicy:
         return f'"{cleaned}"' if cleaned else ""
 
     @classmethod
+    def requires_strict_grounding(cls, plan: QueryPlan) -> bool:
+        return bool(
+            plan.system_phrase
+            or plan.attribute_label
+            or plan.intent in {"definition", "responsibility"}
+        )
+
+    @classmethod
+    def is_strong_question_match(cls, plan: QueryPlan, chunk: RankedChunk) -> bool:
+        if chunk.total_score < 0.42 and cls.requires_strict_grounding(plan):
+            return False
+        combined = " ".join([chunk.heading, chunk.full_text])
+        if plan.system_phrase and not cls.matches_system(plan, combined):
+            return False
+        if plan.attribute_label and not cls.matches_attribute(plan, combined):
+            return False
+        if plan.intent == "definition" and not re.search(r"\bmeans\b|\bdefined as\b|\bdefinition\b", combined, re.IGNORECASE):
+            return False
+        if plan.intent == "responsibility" and not re.search(
+            r"\b(shall|must|responsible|required|provide|furnish|supply|perform|deliver|submit)\b",
+            combined,
+            re.IGNORECASE,
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def matches_system(plan: QueryPlan, text: str) -> bool:
+        if not plan.system_phrase and not plan.system_terms:
+            return True
+        if plan.system_phrase and has_term_overlap(text, (plan.system_phrase,)):
+            return True
+        if any(has_term_overlap(text, (alias,)) for alias in plan.system_aliases):
+            return True
+        if plan.system_terms:
+            hits = sum(1 for term in plan.system_terms if has_term_overlap(text, (term,)))
+            return hits >= max(1, min(len(plan.system_terms), 2))
+        return False
+
+    @staticmethod
+    def matches_attribute(plan: QueryPlan, text: str) -> bool:
+        if not plan.attribute_label and not plan.attribute_terms:
+            return True
+        lowered = text.lower()
+        if any(has_term_overlap(text, (term,)) for term in plan.attribute_terms):
+            return True
+        label = plan.attribute_label or ""
+        if label == "design_conditions":
+            return bool(re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", lowered))
+        if label == "configuration":
+            return bool(re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b", lowered))
+        if label == "type":
+            return bool(re.search(r"\bmodel\b|\btype\b|\bselected\b|\bmanufacturer\b|\bvendor\b", lowered) or re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b", text))
+        if label == "size":
+            return bool(re.search(r"\bsize\b|\bdiameter\b|\brating\b|\bdimension\b", lowered))
+        if label == "capacity":
+            return bool(re.search(r"\bcapacity\b|\boutput\b|\bduty\b|\bthroughput\b", lowered))
+        if label == "pressure":
+            return bool(re.search(r"\bpressure\b|\bpsig\b|\bpsi\b", lowered))
+        if label == "temperature":
+            return bool(re.search(r"\btemperature\b|\bdegf\b|\bdeg c\b", lowered))
+        if label == "flow":
+            return bool(re.search(r"\bflow\b|\bflow rate\b|\bflowrate\b|\bthroughput\b", lowered))
+        if label == "responsibility":
+            return bool(re.search(r"\b(shall|must|responsible|required|provide|furnish|supply)\b", lowered))
+        if label == "definition":
+            return bool(re.search(r"\bmeans\b|\bdefined as\b|\bdefinition\b", lowered))
+        if label == "function":
+            return bool(re.search(r"\b(receives|supplies|provides|distributes|used to|serves to|operates|functions)\b", lowered))
+        return False
+
+    @classmethod
     def extract_term_window(cls, text: str, plan: QueryPlan, *, limit: int) -> str:
         lowered = text.lower()
         candidates: list[str] = []
+        if plan.system_phrase and plan.attribute_terms:
+            candidates.append(f"{plan.system_phrase} {plan.attribute_terms[0]}")
+        if plan.system_phrase:
+            candidates.append(plan.system_phrase)
         if plan.content_query:
             candidates.append(plan.content_query)
         candidates.extend(cls.focus_phrases(plan.focus_terms))
+        candidates.extend(plan.system_aliases)
+        candidates.extend(plan.attribute_terms)
         candidates.extend(plan.focus_terms)
         candidates.extend(plan.topic_terms + plan.action_terms)
         seen: set[str] = set()
@@ -626,6 +922,12 @@ class AnswerPolicy:
         if focus_candidates and not any(candidate and candidate in combined for candidate in focus_candidates):
             return False
         lowered = cleaned.lower()
+        if plan.system_phrase and plan.system_phrase not in combined:
+            system_hits = sum(1 for term in plan.system_terms if term and term in combined)
+            if system_hits < max(1, min(2, len(plan.system_terms))):
+                return False
+        if (plan.attribute_label or plan.count_question) and not AnswerPolicy.excerpt_matches_attribute(lowered, plan):
+            return False
         if AnswerPolicy.is_requirement_question(plan) and not re.search(
             r"\b(shall|must|required|responsible|obligated|provide|perform|submit|deliver|maintain|comply)\b",
             lowered,
@@ -633,6 +935,31 @@ class AnswerPolicy:
             return False
         if AnswerPolicy.is_value_question(plan) and not re.search(r"\d", cleaned):
             return False
+        return True
+
+    @staticmethod
+    def excerpt_matches_attribute(lowered_excerpt: str, plan: QueryPlan) -> bool:
+        label = plan.attribute_label or ""
+        if plan.count_question:
+            return bool(re.search(r"\b\d", lowered_excerpt) or re.search(r"\b(one|two|three|four|five|six|seven|eight|nine|ten)\b", lowered_excerpt))
+        if not label:
+            return True
+        if label == "design_conditions":
+            return bool(re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", lowered_excerpt) or re.search(r"\d", lowered_excerpt))
+        if label == "configuration":
+            return bool(re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b|\bduplex\b|\bredun", lowered_excerpt))
+        if label == "type":
+            return bool(re.search(r"\bmodel\b|\btype\b|\bselected\b|\bvendor\b|\bmanufacturer\b", lowered_excerpt) or re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b", lowered_excerpt))
+        if label == "size":
+            return bool(re.search(r"\bsize\b|\bdiameter\b|\brating\b|\b(?:inch|inches|mm|ft)\b", lowered_excerpt) or re.search(r"\d", lowered_excerpt))
+        if label == "power":
+            return bool(any(term in lowered_excerpt for term in plan.attribute_terms) or re.search(r"\b\d+(?:\.\d+)?\s*(?:hp|kw|kilowatt(?:s)?)\b", lowered_excerpt))
+        if label in {"capacity", "pressure", "temperature", "flow"}:
+            return bool(any(term in lowered_excerpt for term in plan.attribute_terms) or re.search(r"\d", lowered_excerpt))
+        if label == "responsibility":
+            return bool(re.search(r"\b(shall|must|required|responsible|provide|furnish|supply|perform|deliver)\b", lowered_excerpt))
+        if label == "function":
+            return bool(re.search(r"\b(receives|supplies|provides|distributes|conditions|transports|serves|used to|operates)\b", lowered_excerpt))
         return True
 
     @classmethod

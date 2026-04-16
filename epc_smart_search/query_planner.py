@@ -104,6 +104,7 @@ SYSTEM_FILLER = STOPWORDS | {
     "do",
     "does",
     "did",
+    "we",
     "our",
     "using",
     "use",
@@ -117,12 +118,23 @@ ATTRIBUTE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("configuration", ("configuration", "configured", "arrangement", "arranged")),
     ("size", ("size", "sizes", "diameter", "rating", "dimensions")),
     ("capacity", ("capacity", "capacities", "output", "duty", "throughput")),
+    ("power", ("horsepower", "horse power", "hp", "kw", "kilowatt", "kilowatts", "motor power")),
     ("pressure", ("pressure", "pressures", "psig", "psi")),
     ("temperature", ("temperature", "temperatures")),
     ("flow", ("flow", "flows", "flowrate", "flow rate", "throughput")),
     ("type", ("type", "kind", "model", "selected", "selection")),
-    ("responsibility", ("responsible", "provided by", "provide", "furnish", "supply")),
     ("definition", ("defined", "definition", "means", "meaning")),
+)
+
+QUESTION_TAIL_PATTERNS = (
+    r"\bdo we have$",
+    r"\bdo we use$",
+    r"\bare we using$",
+    r"\bis used$",
+    r"\bare there$",
+    r"\bis there$",
+    r"\bdo we need$",
+    r"\bdo we require$",
 )
 
 ATTRIBUTE_LABEL_TERMS: dict[str, tuple[str, ...]] = {
@@ -131,6 +143,7 @@ ATTRIBUTE_LABEL_TERMS: dict[str, tuple[str, ...]] = {
     "type": ("type", "kind", "model", "selected", "manufacturer"),
     "size": ("size", "diameter", "rating", "dimension"),
     "capacity": ("capacity", "output", "duty", "throughput"),
+    "power": ("horsepower", "horse power", "hp", "kw", "kilowatt", "motor power"),
     "pressure": ("pressure", "pressures", "psi", "psig"),
     "temperature": ("temperature", "temperatures"),
     "flow": ("flow", "flow rate", "flowrate", "throughput"),
@@ -175,7 +188,10 @@ def plan_query(query: str) -> QueryPlan:
         intent = "section_lookup"
     elif count_question or direct_text_question:
         intent = "direct_text"
-    elif normalized.startswith(("what is ", "what are ", "define ", "meaning of ")) or " definition" in normalized:
+    elif attribute_label == "definition" or (
+        attribute_label is None
+        and (normalized.startswith(("what is ", "what are ", "define ", "meaning of ")) or " definition" in normalized)
+    ):
         intent = "definition"
     elif "responsible for" in normalized or normalized.startswith("who "):
         intent = "responsibility"
@@ -269,6 +285,8 @@ def _extract_content_query(normalized_query: str) -> str:
             content = content[len(prefix):]
             break
     content = content.strip(" ?.!")
+    for pattern in QUESTION_TAIL_PATTERNS:
+        content = re.sub(pattern, "", content).strip()
     return content or normalized_query
 
 
@@ -288,6 +306,11 @@ def _detect_attribute(normalized_query: str, content_query: str) -> tuple[str | 
         return "function", ATTRIBUTE_LABEL_TERMS["function"]
     if re.search(r"\bwe (?:are )?using\b", normalized_query) or re.search(r"\b(?:using|used)\b", content_query):
         return "type", ATTRIBUTE_LABEL_TERMS["type"]
+    if re.search(
+        r"\b(who is responsible|who provides|who furnishes|who supplies|provided by|responsible for|required to provide|required to furnish|required to supply)\b",
+        normalized_query,
+    ):
+        return "responsibility", ATTRIBUTE_LABEL_TERMS["responsibility"]
     for label, patterns in ATTRIBUTE_PATTERNS:
         if any(f" {normalize_text(pattern)} " in normalized or f" {normalize_text(pattern)} " in content for pattern in patterns):
             return label, ATTRIBUTE_LABEL_TERMS[label]

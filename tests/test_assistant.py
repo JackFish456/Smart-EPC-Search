@@ -2,6 +2,7 @@ from epc_smart_search.assistant import AssistantAnswer, ContractAssistant
 from epc_smart_search.assistant import DEEP_MAX_NEW_TOKENS
 from epc_smart_search.assistant import SUMMARY_ENABLE_THINKING
 from epc_smart_search.assistant import SUMMARY_MAX_NEW_TOKENS
+from epc_smart_search.answer_policy import AnswerPolicy
 from epc_smart_search.retrieval import Citation, ExactPageHit
 from epc_smart_search.retrieval import RankedChunk
 
@@ -81,6 +82,220 @@ def test_build_extractive_answer_keeps_numeric_requirement_language() -> None:
     assert answer is not None
     assert "twenty-four (24) hours" in answer.text
     assert "shall deliver the results" in answer.text
+
+
+def test_build_extractive_answer_prefers_exact_model_sentence() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk_model",
+            section_number="9.2",
+            heading="Selected Turbine Generator",
+            full_text=(
+                "General turbine requirements are listed in this section. "
+                "The selected turbine model shall be Siemens SGT6-5000F for the project. "
+                "Accessories shall be delivered with the package."
+            ),
+            page_start=19,
+            page_end=19,
+            ordinal_in_document=1,
+            total_score=4.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+
+    answer = ContractAssistant._build_extractive_answer(
+        "What is the turbine we are using?",
+        ranked,
+        [],
+    )
+
+    assert answer is not None
+    assert "Siemens SGT6-5000F" in answer.text
+    assert "Accessories shall be delivered" not in answer.text
+
+
+def test_build_extractive_answer_prefers_configuration_sentence() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk_config",
+            section_number="7.4.2",
+            heading="Fuel Gas Dew Point Configuration",
+            full_text=(
+                "Dew point monitoring shall be included in the controls package. "
+                "The fuel gas dew point configuration shall use a duplex analyzer arrangement with automatic switchover. "
+                "Commissioning checks shall verify the analyzer alarms."
+            ),
+            page_start=41,
+            page_end=41,
+            ordinal_in_document=1,
+            total_score=4.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+
+    answer = ContractAssistant._build_extractive_answer(
+        "What is the dew point configuration?",
+        ranked,
+        [],
+    )
+
+    assert answer is not None
+    assert "duplex analyzer arrangement with automatic switchover" in answer.text
+    assert "Commissioning checks shall verify the analyzer alarms." not in answer.text
+
+
+def test_build_extractive_answer_keeps_design_condition_values_together() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk_conditions",
+            section_number="12.4.1",
+            heading="Compressor Design Conditions",
+            full_text=(
+                "The compressor design conditions shall be 1250 psig discharge pressure and 105 degF inlet temperature. "
+                "Normal operating pressure is expected to be lower during startup."
+            ),
+            page_start=28,
+            page_end=28,
+            ordinal_in_document=1,
+            total_score=4.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+
+    answer = ContractAssistant._build_extractive_answer(
+        "What are the compressor design conditions?",
+        ranked,
+        [],
+    )
+
+    assert answer is not None
+    assert "1250 psig discharge pressure" in answer.text
+    assert "105 degF inlet temperature" in answer.text
+
+
+def test_build_extractive_answer_prefers_exact_power_value() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="fire_water_pump",
+            section_number="8.4.2",
+            heading="Fire Water Pump",
+            full_text=(
+                "General pump arrangement details are provided elsewhere. "
+                "Each fire water pump shall be rated at 350 HP for the project fire water service. "
+                "The driver shall be suitable for emergency operation."
+            ),
+            page_start=412,
+            page_end=412,
+            ordinal_in_document=1,
+            total_score=4.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+
+    answer = ContractAssistant._build_extractive_answer(
+        "what is the fire water pump horse power",
+        ranked,
+        [],
+    )
+
+    assert answer is not None
+    assert "350 HP" in answer.text
+    assert "driver shall be suitable" not in answer.text.lower()
+
+
+def test_build_extractive_answer_stops_after_first_high_confidence_exact_block() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="steam_turbine",
+            section_number="8.2.1",
+            heading="Steam Turbine",
+            full_text=(
+                "Each steam turbine unit is of the model STF-D600 and includes the following equipment: "
+                "One combined HP/IP turbine and one double flow LP turbine."
+            ),
+            page_start=1762,
+            page_end=1762,
+            ordinal_in_document=1,
+            total_score=4.5,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        ),
+        RankedChunk(
+            chunk_id="manual_trip",
+            section_number="5",
+            heading="Manual trip - turbine is tripped manually",
+            full_text="Manual trip logic for a steam turbine is described in this appendix section.",
+            page_start=2716,
+            page_end=2716,
+            ordinal_in_document=2,
+            total_score=2.5,
+            lexical_score=0.7,
+            semantic_score=0.0,
+        ),
+    ]
+
+    answer = ContractAssistant._build_extractive_answer(
+        "what turbine are we using",
+        ranked,
+        [],
+    )
+
+    assert answer is not None
+    assert "STF-D600" in answer.text
+    assert "Manual trip" not in answer.text
+    assert answer.text.count("Section ") == 1
+
+
+def test_build_exact_answer_prefers_quantity_value_for_how_many_question() -> None:
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    hits = [
+        ExactPageHit(
+            page_num=290,
+            snippet="Demineralized water pumps",
+            page_text=(
+                "The Demineralized Water System includes two (2) x 100% demineralized water pumps. "
+                "These pumps deliver water to the storage tank."
+            ),
+        )
+    ]
+
+    answer = assistant._build_exact_answer("how many demineralized water pumps do we have", hits)
+
+    assert answer is not None
+    assert "Answer:" in answer.text
+    assert "two (2) x 100%" in answer.text.lower()
+
+
+def test_build_extractive_answer_rejects_system_overview_for_how_many_question_without_quantity() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk_count_fail",
+            section_number="5.50",
+            heading="Demineralized Water",
+            full_text=(
+                "The Demineralized Water System provides and stores demineralized water in the storage tank. "
+                "Demineralized water is used for makeup and wash services."
+            ),
+            page_start=290,
+            page_end=290,
+            ordinal_in_document=1,
+            total_score=4.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+
+    answer = ContractAssistant._build_extractive_answer(
+        "how many demineralized water pumps do we have",
+        ranked,
+        [],
+    )
+
+    assert answer is None
 
 
 def test_prefers_generated_answer_only_for_summary_style_prompts() -> None:
@@ -201,6 +416,105 @@ def test_build_extractive_answer_skips_definition_only_text_for_requirement_ques
     assert answer is not None
     assert "Section 7.5.1 - Air Permit Tests" in answer.text
     assert "Section 2 - Air Permit Test" not in answer.text
+
+
+def test_build_compact_answer_returns_exact_model_line_for_type_question() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="9.2",
+            heading="Selected Turbine Generator",
+            full_text="The selected turbine model shall be Siemens SGT6-5000F for the project.",
+            page_start=19,
+            page_end=19,
+            ordinal_in_document=1,
+            total_score=4.2,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+
+    answer = AnswerPolicy.build_compact_answer(
+        "What is the turbine we are using?",
+        ranked,
+        [],
+    )
+
+    assert answer is not None
+    assert '"The selected turbine model shall be Siemens SGT6-5000F for the project."' in answer.text
+    assert "Section 9.2 - Selected Turbine Generator" in answer.text
+    assert "Pages: 19" in answer.text
+
+
+def test_build_compact_answer_returns_exact_function_line_for_how_it_works_question() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.2",
+            heading="Fuel Gas System Description",
+            full_text=(
+                "The fuel gas system receives natural gas from the pipeline, conditions the gas, "
+                "and distributes it to the combustion turbines. Contractor shall install the skids on the foundations."
+            ),
+            page_start=21,
+            page_end=21,
+            ordinal_in_document=1,
+            total_score=4.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+
+    answer = AnswerPolicy.build_compact_answer(
+        "How does the fuel gas system work?",
+        ranked,
+        [],
+    )
+
+    assert answer is not None
+    assert '"The fuel gas system receives natural gas from the pipeline, conditions the gas, and distributes it to the combustion turbines."' in answer.text
+    assert "Section 5.2 - Fuel Gas System Description" in answer.text
+
+
+def test_system_attribute_question_refuses_when_best_match_is_blurry() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="3.1",
+            heading="Dew Point",
+            full_text="Dew point testing shall be completed during commissioning.",
+            page_start=10,
+            page_end=10,
+            ordinal_in_document=1,
+            total_score=0.8,
+            lexical_score=0.3,
+            semantic_score=0.0,
+        )
+    ]
+    citations = [Citation("chunk1", "3.1", "Dew Point", None, 10, 10, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called for a blurry exact query")
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+
+    answer = assistant.ask("What is the dew point configuration?")
+
+    assert answer.refused
+    assert answer.text == "I can't verify that from the contract."
 
 
 def test_build_summary_prompt_context_uses_ranked_chunks_and_filters_noise() -> None:
