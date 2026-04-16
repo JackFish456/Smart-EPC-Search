@@ -59,6 +59,13 @@ class SearchCandidate:
 
 
 @dataclass(slots=True, frozen=True)
+class SearchPass:
+    name: str
+    query: str
+    bonus: float
+
+
+@dataclass(slots=True, frozen=True)
 class RetrievalProfile:
     name: str
     result_limit: int
@@ -159,11 +166,18 @@ class HybridRetriever:
                 candidate = self._score_row(plan, row, lexical_score=1.0, semantic_score=0.85, bonus=0.9)
                 combined[str(row["chunk_id"])] = candidate
 
-        for match_query in self._match_queries_for_profile(plan, active_profile):
-            for row in self.store.search_chunk_feature_fts(document_id, match_query, limit=active_profile.fts_limit):
+        for search_pass in self._search_passes_for_profile(plan, active_profile):
+            for row in self.store.search_chunk_feature_fts(document_id, search_pass.query, limit=active_profile.fts_limit):
                 lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
                 semantic_score = self._semantic_for_row(semantic_query, row)
-                candidate = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
+                candidate = self._score_row(
+                    plan,
+                    row,
+                    lexical_score=lexical_score,
+                    semantic_score=semantic_score,
+                    bonus=search_pass.bonus,
+                    search_pass_name=search_pass.name,
+                )
                 self._merge_candidate(combined, candidate)
 
         if not combined:
@@ -322,6 +336,74 @@ class HybridRetriever:
             queries.extend(build_match_queries(plan_query(variant)))
         return self._dedupe_queries(queries)
 
+    def _search_passes_for_profile(self, plan: QueryPlan, profile: RetrievalProfile) -> list[SearchPass]:
+        passes: list[SearchPass] = []
+
+        attribute_block = self._fts_term_block(plan.attribute_terms[:4])
+        if plan.system_phrase and attribute_block:
+            passes.append(
+                SearchPass(
+                    "exact_system_attribute",
+                    self._fts_and([self._fts_phrase(plan.system_phrase), attribute_block]),
+                    1.55,
+                )
+            )
+            passes.append(
+                SearchPass(
+                    "heading_system_attribute",
+                    self._fts_and([self._fts_column_block(("heading", "parent_heading"), plan.system_phrase), attribute_block]),
+                    1.8,
+                )
+            )
+
+        if plan.system_phrase:
+            passes.append(
+                SearchPass(
+                    "exact_system_heading",
+                    self._fts_column_block(("heading", "parent_heading"), plan.system_phrase),
+                    1.25,
+                )
+            )
+            passes.append(
+                SearchPass(
+                    "exact_system_text",
+                    self._fts_phrase(plan.system_phrase),
+                    0.95,
+                )
+            )
+
+        if attribute_block:
+            passes.append(
+                SearchPass(
+                    "attribute_only",
+                    attribute_block,
+                    0.45,
+                )
+            )
+
+        for alias in plan.system_aliases[:2]:
+            if not alias:
+                continue
+            alias_phrase = self._fts_phrase(alias)
+            if attribute_block:
+                passes.append(
+                    SearchPass(
+                        "alias_system_attribute",
+                        self._fts_and([alias_phrase, attribute_block]),
+                        0.7,
+                    )
+                )
+            passes.append(
+                SearchPass(
+                    "alias_system",
+                    alias_phrase,
+                    0.35,
+                )
+            )
+
+        passes.extend(SearchPass("general", query, 0.0) for query in self._match_queries_for_profile(plan, profile))
+        return self._dedupe_search_passes(passes)
+
     def _fallback_queries_for_profile(self, plan: QueryPlan, profile: RetrievalProfile) -> list[str]:
         queries = [build_like_fallback(plan)]
         if not profile.use_query_expansion:
@@ -331,7 +413,7 @@ class HybridRetriever:
         return self._dedupe_queries(queries)
 
     def _query_variants(self, plan: QueryPlan) -> list[str]:
-        candidates = [plan.raw_query, plan.content_query]
+        candidates = [plan.raw_query, plan.content_query, plan.system_phrase]
         candidates.extend(self._focus_phrases(plan.focus_terms))
         return self._dedupe_queries(candidates)
 
@@ -346,6 +428,56 @@ class HybridRetriever:
             seen.add(normalized.lower())
             deduped.append(normalized)
         return deduped
+
+    @staticmethod
+    def _dedupe_search_passes(search_passes: list[SearchPass]) -> list[SearchPass]:
+        seen: set[str] = set()
+        deduped: list[SearchPass] = []
+        for search_pass in search_passes:
+            normalized = " ".join(search_pass.query.split())
+            if not normalized or normalized.lower() in seen:
+                continue
+            seen.add(normalized.lower())
+            deduped.append(search_pass)
+        return deduped
+
+    @staticmethod
+    def _fts_escape(text: str) -> str:
+        return " ".join(str(text).replace('"', " ").split())
+
+    @classmethod
+    def _fts_phrase(cls, text: str) -> str:
+        escaped = cls._fts_escape(text)
+        return f'"{escaped}"' if escaped else ""
+
+    @classmethod
+    def _fts_term_block(cls, terms: tuple[str, ...]) -> str:
+        phrases = [cls._fts_phrase(term) for term in terms if term]
+        phrases = [phrase for phrase in phrases if phrase]
+        if not phrases:
+            return ""
+        if len(phrases) == 1:
+            return phrases[0]
+        return "(" + " OR ".join(phrases) + ")"
+
+    @classmethod
+    def _fts_column_block(cls, columns: tuple[str, ...], phrase: str) -> str:
+        quoted = cls._fts_phrase(phrase)
+        if not quoted:
+            return ""
+        parts = [f"{column} : {quoted}" for column in columns]
+        if len(parts) == 1:
+            return parts[0]
+        return "(" + " OR ".join(parts) + ")"
+
+    @staticmethod
+    def _fts_and(parts: list[str]) -> str:
+        filtered = [part for part in parts if part]
+        if not filtered:
+            return ""
+        if len(filtered) == 1:
+            return filtered[0]
+        return "(" + " AND ".join(filtered) + ")"
 
     @staticmethod
     def _row_vector(row: dict) -> list[float]:
@@ -437,6 +569,7 @@ class HybridRetriever:
         lexical_score: float,
         semantic_score: float,
         bonus: float = 0.0,
+        search_pass_name: str = "",
     ) -> SearchCandidate:
         heading = str(row["heading"])
         parent_heading = str(row["parent_heading"] or "")
@@ -447,8 +580,12 @@ class HybridRetriever:
         clause_type = str(row["clause_type"] or row["chunk_type"])
         combined_text = " ".join([heading, parent_heading, full_text, actor_tags, action_tags, topic_tags])
         focus_phrases = self._focus_phrases(plan.focus_terms)
+        system_score, exact_system_match = self._system_match_score(plan, heading, parent_heading, combined_text)
+        attribute_score, attribute_match = self._attribute_match_score(plan, heading, parent_heading, full_text, combined_text)
 
         score = lexical_score * 0.55 + semantic_score * 0.15 + bonus
+        score += system_score
+        score += attribute_score
         if row["section_number"] and row["section_number"] == plan.section_number:
             score += 1.2
         if plan.content_query:
@@ -479,6 +616,18 @@ class HybridRetriever:
             score += 0.9
         score += 0.16 * self._term_hit_count(combined_text, plan.focus_terms)
         score += 0.12 * self._term_hit_count(combined_text, plan.actor_terms + plan.action_terms + plan.topic_terms + plan.expansion_terms)
+        if exact_system_match and attribute_match:
+            score += 1.0
+        elif plan.system_phrase and plan.attribute_terms:
+            score -= 0.65
+        elif plan.system_phrase and not exact_system_match:
+            score -= 1.05
+        elif plan.attribute_terms and not attribute_match:
+            score -= 0.55
+        if search_pass_name in {"exact_system_attribute", "heading_system_attribute"} and not (exact_system_match and attribute_match):
+            score -= 0.85
+        if search_pass_name == "exact_system_heading" and not exact_system_match:
+            score -= 0.75
         if plan.intent == "definition" and clause_type == "definition":
             score += 1.0
         if plan.intent == "responsibility" and re.search(r"\b(shall|must|responsible|required)\b", full_text, re.IGNORECASE):
@@ -514,6 +663,85 @@ class HybridRetriever:
             lexical_score=lexical_score,
             semantic_score=semantic_score,
         )
+
+    @staticmethod
+    def _system_match_score(plan: QueryPlan, heading: str, parent_heading: str, combined_text: str) -> tuple[float, bool]:
+        if not plan.system_phrase and not plan.system_terms:
+            return 0.0, False
+        score = 0.0
+        exact_match = False
+        if plan.system_phrase:
+            if has_term_overlap(heading, (plan.system_phrase,)):
+                score += 1.8
+                exact_match = True
+            elif has_term_overlap(parent_heading, (plan.system_phrase,)):
+                score += 1.15
+                exact_match = True
+            elif has_term_overlap(combined_text, (plan.system_phrase,)):
+                score += 0.8
+                exact_match = True
+        for alias in plan.system_aliases:
+            if has_term_overlap(heading, (alias,)) or has_term_overlap(parent_heading, (alias,)):
+                score += 0.55
+                break
+        if plan.system_terms:
+            hit_count = HybridRetriever._term_hit_count(combined_text, plan.system_terms)
+            if hit_count:
+                score += 0.22 * hit_count
+            exact_match = exact_match or hit_count >= max(1, min(len(plan.system_terms), 2))
+        return score, exact_match
+
+    @staticmethod
+    def _attribute_match_score(
+        plan: QueryPlan,
+        heading: str,
+        parent_heading: str,
+        full_text: str,
+        combined_text: str,
+    ) -> tuple[float, bool]:
+        if not plan.attribute_terms and not plan.attribute_label:
+            return 0.0, False
+        score = 0.0
+        matched = False
+        for phrase in plan.attribute_terms:
+            if has_term_overlap(heading, (phrase,)) or has_term_overlap(parent_heading, (phrase,)):
+                score += 0.95
+                matched = True
+            elif has_term_overlap(combined_text, (phrase,)):
+                score += 0.45
+                matched = True
+        label = plan.attribute_label or ""
+        lowered_full_text = full_text.lower()
+        if label == "design_conditions":
+            if re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", lowered_full_text):
+                score += 1.1
+                matched = True
+            value_hits = len(re.findall(r"\b\d+(?:\.\d+)?\s*(?:psi|psig|psia|degf|deg c|gpm|lb/hr|scfm|mw|mva|hp)\b", lowered_full_text, re.IGNORECASE))
+            score += min(0.75, value_hits * 0.18)
+        elif label == "configuration":
+            if re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b", lowered_full_text):
+                score += 1.0
+                matched = True
+        elif label == "type":
+            if re.search(r"\bmodel\b|\btype\b|\bselected\b|\bmanufacturer\b|\bvendor\b", lowered_full_text):
+                score += 1.0
+                matched = True
+            if re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b", full_text):
+                score += 0.75
+                matched = True
+        elif label == "size":
+            if re.search(r"\bsize\b|\bdiameter\b|\brating\b|\b(?:inch|inches|mm|ft)\b", lowered_full_text):
+                score += 0.95
+                matched = True
+        elif label == "function":
+            if re.search(r"\b(receives|supplies|provides|distributes|used to|serves to|operates)\b", lowered_full_text):
+                score += 0.8
+                matched = True
+        elif label == "responsibility":
+            if re.search(r"\b(shall|must|responsible|provide|furnish|supply|required)\b", lowered_full_text):
+                score += 0.65
+                matched = True
+        return score, matched
 
     @staticmethod
     def _term_hit_count(text: str, terms: tuple[str, ...]) -> int:

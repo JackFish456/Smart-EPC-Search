@@ -189,6 +189,15 @@ def test_contract_say_about_queries_strip_boilerplate_for_focus_terms() -> None:
     assert build_like_fallback(plan) == "electric motors"
 
 
+def test_query_plan_extracts_system_and_attribute_for_configuration_question() -> None:
+    plan = plan_query("What is the dew point configuration?")
+
+    assert plan.system_phrase == "dew point"
+    assert plan.system_terms == ("dew", "point")
+    assert plan.attribute_label == "configuration"
+    assert "configuration" in plan.attribute_terms
+
+
 def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> None:
     retriever = _seed_retriever(
         [
@@ -213,6 +222,84 @@ def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> 
 
     assert ranked
     assert ranked[0].chunk_id == "motors"
+
+
+def test_hierarchical_search_prefers_exact_system_and_configuration_clause() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_dew",
+                "3.1",
+                "Dew Point",
+                "Dew point testing shall be completed during commissioning.",
+                10,
+            ),
+            _chunk(
+                "config_clause",
+                "7.4.2",
+                "Fuel Gas Dew Point Configuration",
+                "The fuel gas dew point configuration shall use a duplex analyzer arrangement with automatic switchover.",
+                41,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What is the dew point configuration?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "config_clause"
+
+
+def test_hierarchical_search_prefers_exact_model_clause_over_generic_equipment_text() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_turbine",
+                "9.1",
+                "Steam Turbine",
+                "Turbine components shall comply with the applicable standards for rotating equipment.",
+                18,
+            ),
+            _chunk(
+                "selected_turbine",
+                "9.2",
+                "Selected Turbine Generator",
+                "The selected turbine model shall be Siemens SGT6-5000F for the project.",
+                19,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What is the turbine we are using?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "selected_turbine"
+
+
+def test_hierarchical_search_prefers_exact_design_conditions_clause() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_design",
+                "12.1",
+                "General Design Philosophy",
+                "Design reviews and operating conditions shall be coordinated with the project team.",
+                27,
+            ),
+            _chunk(
+                "compressor_conditions",
+                "12.4.1",
+                "Compressor Design Conditions",
+                "The compressor design conditions shall be 1250 psig discharge pressure and 105 degF inlet temperature.",
+                28,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What are the compressor design conditions?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "compressor_conditions"
 
 
 def test_deep_profile_prefers_specific_clause_over_generic_match() -> None:
