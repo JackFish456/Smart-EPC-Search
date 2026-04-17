@@ -5,7 +5,13 @@ import re
 from dataclasses import dataclass
 from typing import Sequence
 
-from epc_smart_search.query_planner import QueryPlan, has_term_overlap, plan_query
+from epc_smart_search.query_planner import (
+    ANSWER_FAMILY_GUARANTEE_OR_LIMIT,
+    QueryPlan,
+    REQUEST_SHAPE_GROUPED_LIST,
+    has_term_overlap,
+    plan_query,
+)
 from epc_smart_search.retrieval import Citation, ExactPageHit, RankedChunk
 
 
@@ -97,7 +103,15 @@ class AnswerPolicy:
         evidence_is_weak = (
             best is None
             or (best.total_score < 0.16 and best.lexical_score < 0.05)
-            or (strict_gate_active and self.requires_strict_grounding(plan) and not self.is_strong_question_match(plan, best))
+            or (
+                strict_gate_active
+                and self.requires_strict_grounding(plan)
+                and not (
+                    self.has_strong_grouped_evidence(plan, ranked, citations)
+                    if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST
+                    else self.is_strong_question_match(plan, best)
+                )
+            )
         )
         if evidence_is_weak and not deep_think:
             return AssistantAnswer("I can't verify that from the contract.", citations, True)
@@ -105,6 +119,10 @@ class AnswerPolicy:
         reference_answer = self.build_reference_answer(effective_question, ranked, citations)
         if reference_answer is not None and not summary_request and not deep_think and not expand_answer:
             return reference_answer
+
+        grouped_answer = self.build_grouped_answer(effective_question, ranked, citations)
+        if grouped_answer is not None and not summary_request and not deep_think and not expand_answer:
+            return grouped_answer
 
         compact_answer = self.build_compact_answer(effective_question, ranked, citations)
         if compact_answer is not None and not summary_request and not deep_think and not expand_answer:
@@ -412,6 +430,8 @@ class AnswerPolicy:
 
     @staticmethod
     def default_extractive_sections(plan: QueryPlan) -> int:
+        if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
+            return 2
         if (
             plan.direct_text_question
             or plan.count_question
@@ -421,6 +441,35 @@ class AnswerPolicy:
         ):
             return 1
         return 2
+
+    @classmethod
+    def build_grouped_answer(
+        cls,
+        question: str,
+        ranked: list[RankedChunk],
+        citations: list[Citation],
+    ) -> AssistantAnswer | None:
+        if not ranked:
+            return None
+        plan = plan_query(question)
+        if plan.request_shape != REQUEST_SHAPE_GROUPED_LIST:
+            return None
+        lines = cls.extract_grouped_lines(plan, ranked, citations)
+        if not lines:
+            return None
+        primary = ranked[0]
+        location_citation = next((citation for citation in citations if citation.attachment), citations[0] if citations else None)
+        if location_citation is not None:
+            label = location_citation.section_number or "Unnumbered clause"
+            heading = " ".join(location_citation.heading.split())
+            pages = cls.format_page_range(location_citation.page_start, location_citation.page_end)
+        else:
+            label = primary.section_number or "Unnumbered clause"
+            heading = " ".join(primary.heading.split())
+            pages = cls.format_page_range(primary.page_start, primary.page_end)
+        line_block = "\n".join(f"- {line}" for line in lines)
+        body = f"{line_block}\nSection {label} - {heading}\nPages: {pages}"
+        return AssistantAnswer(body, citations, False)
 
     @classmethod
     def build_compact_answer(
@@ -457,6 +506,8 @@ class AnswerPolicy:
 
     @staticmethod
     def prefers_compact_answer(plan: QueryPlan) -> bool:
+        if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
+            return False
         return bool(
             plan.attribute_label
             or plan.intent in {"definition", "responsibility"}
@@ -704,6 +755,49 @@ class AnswerPolicy:
         )
 
     @classmethod
+    def extract_grouped_lines(
+        cls,
+        plan: QueryPlan,
+        ranked: list[RankedChunk],
+        citations: list[Citation],
+        *,
+        limit: int = 6,
+    ) -> list[str]:
+        texts = [chunk.full_text for chunk in ranked[:4]]
+        texts.extend(citation.quote for citation in citations[:4] if citation.quote)
+        lines: list[str] = []
+        seen: set[str] = set()
+        for text in texts:
+            for sentence in cls.split_sentences(" ".join(str(text).split())):
+                candidate = cls.normalize_grouped_line(sentence)
+                if not candidate or candidate.lower() in seen:
+                    continue
+                if not cls.is_grouped_line_match(candidate, plan):
+                    continue
+                seen.add(candidate.lower())
+                lines.append(candidate)
+                if len(lines) >= limit:
+                    return lines
+        return lines
+
+    @staticmethod
+    def normalize_grouped_line(sentence: str) -> str:
+        cleaned = " ".join(sentence.split()).strip().strip('"')
+        return cleaned
+
+    @classmethod
+    def is_grouped_line_match(cls, sentence: str, plan: QueryPlan) -> bool:
+        lowered = sentence.lower()
+        if plan.answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT:
+            has_family_marker = bool(
+                re.search(r"\bguarantee\b|\bguarantees\b|\bshall not exceed\b|\bnot exceed\b|\blimit\b|\blimits\b", lowered)
+            )
+            has_value = bool(re.search(r"\b\d+(?:\.\d+)?\s*(?:ppmvd|ppmv|lb/hr|mg/nm3|%)\b", lowered))
+            concept_hits = sum(1 for term in plan.concept_terms if term and term in lowered)
+            return (has_family_marker or has_value) and concept_hits >= 1
+        return False
+
+    @classmethod
     def score_sentence(cls, sentence: str, plan: QueryPlan) -> float:
         normalized = sentence.lower()
         score = 0.0
@@ -711,11 +805,18 @@ class AnswerPolicy:
             score += 4.0
         if plan.system_phrase and plan.system_phrase in normalized:
             score += 2.2
+        score += 1.2 * sum(1 for term in plan.concept_terms if term in normalized)
+        score += 0.8 * sum(1 for term in plan.scope_terms if term in normalized)
         score += 1.0 * sum(1 for term in plan.system_terms if term in normalized)
         score += 1.0 * sum(1 for term in plan.attribute_terms if term in normalized)
         score += 1.5 * sum(1 for term in plan.focus_terms if term in normalized)
         score += 0.8 * sum(1 for term in plan.topic_terms + plan.action_terms if term in normalized)
         score += 0.5 * sum(1 for term in plan.actor_terms if term in normalized)
+        if plan.answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT and re.search(
+            r"\bguarantee\b|\bguarantees\b|\bshall not exceed\b|\bnot exceed\b|\blimit\b",
+            normalized,
+        ):
+            score += 1.6
         if cls.is_value_or_requirement_question(plan) and re.search(r"\d", sentence):
             score += 1.2
         if cls.is_requirement_question(plan) and re.search(r"\b(shall|must|required|responsible|obligated)\b", normalized):
@@ -797,6 +898,8 @@ class AnswerPolicy:
         normalized = plan.normalized_query
         if plan.count_question:
             return True
+        if plan.answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT:
+            return True
         if plan.attribute_label in {"design_conditions", "size", "capacity", "power", "pressure", "temperature", "flow"}:
             return True
         markers = (
@@ -828,6 +931,7 @@ class AnswerPolicy:
         normalized = plan.normalized_query
         return (
             plan.intent == "responsibility"
+            or plan.answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT
             or "required" in normalized
             or "requirement" in normalized
             or "requirements" in normalized
@@ -846,6 +950,7 @@ class AnswerPolicy:
     def requires_strict_grounding(cls, plan: QueryPlan) -> bool:
         return bool(
             plan.system_phrase
+            or plan.concept_terms
             or plan.attribute_label
             or plan.count_question
             or plan.direct_text_question
@@ -854,21 +959,42 @@ class AnswerPolicy:
         )
 
     @classmethod
+    def has_strong_grouped_evidence(
+        cls,
+        plan: QueryPlan,
+        ranked: list[RankedChunk],
+        citations: list[Citation],
+    ) -> bool:
+        if plan.request_shape != REQUEST_SHAPE_GROUPED_LIST:
+            return False
+        if any(cls.is_strong_question_match(plan, chunk) for chunk in ranked[:3]):
+            return True
+        lines = cls.extract_grouped_lines(plan, ranked[:3], citations[:3])
+        return len(lines) >= 1
+
+    @classmethod
     def is_strong_question_match(cls, plan: QueryPlan, chunk: RankedChunk) -> bool:
         minimum_score = 0.42
         if plan.attribute_label or plan.count_question or cls.is_value_or_requirement_question(plan):
             minimum_score = 0.56
+        elif plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
+            minimum_score = 0.5
         elif plan.direct_text_question or plan.system_phrase:
             minimum_score = 0.48
         if chunk.total_score < minimum_score and cls.requires_strict_grounding(plan):
             return False
         combined = " ".join([chunk.heading, chunk.full_text])
         focus_hits = sum(1 for term in plan.focus_terms if has_term_overlap(combined, (term,)))
+        concept_hits = sum(1 for term in plan.concept_terms if has_term_overlap(combined, (term,)))
         if plan.direct_text_question and len(plan.focus_terms) >= 2 and focus_hits < min(2, len(plan.focus_terms)):
+            return False
+        if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST and concept_hits < max(1, min(len(plan.concept_terms), 2)):
             return False
         if plan.system_phrase and not cls.matches_system(plan, combined):
             return False
         if (plan.attribute_label or plan.count_question) and not cls.matches_attribute(plan, combined):
+            return False
+        if plan.scope_terms and not cls.matches_scope(plan, combined):
             return False
         if plan.intent == "definition" and not re.search(r"\bmeans\b|\bdefined as\b|\bdefinition\b", combined, re.IGNORECASE):
             return False
@@ -896,6 +1022,12 @@ class AnswerPolicy:
             hits = sum(1 for term in plan.system_terms if has_term_overlap(text, (term,)))
             return hits >= max(1, min(len(plan.system_terms), 2))
         return False
+
+    @staticmethod
+    def matches_scope(plan: QueryPlan, text: str) -> bool:
+        if not plan.scope_terms:
+            return True
+        return any(has_term_overlap(text, (term,)) for term in plan.scope_terms)
 
     @staticmethod
     def matches_attribute(plan: QueryPlan, text: str) -> bool:
@@ -943,7 +1075,11 @@ class AnswerPolicy:
             candidates.append(plan.system_phrase)
         if plan.content_query:
             candidates.append(plan.content_query)
+        if plan.concept_terms:
+            candidates.append(" ".join(plan.concept_terms[:4]))
         candidates.extend(cls.focus_phrases(plan.focus_terms))
+        candidates.extend(plan.scope_terms)
+        candidates.extend(plan.concept_terms)
         candidates.extend(plan.system_aliases)
         candidates.extend(plan.attribute_terms)
         candidates.extend(plan.focus_terms)
@@ -987,7 +1123,11 @@ class AnswerPolicy:
         focus_candidates: list[str] = []
         if plan.content_query:
             focus_candidates.append(plan.content_query)
+        if plan.concept_terms:
+            focus_candidates.append(" ".join(plan.concept_terms[:4]))
         focus_candidates.extend(AnswerPolicy.focus_phrases(plan.focus_terms))
+        focus_candidates.extend(plan.scope_terms)
+        focus_candidates.extend(plan.concept_terms)
         focus_candidates.extend(plan.focus_terms)
         focus_candidates.extend(plan.topic_terms + plan.action_terms)
         if focus_candidates and not any(candidate and candidate in combined for candidate in focus_candidates):

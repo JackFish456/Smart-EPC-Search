@@ -25,6 +25,7 @@ ACTOR_LEXICON: dict[str, tuple[str, ...]] = {
 ACTION_LEXICON: dict[str, tuple[str, ...]] = {
     "permit": ("permit", "permits", "permitting", "approval", "approvals", "license", "licenses", "consent"),
     "pay": ("pay", "pays", "payment", "payments", "compensate", "compensation", "cost", "costs"),
+    "guarantee": ("guarantee", "guarantees", "guaranteed", "warrant", "warrants"),
     "terminate": ("terminate", "termination", "end", "cancel", "convenience", "default"),
     "delay": ("delay", "delays", "late", "lateness", "slip", "slippage"),
     "schedule": ("schedule", "milestone", "milestones", "completion", "substantial completion"),
@@ -37,6 +38,8 @@ ACTION_LEXICON: dict[str, tuple[str, ...]] = {
 TOPIC_LEXICON: dict[str, tuple[str, ...]] = {
     "permitting": ("permit", "permits", "permitting", "approval", "approvals", "license", "licenses"),
     "liquidated damages": ("liquidated damages", "late substantial completion", "delay damages", "late completion"),
+    "guarantees": ("guarantee", "guarantees", "guaranteed", "performance guarantee", "emission guarantees", "limit", "limits"),
+    "emissions": ("emission", "emissions", "nox", "co", "ppmvd", "oxygen"),
     "termination": ("termination", "terminate", "convenience", "default"),
     "weather": ("weather", "severe weather", "adverse weather"),
     "delay": ("delay", "delays", "late", "lateness", "schedule", "completion"),
@@ -48,6 +51,8 @@ TOPIC_LEXICON: dict[str, tuple[str, ...]] = {
 QUERY_EXPANSIONS: dict[str, tuple[str, ...]] = {
     "responsible for": ("responsible", "obligation", "obligations", "shall", "must", "required"),
     "who is responsible": ("responsible", "obligation", "shall", "must"),
+    "emission guarantees": ("guarantee", "guarantees", "emissions", "shall not exceed", "ppmvd", "nox", "co"),
+    "emission guarantee": ("guarantee", "guarantees", "emissions", "shall not exceed", "ppmvd", "nox", "co"),
     "finishes late": ("delay", "delays", "late substantial completion", "liquidated damages"),
     "end the contract": ("terminate", "termination", "convenience", "default"),
     "weather delays": ("weather", "severe weather", "delay", "schedule"),

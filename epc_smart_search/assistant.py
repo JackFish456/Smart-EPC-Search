@@ -1,29 +1,36 @@
 from __future__ import annotations
 
 import atexit
-import html
+import re
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from typing import Sequence
 
 import requests
 
-from epc_smart_search.answer_policy import (
-    AssistantAnswer as PolicyAssistantAnswer,
-    AnswerPolicy,
-)
+from epc_smart_search import answer_policy as answer_policy_module
+from epc_smart_search.answer_policy import AnswerPolicy
 from epc_smart_search.app_paths import DB_PATH, GEMMA_TEST_PYTHON, WORKSPACE_ROOT, seed_preloaded_db
 from epc_smart_search.config import GEMMA_SERVICE_HOST, GEMMA_SERVICE_PORT, SEARCH_SCHEMA_VERSION
 from epc_smart_search.gemma_client import GemmaServiceClient as ManagedGemmaServiceClient
-from epc_smart_search.query_planner import QueryPlan, plan_query
+from epc_smart_search.query_planner import QueryPlan
 from epc_smart_search.retrieval import Citation, ExactPageHit, HashingEmbedder, HybridRetriever, RankedChunk
 from epc_smart_search.storage import ContractStore
 
 
-AssistantAnswer = PolicyAssistantAnswer
+AssistantAnswer = answer_policy_module.AssistantAnswer
+SUMMARY_MAX_NEW_TOKENS = answer_policy_module.SUMMARY_MAX_NEW_TOKENS
+SUMMARY_ENABLE_THINKING = answer_policy_module.SUMMARY_ENABLE_THINKING
+SUMMARY_CONTEXT_MAX_SECTIONS = answer_policy_module.SUMMARY_CONTEXT_MAX_SECTIONS
+SUMMARY_EXCERPT_LIMIT = answer_policy_module.SUMMARY_EXCERPT_LIMIT
+EXPAND_MAX_NEW_TOKENS = answer_policy_module.EXPAND_MAX_NEW_TOKENS
+DEEP_MAX_NEW_TOKENS = answer_policy_module.DEEP_MAX_NEW_TOKENS
+DEEP_ENABLE_THINKING = answer_policy_module.DEEP_ENABLE_THINKING
+DEEP_CONTEXT_MAX_SECTIONS = answer_policy_module.DEEP_CONTEXT_MAX_SECTIONS
+DEEP_CONTEXT_EXACT_HITS = answer_policy_module.DEEP_CONTEXT_EXACT_HITS
+DEEP_PAGE_CONTEXT_SECTIONS = answer_policy_module.DEEP_PAGE_CONTEXT_SECTIONS
 
 
 @dataclass(slots=True)
@@ -35,16 +42,6 @@ class IndexValidationResult:
     feature_count: int = 0
 
 
-SUMMARY_MAX_NEW_TOKENS = 224
-SUMMARY_ENABLE_THINKING = False
-SUMMARY_CONTEXT_MAX_SECTIONS = 6
-SUMMARY_EXCERPT_LIMIT = 760
-DEEP_MAX_NEW_TOKENS = 384
-DEEP_ENABLE_THINKING = True
-DEEP_CONTEXT_MAX_SECTIONS = 8
-DEEP_CONTEXT_EXACT_HITS = 3
-DEEP_PAGE_CONTEXT_SECTIONS = 2
-DEEP_EXCERPT_LIMIT = 920
 INTERNAL_REBUILD_ERROR = "Contract rebuild is available only through the internal rebuild tool."
 
 
@@ -160,7 +157,7 @@ class ContractAssistant:
     def _get_answer_policy(self) -> AnswerPolicy:
         policy = getattr(self, "answer_policy", None)
         if policy is None:
-            policy = AnswerPolicy(getattr(self, "store", None), self.retriever)
+            policy = AnswerPolicy(getattr(self, "store", None), getattr(self, "retriever", None))
             self.answer_policy = policy
         return policy
 
@@ -193,203 +190,50 @@ class ContractAssistant:
 
     @classmethod
     def _resolve_question(cls, question: str, history: Sequence[dict[str, str]] | None = None) -> str:
-        if not history:
-            return question
-        normalized = " ".join(question.lower().split())
-        plan = plan_query(question)
-        if not cls._looks_like_follow_up(question, plan):
-            return question
-        anchor = cls._find_follow_up_anchor(history)
-        if not anchor:
-            return question
-        normalized_anchor = " ".join(anchor.lower().split())
-        if normalized_anchor and normalized_anchor in normalized:
-            return question
-        stem = question.rstrip(" ?.!")
-        if normalized.startswith(("what section", "which section")):
-            return f"what section talks about {anchor}"
-        if normalized.startswith(("what page", "which page")):
-            return f"which page mentions {anchor}"
-        if normalized.startswith(("quote that", "show me that")):
-            return f"show me {anchor}"
-        if normalized.startswith(("where ", "who ", "when ", "how many ", "how much ")):
-            return f"{stem} for {anchor}"
-        return f"{stem} regarding {anchor}"
+        return AnswerPolicy.resolve_question(question, history)
 
     @classmethod
     def _find_follow_up_anchor(cls, history: Sequence[dict[str, str]]) -> str:
-        for turn in reversed(history):
-            if str(turn.get("role", "")).strip() != "user":
-                continue
-            content = str(turn.get("content", "")).strip()
-            if not content:
-                continue
-            plan = plan_query(content)
-            if cls._looks_like_follow_up(content, plan):
-                continue
-            anchor = re.sub(r"^(summari[sz]e|explain)\s+", "", plan.content_query.strip(" ?.!"), flags=re.IGNORECASE)
-            anchor = re.sub(r"\s+in plain english$", "", anchor, flags=re.IGNORECASE)
-            if anchor:
-                return anchor
-        return ""
+        return AnswerPolicy.find_follow_up_anchor(history)
 
     @staticmethod
     def _looks_like_follow_up(question: str, plan: QueryPlan) -> bool:
-        normalized = " ".join(question.lower().split())
-        if not normalized:
-            return False
-        follow_up_prefixes = (
-            "what about",
-            "how about",
-            "what section",
-            "which section",
-            "what page",
-            "which page",
-            "where ",
-            "when ",
-            "who ",
-            "quote that",
-            "show me that",
-            "does it ",
-            "is it ",
-            "is that ",
-            "are those ",
-            "and ",
-            "also ",
-        )
-        referential_terms = (
-            " it ",
-            " that ",
-            " this ",
-            " these ",
-            " those ",
-            " they ",
-            " them ",
-            " same ",
-        )
-        wrapped = f" {normalized} "
-        has_referential_term = any(term in wrapped for term in referential_terms)
-        if plan.section_number:
-            return False
-        if normalized.startswith(follow_up_prefixes):
-            return True
-        if has_referential_term and (
-            not plan.focus_terms or (len(plan.focus_terms) == 1 and plan.focus_terms[0] in {"section", "page"})
-        ):
-            return True
-        if len(plan.focus_terms) >= 2 or len(plan.content_query.split()) >= 4:
-            return False
-        return has_referential_term
+        return AnswerPolicy.looks_like_follow_up(question, plan)
 
     def _build_exact_answer(self, question: str, hits: list[ExactPageHit]) -> AssistantAnswer | None:
-        if not hits:
-            return None
-        lowered = " ".join(question.lower().split())
-        if not self._prefer_exact_answer(lowered):
-            return None
-        excerpts = []
-        for hit in hits[:4]:
-            excerpts.append(f"Page {hit.page_num}: {self._trim_page_excerpt(hit.page_text, lowered)}")
-        if self._is_count_question(lowered):
-            quantity = self._extract_count_value(lowered, hits)
-            if quantity is not None:
-                body = (
-                    f"Answer: {quantity}\n\n"
-                    "Direct contract text:\n"
-                    + "\n\n".join(excerpts)
-                )
-                return AssistantAnswer(body, [], False)
-        body = "Direct contract text:\n" + "\n\n".join(excerpts)
-        return AssistantAnswer(body, [], False)
+        return AnswerPolicy(getattr(self, "store", None), getattr(self, "retriever", None)).build_exact_answer(question, hits)
 
     @staticmethod
     def _is_count_question(question: str) -> bool:
-        return question.startswith("how many ")
+        return AnswerPolicy.is_count_question(question)
 
     @staticmethod
     def _prefer_exact_answer(question: str) -> bool:
-        prefixes = (
-            "how many ",
-            "show me ",
-            "find ",
-            "quote ",
-            "where does ",
-            "which page ",
-        )
-        return question.startswith(prefixes)
+        return AnswerPolicy.prefer_exact_answer(question)
 
     @staticmethod
     def _reference_lookup_kind(question: str) -> str | None:
-        normalized = " ".join(question.lower().split())
-        if normalized.startswith(("what section", "which section")):
-            return "section"
-        if normalized.startswith(("what page", "which page")):
-            return "page"
-        return None
+        return AnswerPolicy.reference_lookup_kind(question)
 
     @staticmethod
     def _count_exact_items(question: str, hits: list[ExactPageHit]) -> int | None:
-        item_phrase = question.removeprefix("how many ").strip(" ?.")
-        if item_phrase.endswith("s"):
-            item_phrase = item_phrase[:-1]
-        if not item_phrase:
-            return None
-        seen_numbers: set[str] = set()
-        pattern = re.compile(rf"{re.escape(item_phrase)}\s+(\d+)", re.IGNORECASE)
-        for hit in hits:
-            for match in pattern.finditer(hit.page_text):
-                seen_numbers.add(match.group(1))
-        if seen_numbers:
-            return len(seen_numbers)
-        return None
+        return AnswerPolicy.count_exact_items(question, hits)
 
     @classmethod
     def _extract_count_value(cls, question: str, hits: list[ExactPageHit]) -> str | None:
-        item_phrase = cls._count_item_phrase(question)
-        if not item_phrase:
-            return None
-        patterns = cls._count_value_patterns(item_phrase)
-        for hit in hits:
-            compact = " ".join(hit.page_text.split())
-            for pattern in patterns:
-                match = pattern.search(compact)
-                if match:
-                    return " ".join(match.group(1).split())
-        count = cls._count_exact_items(question, hits)
-        return str(count) if count is not None else None
+        return AnswerPolicy.extract_count_value(question, hits)
 
     @staticmethod
     def _count_item_phrase(question: str) -> str:
-        item_phrase = question.removeprefix("how many ").strip(" ?.")
-        item_phrase = re.sub(r"\b(do we have|do we use|are there|is there|do we need|do we require)$", "", item_phrase).strip()
-        return item_phrase
+        return AnswerPolicy.count_item_phrase(question)
 
     @staticmethod
     def _count_value_patterns(item_phrase: str) -> list[re.Pattern[str]]:
-        phrase = re.escape(item_phrase)
-        singular = re.escape(item_phrase[:-1]) if item_phrase.endswith("s") and len(item_phrase) > 4 else phrase
-        return [
-            re.compile(rf"((?:\w+\s+)?\(?\d+\)?\s*x\s*\d+%[^.]*?{phrase})", re.IGNORECASE),
-            re.compile(rf"((?:\w+\s+)?\(?\d+\)?\s*x\s*\d+%[^.]*?{singular})", re.IGNORECASE),
-            re.compile(rf"((?:one|two|three|four|five|six|seven|eight|nine|ten|\(?\d+\)?)[^.]*?{phrase})", re.IGNORECASE),
-            re.compile(rf"((?:one|two|three|four|five|six|seven|eight|nine|ten|\(?\d+\)?)[^.]*?{singular})", re.IGNORECASE),
-            re.compile(rf"({phrase}[^.]*?\(?\d+\)?\s*x\s*\d+%)", re.IGNORECASE),
-            re.compile(rf"({singular}[^.]*?\(?\d+\)?\s*x\s*\d+%)", re.IGNORECASE),
-        ]
+        return AnswerPolicy.count_value_patterns(item_phrase)
 
     @staticmethod
     def _trim_page_excerpt(page_text: str, question: str, limit: int = 700) -> str:
-        compact = " ".join(page_text.split())
-        term = question.removeprefix("how many ").strip(" ?.")
-        if term.endswith("s"):
-            term = term[:-1]
-        needle = term.lower()
-        idx = compact.lower().find(needle)
-        if idx < 0:
-            idx = 0
-        start = max(0, idx - 120)
-        excerpt = compact[start:start + limit]
-        return excerpt if len(excerpt) < len(compact) else compact[:limit]
+        return AnswerPolicy.trim_page_excerpt(page_text, question, limit=limit)
 
     @classmethod
     def _build_reference_answer(
@@ -398,41 +242,11 @@ class ContractAssistant:
         ranked: list[RankedChunk],
         citations: list[Citation],
     ) -> AssistantAnswer | None:
-        lookup_kind = cls._reference_lookup_kind(question)
-        if lookup_kind is None or not ranked:
-            return None
-        plan = plan_query(question)
-        for chunk in ranked:
-            if "...." in chunk.heading:
-                continue
-            excerpt = cls._extract_ranked_excerpt(chunk.full_text, plan, limit=520)
-            if not excerpt:
-                continue
-            label = chunk.section_number or "Unnumbered clause"
-            pages = cls._format_page_range(chunk.page_start, chunk.page_end)
-            heading = " ".join(chunk.heading.split())
-            intro = "Most relevant section:" if lookup_kind == "section" else "Most relevant pages:"
-            body = (
-                f"Section {label} - {heading}\n"
-                f"Pages: {pages}\n"
-                f"Contract text: {excerpt}"
-            )
-            return AssistantAnswer(f"{intro}\n\n{body}", citations, False)
-        return None
+        return AnswerPolicy.build_reference_answer(question, ranked, citations)
 
     @staticmethod
     def _limit_citations(citations: list[Citation], limit: int = 3) -> list[Citation]:
-        limited: list[Citation] = []
-        seen_pages: set[int] = set()
-        for citation in citations:
-            pages = range(citation.page_start, citation.page_end + 1)
-            if all(page in seen_pages for page in pages):
-                continue
-            limited.append(citation)
-            seen_pages.update(pages)
-            if len(limited) >= limit:
-                break
-        return limited
+        return AnswerPolicy.limit_citations(citations, limit=limit)
 
     @classmethod
     def _build_extractive_answer(
@@ -443,62 +257,27 @@ class ContractAssistant:
         *,
         max_sections: int | None = None,
     ) -> AssistantAnswer | None:
-        if not ranked:
-            return None
-        plan = plan_query(question)
-        active_max_sections = cls._default_extractive_sections(plan) if max_sections is None else max_sections
-        blocks: list[str] = []
-        seen_keys: set[tuple[str | None, int, int]] = set()
-        excerpt_limit = 900 if cls._is_value_or_requirement_question(plan) else 650
-        for chunk in ranked:
-            key = (chunk.section_number, chunk.page_start, chunk.page_end)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            excerpt = cls._extract_ranked_excerpt(chunk.full_text, plan, limit=excerpt_limit)
-            if not excerpt or not cls._is_useful_extractive_block(chunk.heading, excerpt, plan):
-                continue
-            label = chunk.section_number or "Unnumbered clause"
-            pages = cls._format_page_range(chunk.page_start, chunk.page_end)
-            heading = " ".join(chunk.heading.split())
-            blocks.append(
-                f"Section {label} - {heading}\n"
-                f"Pages: {pages}\n"
-                f"Contract text: {excerpt}"
-            )
-            if len(blocks) >= active_max_sections:
-                break
-        if not blocks:
-            return None
-        return AssistantAnswer("\n\n".join(blocks), citations, False)
+        return AnswerPolicy.build_extractive_answer(question, ranked, citations, max_sections=max_sections)
 
     @staticmethod
     def _default_extractive_sections(plan: QueryPlan) -> int:
-        if (
-            plan.direct_text_question
-            or plan.count_question
-            or plan.system_phrase
-            or plan.attribute_label is not None
-            or ContractAssistant._is_value_or_requirement_question(plan)
-        ):
-            return 1
-        return 2
+        return AnswerPolicy.default_extractive_sections(plan)
+
+    def _build_compact_answer(
+        self,
+        question: str,
+        ranked: list[RankedChunk],
+        citations: list[Citation],
+    ) -> AssistantAnswer | None:
+        return AnswerPolicy(getattr(self, "store", None), getattr(self, "retriever", None)).build_compact_answer(
+            question,
+            ranked,
+            citations,
+        )
 
     @staticmethod
     def _prefers_generated_answer(question: str) -> bool:
-        normalized = " ".join(question.lower().split())
-        explicit_prefixes = (
-            "summarize ",
-            "summarise ",
-            "explain ",
-        )
-        explicit_phrases = (
-            " summarize ",
-            " summarise ",
-            " explain ",
-        )
-        wrapped = f" {normalized} "
-        return normalized.startswith(explicit_prefixes) or any(phrase in wrapped for phrase in explicit_phrases)
+        return AnswerPolicy.prefers_generated_answer(question)
 
     @classmethod
     def _build_summary_prompt_context(
@@ -508,36 +287,18 @@ class ContractAssistant:
         *,
         max_sections: int = SUMMARY_CONTEXT_MAX_SECTIONS,
     ) -> str:
-        if not ranked:
-            return ""
-        plan = plan_query(question)
-        blocks: list[str] = []
-        seen: set[tuple[str | None, int, int]] = set()
-        for chunk in ranked:
-            key = (chunk.section_number, chunk.page_start, chunk.page_end)
-            if key in seen:
-                continue
-            seen.add(key)
-            excerpt = cls._extract_ranked_excerpt(
-                chunk.full_text,
-                plan,
-                limit=SUMMARY_EXCERPT_LIMIT,
-                surrounding_sentences=1,
-            )
-            if not excerpt or not cls._is_useful_summary_block(chunk, excerpt, plan):
-                continue
-            label = html.escape(chunk.section_number or "Unnumbered clause")
-            heading = html.escape(" ".join(chunk.heading.split()))
-            pages = html.escape(cls._format_page_range(chunk.page_start, chunk.page_end))
-            blocks.append(
-                f"Section: {label}\n"
-                f"Heading: {heading}\n"
-                f"Pages: {pages}\n"
-                f"Excerpt: {excerpt}"
-            )
-            if len(blocks) >= max_sections:
-                break
-        return "\n\n".join(blocks)
+        return AnswerPolicy.build_summary_prompt_context(question, ranked, max_sections=max_sections)
+
+    @classmethod
+    def _build_expand_prompt_context(
+        cls,
+        question: str,
+        ranked: list[RankedChunk],
+        previous_answer: str | None,
+        *,
+        max_sections: int = SUMMARY_CONTEXT_MAX_SECTIONS,
+    ) -> str:
+        return AnswerPolicy.build_expand_prompt_context(question, ranked, previous_answer, max_sections=max_sections)
 
     def _build_deep_prompt_context(
         self,
@@ -545,75 +306,26 @@ class ContractAssistant:
         ranked: list[RankedChunk],
         exact_hits: list[ExactPageHit],
     ) -> str:
-        sections: list[str] = []
-        ranked_blocks = self._build_summary_prompt_context(
+        return AnswerPolicy(getattr(self, "store", None), getattr(self, "retriever", None)).build_deep_prompt_context(
             question,
             ranked,
-            max_sections=DEEP_CONTEXT_MAX_SECTIONS,
+            exact_hits,
         )
-        if ranked_blocks:
-            sections.append("Ranked contract sections:\n" + ranked_blocks)
-
-        exact_blocks = self._build_exact_hit_prompt_context(question, exact_hits)
-        if exact_blocks:
-            sections.append("Exact page hits:\n" + exact_blocks)
-
-        page_context = self._build_deep_page_context(ranked)
-        if page_context:
-            sections.append("Nearby page context:\n" + page_context)
-
-        return "\n\n".join(section for section in sections if section).strip()
 
     @classmethod
     def _build_exact_hit_prompt_context(cls, question: str, exact_hits: list[ExactPageHit]) -> str:
-        lowered = " ".join(question.lower().split())
-        blocks: list[str] = []
-        for hit in exact_hits[:DEEP_CONTEXT_EXACT_HITS]:
-            excerpt = cls._trim_page_excerpt(hit.page_text, lowered)
-            blocks.append(f"Page {hit.page_num}: {cls._quote_excerpt(excerpt)}")
-        return "\n\n".join(blocks)
+        return AnswerPolicy.build_exact_hit_prompt_context(question, exact_hits)
 
     def _build_deep_page_context(self, ranked: list[RankedChunk]) -> str:
-        document_id = self.retriever.resolve_document_id()
-        if not document_id or not ranked:
-            return ""
-        seen_pages: set[tuple[int, int]] = set()
-        blocks: list[str] = []
-        for chunk in ranked:
-            page_key = (chunk.page_start, chunk.page_end)
-            if page_key in seen_pages:
-                continue
-            seen_pages.add(page_key)
-            label = chunk.section_number or "Unnumbered clause"
-            heading = " ".join(chunk.heading.split())
-            rows = self.store.fetch_page_window(
-                document_id,
-                chunk.page_start,
-                chunk.page_end,
-                padding=0,
-                limit=2,
-            )
-            if not rows:
-                continue
-            page_lines = [
-                f"Page {int(row['page_num'])}: {self._quote_excerpt(self._truncate_text(str(row['page_text']), limit=500))}"
-                for row in rows
-            ]
-            blocks.append(f"Section {label} - {heading}\n" + "\n".join(page_lines))
-            if len(blocks) >= DEEP_PAGE_CONTEXT_SECTIONS:
-                break
-        return "\n\n".join(blocks)
+        return AnswerPolicy(getattr(self, "store", None), getattr(self, "retriever", None)).build_deep_page_context(ranked)
 
     @staticmethod
     def _format_page_range(page_start: int, page_end: int) -> str:
-        if page_start == page_end:
-            return f"{page_start}"
-        return f"{page_start}-{page_end}"
+        return AnswerPolicy.format_page_range(page_start, page_end)
 
     @staticmethod
     def _truncate_text(text: str, limit: int = 340) -> str:
-        compact = " ".join(text.split())
-        return compact if len(compact) <= limit else compact[: limit - 3] + "..."
+        return AnswerPolicy.truncate_text(text, limit=limit)
 
     @classmethod
     def _extract_ranked_excerpt(
@@ -624,336 +336,45 @@ class ContractAssistant:
         limit: int = 650,
         surrounding_sentences: int = 0,
     ) -> str:
-        compact = " ".join(text.split())
-        if not compact:
-            return ""
-        attribute_excerpt = cls._extract_attribute_excerpt(compact, plan, limit=limit)
-        if attribute_excerpt:
-            return cls._quote_excerpt(attribute_excerpt)
-        term_window = cls._extract_term_window(compact, plan, limit=limit)
-        if term_window:
-            return cls._quote_excerpt(term_window)
-        sentences = cls._split_sentences(compact)
-        if not sentences:
-            return cls._quote_excerpt(compact[:limit].rstrip())
-        scored: list[tuple[float, int]] = []
-        for index, sentence in enumerate(sentences):
-            score = cls._score_sentence(sentence, plan)
-            scored.append((score, index))
-        scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-        best_index = scored[0][1]
-        selected_indices = {best_index}
-        if cls._is_value_or_requirement_question(plan):
-            if best_index + 1 < len(sentences):
-                selected_indices.add(best_index + 1)
-            elif best_index > 0:
-                selected_indices.add(best_index - 1)
-        for offset in range(1, surrounding_sentences + 1):
-            if best_index - offset >= 0:
-                selected_indices.add(best_index - offset)
-            if best_index + offset < len(sentences):
-                selected_indices.add(best_index + offset)
-        selected = [sentences[index] for index in sorted(selected_indices)]
-        excerpt = " ".join(selected).strip()
-        if len(excerpt) < min(180, limit) and len(sentences) > 1:
-            if best_index > 0:
-                excerpt = f"{sentences[best_index - 1]} {excerpt}".strip()
-            if len(excerpt) < limit and best_index + 1 < len(sentences):
-                excerpt = f"{excerpt} {sentences[best_index + 1]}".strip()
-        if len(excerpt) > limit:
-            excerpt = excerpt[: limit - 3].rstrip() + "..."
-        return cls._quote_excerpt(excerpt)
-
-    @classmethod
-    def _extract_attribute_excerpt(cls, text: str, plan: QueryPlan, *, limit: int) -> str:
-        if not plan.attribute_label and not plan.system_phrase:
-            return ""
-        sentences = cls._split_sentences(text)
-        if not sentences:
-            return ""
-        scored = [(cls._score_attribute_sentence(sentence, plan), index) for index, sentence in enumerate(sentences)]
-        scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-        best_score, best_index = scored[0]
-        if best_score < 1.4:
-            return ""
-        selected_indices = {best_index}
-        label = plan.attribute_label or ""
-        if label in {"design_conditions", "function"}:
-            selected_indices.update(cls._expand_related_sentences(sentences, best_index, plan, limit=2))
-        elif label in {"configuration", "type", "size", "capacity", "pressure", "temperature", "flow"}:
-            if best_index + 1 < len(sentences) and cls._score_attribute_sentence(sentences[best_index + 1], plan) >= 1.0:
-                selected_indices.add(best_index + 1)
-        excerpt = " ".join(sentences[index] for index in sorted(selected_indices)).strip()
-        if len(excerpt) > limit:
-            excerpt = excerpt[: limit - 3].rstrip() + "..."
-        return excerpt
-
-    @staticmethod
-    def _split_sentences(text: str) -> list[str]:
-        pieces = re.split(r"(?<=[.!?;:])\s+|\s{2,}", text)
-        return [piece.strip() for piece in pieces if piece.strip()]
-
-    @classmethod
-    def _score_sentence(cls, sentence: str, plan: QueryPlan) -> float:
-        normalized = sentence.lower()
-        score = 0.0
-        if plan.content_query and plan.content_query in normalized:
-            score += 4.0
-        if plan.system_phrase and plan.system_phrase in normalized:
-            score += 2.2
-        score += 1.0 * sum(1 for term in plan.system_terms if term in normalized)
-        score += 1.0 * sum(1 for term in plan.attribute_terms if term in normalized)
-        score += 1.5 * sum(1 for term in plan.focus_terms if term in normalized)
-        score += 0.8 * sum(1 for term in plan.topic_terms + plan.action_terms if term in normalized)
-        score += 0.5 * sum(1 for term in plan.actor_terms if term in normalized)
-        if cls._is_value_or_requirement_question(plan) and re.search(r"\d", sentence):
-            score += 1.2
-        if cls._is_requirement_question(plan) and re.search(r"\b(shall|must|required|responsible|obligated)\b", normalized):
-            score += 1.1
-        if sentence.count("....") >= 2:
-            score -= 2.0
-        return score
-
-    @classmethod
-    def _score_attribute_sentence(cls, sentence: str, plan: QueryPlan) -> float:
-        normalized = sentence.lower()
-        score = cls._score_sentence(sentence, plan)
-        label = plan.attribute_label or ""
-        if label == "design_conditions":
-            if re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", normalized):
-                score += 2.4
-            score += min(2.0, cls._numeric_value_count(sentence) * 0.4)
-        elif label == "configuration":
-            if re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b|\bduplex\b|\bredun", normalized):
-                score += 2.1
-        elif label == "type":
-            if re.search(r"\bmodel\b|\btype\b|\bselected\b|\bvendor\b|\bmanufacturer\b|\buse\b|\busing\b", normalized):
-                score += 2.2
-            if re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b", sentence):
-                score += 2.0
-        elif label == "size":
-            if re.search(r"\bsize\b|\bdiameter\b|\brating\b|\b(?:inch|inches|mm|ft)\b", normalized):
-                score += 2.0
-            score += min(1.6, cls._numeric_value_count(sentence) * 0.35)
-        elif label == "power":
-            score += min(1.8, cls._numeric_value_count(sentence) * 0.35)
-            if re.search(r"\bhorse\s*power\b|\bhp\b|\bkw\b|\bkilowatt", normalized):
-                score += 1.8
-        elif label in {"capacity", "pressure", "temperature", "flow"}:
-            score += min(1.8, cls._numeric_value_count(sentence) * 0.35)
-            if any(term in normalized for term in plan.attribute_terms):
-                score += 1.6
-        elif label == "responsibility":
-            if re.search(r"\b(shall|must|required|responsible|provide|furnish|supply|perform|deliver)\b", normalized):
-                score += 2.0
-        elif label == "function":
-            if re.search(r"\b(receives|supplies|provides|distributes|conditions|transports|serves|used to|operates)\b", normalized):
-                score += 2.0
-        return score
-
-    @classmethod
-    def _expand_related_sentences(
-        cls,
-        sentences: list[str],
-        anchor_index: int,
-        plan: QueryPlan,
-        *,
-        limit: int = 2,
-    ) -> set[int]:
-        selected: set[int] = set()
-        for offset in range(1, limit + 1):
-            next_index = anchor_index + offset
-            if next_index < len(sentences) and cls._score_attribute_sentence(sentences[next_index], plan) >= 1.0:
-                selected.add(next_index)
-            prev_index = anchor_index - offset
-            if prev_index >= 0 and cls._score_attribute_sentence(sentences[prev_index], plan) >= 1.0:
-                selected.add(prev_index)
-        return selected
-
-    @staticmethod
-    def _numeric_value_count(text: str) -> int:
-        pattern = r"\b\d+(?:\.\d+)?\s*(?:psi|psig|psia|degf|deg c|gpm|lb/hr|scfm|mw|mva|hp|%|inch|inches|mm|ft)?\b"
-        return len(re.findall(pattern, text, re.IGNORECASE))
+        return AnswerPolicy.extract_ranked_excerpt(
+            text,
+            plan,
+            limit=limit,
+            surrounding_sentences=surrounding_sentences,
+        )
 
     @staticmethod
     def _is_value_or_requirement_question(plan: QueryPlan) -> bool:
-        return ContractAssistant._is_value_question(plan) or ContractAssistant._is_requirement_question(plan)
+        return AnswerPolicy.is_value_or_requirement_question(plan)
 
     @staticmethod
     def _is_value_question(plan: QueryPlan) -> bool:
-        normalized = plan.normalized_query
-        if plan.attribute_label in {"design_conditions", "size", "capacity", "power", "pressure", "temperature", "flow"}:
-            return True
-        markers = (
-            "how much",
-            "amount",
-            "price",
-            "cost",
-            "payment",
-            "payments",
-            "damages",
-            "rate",
-            "percent",
-            "percentage",
-            "days",
-            "hours",
-            "deadline",
-            "value",
-            "values",
-            "mw",
-            "kw",
-            "psi",
-            "voltage",
-            "temperature",
-        )
-        return any(marker in normalized for marker in markers)
+        return AnswerPolicy.is_value_question(plan)
 
     @staticmethod
     def _is_requirement_question(plan: QueryPlan) -> bool:
-        normalized = plan.normalized_query
-        return (
-            plan.intent == "responsibility"
-            or "required" in normalized
-            or "requirement" in normalized
-            or "requirements" in normalized
-            or "shall" in normalized
-            or "must" in normalized
-            or "responsible" in normalized
-            or "obligation" in normalized
-        )
+        return AnswerPolicy.is_requirement_question(plan)
 
     @staticmethod
     def _quote_excerpt(text: str) -> str:
-        cleaned = " ".join(text.split()).strip()
-        if not cleaned:
-            return ""
-        return f'"{cleaned}"'
+        return AnswerPolicy.quote_excerpt(text)
 
     @classmethod
     def _extract_term_window(cls, text: str, plan: QueryPlan, *, limit: int) -> str:
-        lowered = text.lower()
-        candidates: list[str] = []
-        if plan.system_phrase and plan.attribute_terms:
-            candidates.append(f"{plan.system_phrase} {plan.attribute_terms[0]}")
-        if plan.system_phrase:
-            candidates.append(plan.system_phrase)
-        if plan.content_query:
-            candidates.append(plan.content_query)
-        candidates.extend(cls._focus_phrases(plan.focus_terms))
-        candidates.extend(plan.system_aliases)
-        candidates.extend(plan.attribute_terms)
-        candidates.extend(plan.focus_terms)
-        candidates.extend(plan.topic_terms + plan.action_terms)
-        seen: set[str] = set()
-        for candidate in candidates:
-            needle = candidate.lower().strip()
-            if not needle or needle in seen:
-                continue
-            seen.add(needle)
-            index = lowered.find(needle)
-            if index < 0:
-                continue
-            start = max(0, index - 140)
-            end = min(len(text), index + max(limit - 140, len(needle) + 220))
-            window = text[start:end].strip()
-            if start > 0:
-                first_space = window.find(" ")
-                if first_space > 0:
-                    window = window[first_space + 1 :].strip()
-            if len(window) > limit:
-                window = window[: limit - 3].rstrip() + "..."
-            return window
-        return ""
+        return AnswerPolicy.extract_term_window(text, plan, limit=limit)
 
     @staticmethod
     def _is_useful_extractive_block(heading: str, excerpt: str, plan: QueryPlan) -> bool:
-        normalized_heading = " ".join(heading.lower().split())
-        cleaned = excerpt.strip().strip('"').strip()
-        if not cleaned or len(cleaned) < 35:
-            return False
-        if "...." in heading:
-            return False
-        if normalized_heading in {"front matter"}:
-            return False
-        if re.fullmatch(r"[A-Za-z0-9.()\- ]{1,24}", cleaned):
-            return False
-        if cleaned.lower().startswith("section ") and "agreement" in cleaned.lower() and len(cleaned) < 90:
-            return False
-        combined = f"{normalized_heading} {cleaned.lower()}"
-        focus_candidates: list[str] = []
-        if plan.content_query:
-            focus_candidates.append(plan.content_query)
-        focus_candidates.extend(ContractAssistant._focus_phrases(plan.focus_terms))
-        focus_candidates.extend(plan.focus_terms)
-        focus_candidates.extend(plan.topic_terms + plan.action_terms)
-        if focus_candidates and not any(candidate and candidate in combined for candidate in focus_candidates):
-            return False
-        lowered = cleaned.lower()
-        if plan.system_phrase and plan.system_phrase not in combined:
-            system_hits = sum(1 for term in plan.system_terms if term and term in combined)
-            if system_hits < max(1, min(2, len(plan.system_terms))):
-                return False
-        if (plan.attribute_label or plan.count_question) and not ContractAssistant._excerpt_matches_attribute(lowered, plan):
-            return False
-        if ContractAssistant._is_requirement_question(plan) and not re.search(
-            r"\b(shall|must|required|responsible|obligated|provide|perform|submit|deliver|maintain|comply)\b",
-            lowered,
-        ) and not re.search(r"\d", cleaned):
-            return False
-        if ContractAssistant._is_value_question(plan) and not re.search(r"\d", cleaned):
-            return False
-        return True
+        return AnswerPolicy.is_useful_extractive_block(heading, excerpt, plan)
 
     @staticmethod
     def _excerpt_matches_attribute(lowered_excerpt: str, plan: QueryPlan) -> bool:
-        label = plan.attribute_label or ""
-        if plan.count_question:
-            return bool(re.search(r"\b\d", lowered_excerpt) or re.search(r"\b(one|two|three|four|five|six|seven|eight|nine|ten)\b", lowered_excerpt))
-        if not label:
-            return True
-        if label == "design_conditions":
-            return bool(re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", lowered_excerpt) or re.search(r"\d", lowered_excerpt))
-        if label == "configuration":
-            return bool(re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b|\bduplex\b|\bredun", lowered_excerpt))
-        if label == "type":
-            return bool(re.search(r"\bmodel\b|\btype\b|\bselected\b|\bvendor\b|\bmanufacturer\b", lowered_excerpt) or re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b", lowered_excerpt))
-        if label == "size":
-            return bool(re.search(r"\bsize\b|\bdiameter\b|\brating\b|\b(?:inch|inches|mm|ft)\b", lowered_excerpt) or re.search(r"\d", lowered_excerpt))
-        if label == "power":
-            return bool(any(term in lowered_excerpt for term in plan.attribute_terms) or re.search(r"\b\d+(?:\.\d+)?\s*(?:hp|kw|kilowatt(?:s)?)\b", lowered_excerpt))
-        if label in {"capacity", "pressure", "temperature", "flow"}:
-            return bool(any(term in lowered_excerpt for term in plan.attribute_terms) or re.search(r"\d", lowered_excerpt))
-        if label == "responsibility":
-            return bool(re.search(r"\b(shall|must|required|responsible|provide|furnish|supply|perform|deliver)\b", lowered_excerpt))
-        if label == "function":
-            return bool(re.search(r"\b(receives|supplies|provides|distributes|conditions|transports|serves|used to|operates)\b", lowered_excerpt))
-        return True
+        return AnswerPolicy.excerpt_matches_attribute(lowered_excerpt, plan)
 
     @classmethod
     def _is_useful_summary_block(cls, chunk: RankedChunk, excerpt: str, plan: QueryPlan) -> bool:
-        heading = chunk.heading
-        if "...." in heading:
-            return False
-        if chunk.total_score < 0.42:
-            return False
-        cleaned_heading = " ".join(heading.split()).lower()
-        if cleaned_heading in {"front matter"}:
-            return False
-        cleaned_excerpt = excerpt.strip().strip('"').strip()
-        if len(cleaned_excerpt) < 60:
-            return False
-        if re.fullmatch(r"[A-Za-z0-9.()\- ]{1,28}", cleaned_excerpt):
-            return False
-        if cleaned_excerpt.lower().startswith("section ") and "agreement" in cleaned_excerpt.lower() and len(cleaned_excerpt) < 110:
-            return False
-        return cls._is_useful_extractive_block(heading, excerpt, plan)
+        return AnswerPolicy.is_useful_summary_block(chunk, excerpt, plan)
 
     @staticmethod
     def _focus_phrases(focus_terms: tuple[str, ...]) -> tuple[str, ...]:
-        if len(focus_terms) < 2:
-            return ()
-        phrases = [" ".join(focus_terms[index:index + 2]) for index in range(len(focus_terms) - 1)]
-        if len(focus_terms) >= 3:
-            phrases.append(" ".join(focus_terms[:3]))
-        seen: set[str] = set()
-        return tuple(phrase for phrase in phrases if phrase and not (phrase in seen or seen.add(phrase)))
+        return AnswerPolicy.focus_phrases(focus_terms)

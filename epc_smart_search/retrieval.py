@@ -7,7 +7,9 @@ from dataclasses import dataclass
 
 from epc_smart_search.config import MAX_EMBEDDING_DIM, MAX_SEARCH_RESULTS, MAX_SEMANTIC_SCAN
 from epc_smart_search.query_planner import (
+    ANSWER_FAMILY_GUARANTEE_OR_LIMIT,
     QueryPlan,
+    REQUEST_SHAPE_GROUPED_LIST,
     build_like_fallback,
     build_match_queries,
     has_term_overlap,
@@ -161,6 +163,15 @@ class HybridRetriever:
             return []
         plan = self.plan_query(query)
         active_profile = self._resolve_profile(profile, limit)
+        if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
+            active_profile = RetrievalProfile(
+                name=active_profile.name,
+                result_limit=max(active_profile.result_limit, 6),
+                fts_limit=max(active_profile.fts_limit, 36),
+                keyword_limit=max(active_profile.keyword_limit, 24),
+                semantic_limit=max(active_profile.semantic_limit, 24),
+                use_query_expansion=active_profile.use_query_expansion,
+            )
         semantic_query = plan.content_query or query
         combined: dict[str, SearchCandidate] = {}
 
@@ -357,6 +368,46 @@ class HybridRetriever:
         passes: list[SearchPass] = []
 
         attribute_block = self._fts_term_block(plan.attribute_terms[:4])
+        concept_block = self._fts_term_block(plan.concept_terms[:5])
+        scope_block = self._fts_term_block(plan.scope_terms[:3])
+
+        if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST and concept_block:
+            heading_concept_phrase = " ".join(plan.concept_terms[:4])
+            passes.append(
+                SearchPass(
+                    "grouped_heading_concept",
+                    self._fts_column_block(("heading", "parent_heading"), heading_concept_phrase),
+                    1.55,
+                )
+            )
+            passes.append(
+                SearchPass(
+                    "grouped_concept",
+                    concept_block,
+                    1.1,
+                )
+            )
+            if scope_block:
+                passes.append(
+                    SearchPass(
+                        "grouped_scope_concept",
+                        self._fts_and([concept_block, scope_block]),
+                        1.65,
+                    )
+                )
+                passes.append(
+                    SearchPass(
+                        "grouped_heading_scope",
+                        self._fts_and(
+                            [
+                                self._fts_column_block(("heading", "parent_heading"), heading_concept_phrase),
+                                scope_block,
+                            ]
+                        ),
+                        1.95,
+                    )
+                )
+
         if plan.system_phrase and attribute_block:
             passes.append(
                 SearchPass(
@@ -431,6 +482,9 @@ class HybridRetriever:
 
     def _query_variants(self, plan: QueryPlan) -> list[str]:
         candidates = [plan.raw_query, plan.content_query, plan.system_phrase]
+        candidates.extend(plan.scope_terms)
+        if plan.concept_terms:
+            candidates.append(" ".join(plan.concept_terms))
         candidates.extend(self._focus_phrases(plan.focus_terms))
         return self._dedupe_queries(candidates)
 
@@ -518,6 +572,7 @@ class HybridRetriever:
             "what does the contract say about ",
             "what does it say about ",
             "what is ",
+            "what are ",
             "define ",
             "tell me about ",
             "show me ",
@@ -527,6 +582,7 @@ class HybridRetriever:
                 raw = raw[len(prefix):]
                 break
         raw = raw.strip(" ?.")
+        raw = re.sub(r"\b(my|our|the)\b\s+", "", raw).strip()
         raw = re.sub(r"\b(do we have|do we use|are we using|are there|is there|do we need|do we require)$", "", raw).strip()
         variants: list[str] = []
         if raw:
@@ -600,10 +656,16 @@ class HybridRetriever:
         focus_phrases = self._focus_phrases(plan.focus_terms)
         system_score, exact_system_match = self._system_match_score(plan, heading, parent_heading, combined_text)
         attribute_score, attribute_match = self._attribute_match_score(plan, heading, parent_heading, full_text, combined_text)
+        concept_score, concept_match = self._concept_match_score(plan, heading, parent_heading, combined_text)
+        scope_score, scope_match = self._scope_match_score(plan, heading, parent_heading, clause_type)
+        family_score = self._answer_family_score(plan, full_text, heading, parent_heading)
 
         score = lexical_score * 0.55 + semantic_score * 0.15 + bonus
         score += system_score
         score += attribute_score
+        score += concept_score
+        score += scope_score
+        score += family_score
         if row["section_number"] and row["section_number"] == plan.section_number:
             score += 1.2
         if plan.content_query:
@@ -632,9 +694,12 @@ class HybridRetriever:
             score += 0.65
         if has_term_overlap(topic_tags, plan.topic_terms):
             score += 0.8
+        if has_term_overlap(topic_tags, plan.concept_terms):
+            score += 0.45
         if has_term_overlap(combined_text, plan.expansion_terms):
             score += 0.9
         score += 0.16 * self._term_hit_count(combined_text, plan.focus_terms)
+        score += 0.18 * self._term_hit_count(combined_text, plan.concept_terms + plan.scope_terms)
         score += 0.12 * self._term_hit_count(combined_text, plan.actor_terms + plan.action_terms + plan.topic_terms + plan.expansion_terms)
         if exact_system_match and attribute_match:
             score += 1.25
@@ -647,8 +712,17 @@ class HybridRetriever:
             score -= 1.05
         elif plan.attribute_terms and not attribute_match:
             score -= 0.55
+        if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
+            if not concept_match:
+                score -= 1.2
+            if plan.scope_terms and not scope_match:
+                score -= 0.45
         if search_pass_name in {"exact_system_attribute", "heading_system_attribute"} and not (exact_system_match and attribute_match):
             score -= 1.25
+        if search_pass_name in {"grouped_heading_concept", "grouped_concept"} and not concept_match:
+            score -= 0.9
+        if search_pass_name in {"grouped_scope_concept", "grouped_heading_scope"} and not (concept_match and (scope_match or not plan.scope_terms)):
+            score -= 1.1
         if search_pass_name == "exact_system_heading" and not exact_system_match:
             score -= 0.75
         if plan.intent == "definition" and clause_type == "definition":
@@ -777,6 +851,52 @@ class HybridRetriever:
                 score += 0.65
                 matched = True
         return score, matched
+
+    @staticmethod
+    def _concept_match_score(plan: QueryPlan, heading: str, parent_heading: str, combined_text: str) -> tuple[float, bool]:
+        if not plan.concept_terms:
+            return 0.0, False
+        score = 0.0
+        if has_term_overlap(heading, plan.concept_terms):
+            score += 1.1
+        if has_term_overlap(parent_heading, plan.concept_terms):
+            score += 0.8
+        hits = HybridRetriever._term_hit_count(combined_text, plan.concept_terms)
+        if hits:
+            score += min(1.4, hits * 0.28)
+        matched = hits >= max(1, min(len(plan.concept_terms), 2))
+        return score, matched
+
+    @staticmethod
+    def _scope_match_score(plan: QueryPlan, heading: str, parent_heading: str, clause_type: str) -> tuple[float, bool]:
+        if not plan.scope_terms:
+            return 0.0, False
+        score = 0.0
+        matched = False
+        if has_term_overlap(heading, plan.scope_terms):
+            score += 1.2
+            matched = True
+        if has_term_overlap(parent_heading, plan.scope_terms):
+            score += 0.9
+            matched = True
+        if clause_type == "exhibit":
+            score += 0.35
+            matched = True
+        return score, matched
+
+    @staticmethod
+    def _answer_family_score(plan: QueryPlan, full_text: str, heading: str, parent_heading: str) -> float:
+        if plan.answer_family != ANSWER_FAMILY_GUARANTEE_OR_LIMIT:
+            return 0.0
+        normalized = " ".join([heading, parent_heading, full_text]).lower()
+        score = 0.0
+        if re.search(r"\bguarantee\b|\bguarantees\b|\bguaranteed\b", normalized):
+            score += 0.9
+        if re.search(r"\bshall not exceed\b|\bnot exceed\b|\blimit\b|\blimits\b", normalized):
+            score += 1.1
+        if re.search(r"\b\d+(?:\.\d+)?\s*(?:ppmvd|ppmv|lb/hr|mg/nm3|%)\b", normalized):
+            score += 0.95
+        return score
 
     @staticmethod
     def _term_hit_count(text: str, terms: tuple[str, ...]) -> int:

@@ -202,9 +202,21 @@ def test_query_plan_normalizes_emission_guarantees_typo_and_keeps_general_intent
     plan = plan_query("what are my emission guarentees")
 
     assert plan.intent == "general_topic"
+    assert plan.request_shape == "grouped_list"
+    assert plan.answer_family == "guarantee_or_limit"
+    assert plan.aggregate_requested is True
     assert plan.content_query == "my emission guarantees"
     assert plan.focus_terms == ("emission", "guarantees")
-    assert plan.system_terms == ("emission", "guarantees")
+    assert plan.concept_terms == ("emission", "guarantees")
+    assert plan.system_terms == ()
+
+
+def test_query_plan_tracks_appendix_scope_for_grouped_guarantee_question() -> None:
+    plan = plan_query("show me all emission guarantees in Appendix E")
+
+    assert plan.request_shape == "grouped_list"
+    assert plan.scope_terms == ("appendix e", "appendix")
+    assert plan.concept_terms == ("emission", "guarantees")
 
 
 def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> None:
@@ -441,6 +453,58 @@ def test_hierarchical_search_prefers_exact_function_clause() -> None:
     assert ranked[0].chunk_id == "function_clause"
 
 
+def test_grouped_question_prefers_appendix_guarantees_over_generic_emissions_clause() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_emissions",
+                "7.5.3",
+                "Air Permit Test Result",
+                "The submission must include all emissions values and supporting calculations.",
+                83,
+            ),
+            _chunk(
+                "appendix_e",
+                "E",
+                "APPENDIX E - Emission Guarantees",
+                "Emission Guarantees. Seller guarantees NOx emissions shall not exceed 2.0 ppmvd at 15% oxygen.",
+                2686,
+                chunk_type="exhibit",
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what are my emission guarantees")
+
+    assert ranked
+    assert ranked[0].chunk_id == "appendix_e"
+
+
+def test_grouped_question_returns_related_appendix_results_as_bundle_candidates() -> None:
+    appendix = _chunk(
+        "appendix_e",
+        "E",
+        "APPENDIX E - Emission Guarantees",
+        "Emission Guarantees.",
+        2686,
+        chunk_type="exhibit",
+    )
+    sibling = _chunk(
+        "appendix_e_limits",
+        "E.1",
+        "Guarantee Limits",
+        "Seller guarantees NOx emissions shall not exceed 2.0 ppmvd at 15% oxygen. CO emissions shall not exceed 4.0 ppmvd at 15% oxygen.",
+        2687,
+        parent_chunk_id="appendix_e",
+    )
+    retriever = _seed_retriever([appendix, sibling])
+
+    ranked = retriever.retrieve("show me all emission guarantees in appendix e")
+
+    assert ranked
+    assert {ranked[0].chunk_id, ranked[1].chunk_id} == {"appendix_e", "appendix_e_limits"}
+
+
 def test_deep_profile_prefers_specific_clause_over_generic_match() -> None:
     retriever = _seed_retriever(
         [
@@ -575,6 +639,7 @@ def _chunk(
     page_num: int,
     *,
     chunk_type: str = "section",
+    parent_chunk_id: str | None = None,
 ) -> ChunkRecord:
     return ChunkRecord(
         chunk_id=chunk_id,
@@ -585,6 +650,6 @@ def _chunk(
         full_text=full_text,
         page_start=page_num,
         page_end=page_num,
-        parent_chunk_id=None,
+        parent_chunk_id=parent_chunk_id,
         ordinal_in_document=page_num,
     )
