@@ -1783,7 +1783,7 @@ class AnswerPolicy:
             system_hits = sum(1 for term in plan.system_terms if term and term in combined)
             if system_hits < max(1, min(2, len(plan.system_terms))):
                 return False
-        if (plan.attribute_label or plan.count_question) and not AnswerPolicy.excerpt_matches_attribute(lowered, plan):
+        if ((plan.attribute_label and not plan.direct_text_question) or plan.count_question) and not AnswerPolicy.excerpt_matches_attribute(lowered, plan):
             return False
         if AnswerPolicy.is_requirement_question(plan) and not re.search(
             r"\b(shall|must|required|responsible|obligated|provide|perform|submit|deliver|maintain|comply)\b",

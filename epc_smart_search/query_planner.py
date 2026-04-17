@@ -36,7 +36,18 @@ ANSWER_FAMILY_GUARANTEE_OR_LIMIT = "guarantee_or_limit"
 RETRIEVAL_MODE_FACT_LOOKUP = "fact_lookup"
 RETRIEVAL_MODE_TOPIC_SUMMARY = "topic_summary"
 RETRIEVAL_MODE_FALLBACK = "fallback"
-EXACT_VALUE_ATTRIBUTE_LABELS = ("configuration", "capacity", "type", "size", "power", "pressure", "temperature", "flow")
+EXACT_VALUE_ATTRIBUTE_LABELS = (
+    "configuration",
+    "capacity",
+    "quantity",
+    "service",
+    "type",
+    "size",
+    "power",
+    "pressure",
+    "temperature",
+    "flow",
+)
 
 
 @dataclass(slots=True, frozen=True)

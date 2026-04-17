@@ -123,7 +123,7 @@ def test_refresh_query_index_rebuilds_contract_facts() -> None:
     )
 
     refresh_query_index(store, "doc1")
-    power_rows = store.lookup_facts_by_system_attribute("doc1", "fire water pump", "rating")
+    power_rows = store.lookup_facts_by_system_attribute("doc1", "fire water pump", "power")
 
     assert len(power_rows) == 1
     assert power_rows[0].value == "350 HP"

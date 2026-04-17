@@ -15,6 +15,7 @@ from epc_smart_search.query_planner import (
     REQUEST_SHAPE_BROAD_TOPIC,
     REQUEST_SHAPE_GROUPED_LIST,
     RETRIEVAL_MODE_FACT_LOOKUP,
+    RETRIEVAL_MODE_TOPIC_SUMMARY,
     build_like_fallback,
     build_match_queries,
     has_term_overlap,
@@ -106,6 +107,32 @@ class RetrievalTrace:
     bundles: list[EvidenceBundle]
     selected_bundle: EvidenceBundle | None
     used_gemma_disambiguation: bool = False
+    normalized_system: str = ""
+    normalized_attribute: str = ""
+    fact_lookup_attempted: bool = False
+    fact_rows_returned: int = 0
+    fallback_reason: str | None = None
+
+    def to_debug_dict(self) -> dict[str, object]:
+        return {
+            "query": self.query,
+            "retrieval_mode": self.plan.retrieval_mode,
+            "request_shape": self.plan.request_shape,
+            "normalized_system": self.normalized_system,
+            "normalized_attribute": self.normalized_attribute,
+            "fact_lookup_attempted": self.fact_lookup_attempted,
+            "fact_rows_returned": self.fact_rows_returned,
+            "fallback_reason": self.fallback_reason,
+            "selected_bundle_id": self.selected_bundle.bundle_id if self.selected_bundle is not None else None,
+            "recall_source_counts": {name: len(rows) for name, rows in self.recall_sources.items()},
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class FactLookupOutcome:
+    rows_returned: int
+    confident: bool
+    fallback_reason: str | None = None
 
 
 DEFAULT_RETRIEVAL_PROFILE = RetrievalProfile(
@@ -209,7 +236,21 @@ class HybridRetriever:
     ) -> RetrievalTrace:
         document_id = self.resolve_document_id()
         if not document_id:
-            return RetrievalTrace(query, self.plan_query(query), {}, [], [], None, False)
+            plan = self.plan_query(query)
+            return RetrievalTrace(
+                query=query,
+                plan=plan,
+                recall_sources={},
+                merged_ranked=[],
+                bundles=[],
+                selected_bundle=None,
+                used_gemma_disambiguation=False,
+                normalized_system=normalize_system_name(plan.system_phrase),
+                normalized_attribute=normalize_attribute_name(plan.attribute_label or ""),
+                fact_lookup_attempted=False,
+                fact_rows_returned=0,
+                fallback_reason="missing_document",
+            )
         plan = self.plan_query(query)
         active_profile = self._resolve_profile(profile, limit)
         if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
@@ -233,8 +274,14 @@ class HybridRetriever:
         query_vector = self.embedder.embed(query)
         recall_sources: dict[str, list[RankedChunk]] = {}
         combined: dict[str, SearchCandidate] = {}
+        normalized_system = normalize_system_name(plan.system_phrase)
+        normalized_attribute = normalize_attribute_name(plan.attribute_label or "")
+        fact_lookup_attempted = False
+        fact_rows_returned = 0
+        fallback_reason: str | None = None
         if plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP:
-            fact_sources, fact_candidates, fact_confident = self._collect_fact_lookup_candidates(
+            fact_lookup_attempted = True
+            fact_sources, fact_candidates, fact_outcome = self._collect_fact_lookup_candidates(
                 document_id,
                 query,
                 query_vector,
@@ -242,7 +289,9 @@ class HybridRetriever:
             )
             recall_sources.update(fact_sources)
             combined.update(fact_candidates)
-            if not fact_confident:
+            fact_rows_returned = fact_outcome.rows_returned
+            fallback_reason = fact_outcome.fallback_reason
+            if not fact_outcome.confident:
                 fallback_sources, fallback_candidates = self._collect_recall_candidates(
                     document_id,
                     query,
@@ -254,6 +303,10 @@ class HybridRetriever:
                 for candidate in fallback_candidates.values():
                     self._merge_recall_candidate(combined, candidate)
         else:
+            if plan.retrieval_mode == RETRIEVAL_MODE_TOPIC_SUMMARY:
+                fallback_reason = "topic_summary_mode"
+            elif plan.retrieval_mode:
+                fallback_reason = f"retrieval_mode:{plan.retrieval_mode}"
             recall_sources, combined = self._collect_recall_candidates(document_id, query, query_vector, plan, active_profile)
         if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
             merged_limit = GROUPED_MERGED_RECALL_KEEP
@@ -295,6 +348,11 @@ class HybridRetriever:
             bundles=bundles,
             selected_bundle=selected_bundle,
             used_gemma_disambiguation=used_gemma_disambiguation,
+            normalized_system=normalized_system,
+            normalized_attribute=normalized_attribute,
+            fact_lookup_attempted=fact_lookup_attempted,
+            fact_rows_returned=fact_rows_returned,
+            fallback_reason=fallback_reason,
         )
 
     def _collect_recall_candidates(
@@ -404,11 +462,13 @@ class HybridRetriever:
         query: str,
         query_vector: list[float],
         plan: QueryPlan,
-    ) -> tuple[dict[str, list[RankedChunk]], dict[str, SearchCandidate], bool]:
+    ) -> tuple[dict[str, list[RankedChunk]], dict[str, SearchCandidate], FactLookupOutcome]:
         combined: dict[str, SearchCandidate] = {}
         recall_sources: dict[str, list[RankedChunk]] = {"fact_lookup": []}
         best_match_score = 0.0
-        for fact in self._candidate_facts_for_plan(document_id, plan):
+        facts = self._candidate_facts_for_plan(document_id, plan)
+        fallback_reason = "no_fact_rows" if not facts else "fact_lookup_miss"
+        for fact in facts:
             match_score = self._fact_match_score(plan, fact)
             if match_score <= 0.0:
                 continue
@@ -427,12 +487,21 @@ class HybridRetriever:
             recall_sources["fact_lookup"].append(self._ranked_from_candidate(candidate))
             self._merge_recall_candidate(combined, candidate)
             best_match_score = max(best_match_score, match_score)
+        confident = best_match_score >= 2.0
+        if best_match_score > 0.0 and not confident:
+            fallback_reason = "low_confidence_fact_match"
+        elif confident:
+            fallback_reason = None
         recall_sources["fact_lookup"] = sorted(
             recall_sources["fact_lookup"],
             key=lambda item: item.total_score,
             reverse=True,
         )[:LEXICAL_RECALL_KEEP]
-        return recall_sources, combined, best_match_score >= 2.0
+        return recall_sources, combined, FactLookupOutcome(
+            rows_returned=len(facts),
+            confident=confident,
+            fallback_reason=fallback_reason,
+        )
 
     def _candidate_facts_for_plan(self, document_id: str, plan: QueryPlan) -> list[ContractFactRow]:
         if plan.attribute_label not in EXACT_VALUE_ATTRIBUTE_LABELS or not plan.system_phrase:

@@ -749,6 +749,23 @@ def test_fact_lookup_uses_shared_system_and_attribute_normalization() -> None:
     assert trace.recall_sources["fact_lookup"]
     assert trace.selected_bundle is not None
     assert trace.selected_bundle.ranked_chunks[0].chunk_id == "ccw_fact"
+    assert trace.normalized_system == "closed cooling water"
+    assert trace.normalized_attribute == "configuration"
+    assert trace.fact_lookup_attempted is True
+    assert trace.fact_rows_returned == 1
+    assert trace.fallback_reason is None
+    assert trace.to_debug_dict() == {
+        "query": "What is the CCW configuration?",
+        "retrieval_mode": "fact_lookup",
+        "request_shape": "scalar",
+        "normalized_system": "closed cooling water",
+        "normalized_attribute": "configuration",
+        "fact_lookup_attempted": True,
+        "fact_rows_returned": 1,
+        "fallback_reason": None,
+        "selected_bundle_id": "ccw_fact",
+        "recall_source_counts": {"fact_lookup": 1},
+    }
 
 
 def test_retrieve_trace_can_use_gemma_to_break_close_bundle_ties() -> None:
@@ -864,6 +881,11 @@ def test_topic_summary_keeps_broader_bundle_path_for_summary_questions() -> None
     assert trace.selected_bundle is not None
     assert trace.selected_bundle.primary_chunk_id == "permit_overview"
     assert {chunk.chunk_id for chunk in trace.selected_bundle.ranked_chunks[:2]} == {"permit_overview", "permit_testing"}
+    assert trace.fact_lookup_attempted is False
+    assert trace.fact_rows_returned == 0
+    assert trace.fallback_reason == "topic_summary_mode"
+    assert trace.to_debug_dict()["fact_lookup_attempted"] is False
+    assert trace.to_debug_dict()["recall_source_counts"]["planner_hints"] > 0
 
 
 def test_low_confidence_fact_lookup_falls_back_to_generic_recall() -> None:
@@ -907,6 +929,15 @@ def test_low_confidence_fact_lookup_falls_back_to_generic_recall() -> None:
     assert "planner_hints" in trace.recall_sources
     assert trace.merged_ranked
     assert trace.merged_ranked[0].chunk_id == "service_water_capacity"
+    assert trace.normalized_system == "service water tank"
+    assert trace.normalized_attribute == "capacity"
+    assert trace.fact_lookup_attempted is True
+    assert trace.fact_rows_returned == 1
+    assert trace.fallback_reason == "fact_lookup_miss"
+    debug = trace.to_debug_dict()
+    assert debug["fallback_reason"] == "fact_lookup_miss"
+    assert debug["recall_source_counts"]["fact_lookup"] == 0
+    assert debug["recall_source_counts"]["planner_hints"] > 0
 
 
 def test_broad_topic_environmental_requirements_prefers_requirement_clause_over_appendix_header() -> None:
