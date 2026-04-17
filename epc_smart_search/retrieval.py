@@ -7,17 +7,21 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from epc_smart_search.config import MAX_EMBEDDING_DIM, MAX_SEARCH_RESULTS, MAX_SEMANTIC_SCAN
+from epc_smart_search.name_normalization import build_system_aliases, normalize_attribute_name, normalize_system_name
 from epc_smart_search.query_planner import (
     ANSWER_FAMILY_GUARANTEE_OR_LIMIT,
+    EXACT_VALUE_ATTRIBUTE_LABELS,
     QueryPlan,
     REQUEST_SHAPE_BROAD_TOPIC,
     REQUEST_SHAPE_GROUPED_LIST,
+    RETRIEVAL_MODE_FACT_LOOKUP,
+    RETRIEVAL_MODE_TOPIC_SUMMARY,
     build_like_fallback,
     build_match_queries,
     has_term_overlap,
     plan_query,
 )
-from epc_smart_search.storage import ContractStore, unpack_vector
+from epc_smart_search.storage import ContractFactRow, ContractStore, unpack_vector
 from epc_smart_search.system_vocabulary import SystemVocabulary, build_contract_system_vocabulary
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{1,}")
@@ -103,6 +107,32 @@ class RetrievalTrace:
     bundles: list[EvidenceBundle]
     selected_bundle: EvidenceBundle | None
     used_gemma_disambiguation: bool = False
+    normalized_system: str = ""
+    normalized_attribute: str = ""
+    fact_lookup_attempted: bool = False
+    fact_rows_returned: int = 0
+    fallback_reason: str | None = None
+
+    def to_debug_dict(self) -> dict[str, object]:
+        return {
+            "query": self.query,
+            "retrieval_mode": self.plan.retrieval_mode,
+            "request_shape": self.plan.request_shape,
+            "normalized_system": self.normalized_system,
+            "normalized_attribute": self.normalized_attribute,
+            "fact_lookup_attempted": self.fact_lookup_attempted,
+            "fact_rows_returned": self.fact_rows_returned,
+            "fallback_reason": self.fallback_reason,
+            "selected_bundle_id": self.selected_bundle.bundle_id if self.selected_bundle is not None else None,
+            "recall_source_counts": {name: len(rows) for name, rows in self.recall_sources.items()},
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class FactLookupOutcome:
+    rows_returned: int
+    confident: bool
+    fallback_reason: str | None = None
 
 
 DEFAULT_RETRIEVAL_PROFILE = RetrievalProfile(
@@ -206,7 +236,21 @@ class HybridRetriever:
     ) -> RetrievalTrace:
         document_id = self.resolve_document_id()
         if not document_id:
-            return RetrievalTrace(query, self.plan_query(query), {}, [], [], None, False)
+            plan = self.plan_query(query)
+            return RetrievalTrace(
+                query=query,
+                plan=plan,
+                recall_sources={},
+                merged_ranked=[],
+                bundles=[],
+                selected_bundle=None,
+                used_gemma_disambiguation=False,
+                normalized_system=normalize_system_name(plan.system_phrase),
+                normalized_attribute=normalize_attribute_name(plan.attribute_label or ""),
+                fact_lookup_attempted=False,
+                fact_rows_returned=0,
+                fallback_reason="missing_document",
+            )
         plan = self.plan_query(query)
         active_profile = self._resolve_profile(profile, limit)
         if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
@@ -228,7 +272,42 @@ class HybridRetriever:
                 use_query_expansion=True,
             )
         query_vector = self.embedder.embed(query)
-        recall_sources, combined = self._collect_recall_candidates(document_id, query, query_vector, plan, active_profile)
+        recall_sources: dict[str, list[RankedChunk]] = {}
+        combined: dict[str, SearchCandidate] = {}
+        normalized_system = normalize_system_name(plan.system_phrase)
+        normalized_attribute = normalize_attribute_name(plan.attribute_label or "")
+        fact_lookup_attempted = False
+        fact_rows_returned = 0
+        fallback_reason: str | None = None
+        if plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP:
+            fact_lookup_attempted = True
+            fact_sources, fact_candidates, fact_outcome = self._collect_fact_lookup_candidates(
+                document_id,
+                query,
+                query_vector,
+                plan,
+            )
+            recall_sources.update(fact_sources)
+            combined.update(fact_candidates)
+            fact_rows_returned = fact_outcome.rows_returned
+            fallback_reason = fact_outcome.fallback_reason
+            if not fact_outcome.confident:
+                fallback_sources, fallback_candidates = self._collect_recall_candidates(
+                    document_id,
+                    query,
+                    query_vector,
+                    plan,
+                    active_profile,
+                )
+                recall_sources.update(fallback_sources)
+                for candidate in fallback_candidates.values():
+                    self._merge_recall_candidate(combined, candidate)
+        else:
+            if plan.retrieval_mode == RETRIEVAL_MODE_TOPIC_SUMMARY:
+                fallback_reason = "topic_summary_mode"
+            elif plan.retrieval_mode:
+                fallback_reason = f"retrieval_mode:{plan.retrieval_mode}"
+            recall_sources, combined = self._collect_recall_candidates(document_id, query, query_vector, plan, active_profile)
         if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
             merged_limit = GROUPED_MERGED_RECALL_KEEP
         elif plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC:
@@ -269,6 +348,11 @@ class HybridRetriever:
             bundles=bundles,
             selected_bundle=selected_bundle,
             used_gemma_disambiguation=used_gemma_disambiguation,
+            normalized_system=normalized_system,
+            normalized_attribute=normalized_attribute,
+            fact_lookup_attempted=fact_lookup_attempted,
+            fact_rows_returned=fact_rows_returned,
+            fallback_reason=fallback_reason,
         )
 
     def _collect_recall_candidates(
@@ -371,6 +455,108 @@ class HybridRetriever:
         for source_name, rows in list(recall_sources.items()):
             recall_sources[source_name] = sorted(rows, key=lambda item: item.total_score, reverse=True)[:LEXICAL_RECALL_KEEP]
         return recall_sources, combined
+
+    def _collect_fact_lookup_candidates(
+        self,
+        document_id: str,
+        query: str,
+        query_vector: list[float],
+        plan: QueryPlan,
+    ) -> tuple[dict[str, list[RankedChunk]], dict[str, SearchCandidate], FactLookupOutcome]:
+        combined: dict[str, SearchCandidate] = {}
+        recall_sources: dict[str, list[RankedChunk]] = {"fact_lookup": []}
+        best_match_score = 0.0
+        facts = self._candidate_facts_for_plan(document_id, plan)
+        fallback_reason = "no_fact_rows" if not facts else "fact_lookup_miss"
+        for fact in facts:
+            match_score = self._fact_match_score(plan, fact)
+            if match_score <= 0.0:
+                continue
+            row = self.store.fetch_chunk(fact.source_chunk_id)
+            if row is None:
+                continue
+            candidate = self._make_recall_candidate(
+                query,
+                plan,
+                row,
+                lexical_score=0.0,
+                semantic_score=self._semantic_for_row(query_vector, row),
+                bonus=min(2.4, match_score),
+                source_name="fact_lookup",
+            )
+            recall_sources["fact_lookup"].append(self._ranked_from_candidate(candidate))
+            self._merge_recall_candidate(combined, candidate)
+            best_match_score = max(best_match_score, match_score)
+        confident = best_match_score >= 2.0
+        if best_match_score > 0.0 and not confident:
+            fallback_reason = "low_confidence_fact_match"
+        elif confident:
+            fallback_reason = None
+        recall_sources["fact_lookup"] = sorted(
+            recall_sources["fact_lookup"],
+            key=lambda item: item.total_score,
+            reverse=True,
+        )[:LEXICAL_RECALL_KEEP]
+        return recall_sources, combined, FactLookupOutcome(
+            rows_returned=len(facts),
+            confident=confident,
+            fallback_reason=fallback_reason,
+        )
+
+    def _candidate_facts_for_plan(self, document_id: str, plan: QueryPlan) -> list[ContractFactRow]:
+        if plan.attribute_label not in EXACT_VALUE_ATTRIBUTE_LABELS or not plan.system_phrase:
+            return []
+        for system_name in (plan.system_phrase, *plan.system_aliases):
+            if not system_name:
+                continue
+            direct = self.store.lookup_facts_by_system_attribute(document_id, system_name, plan.attribute_label)
+            if direct:
+                return direct
+        return self.store.lookup_facts_by_attribute(document_id, plan.attribute_label)
+
+    @staticmethod
+    def _fact_match_score(plan: QueryPlan, fact: ContractFactRow) -> float:
+        if not plan.system_phrase or not fact.attribute_normalized:
+            return 0.0
+        plan_system = normalize_system_name(plan.system_phrase)
+        fact_system = normalize_system_name(fact.system_normalized or fact.system)
+        if not fact_system:
+            return 0.0
+
+        plan_attribute = normalize_attribute_name(plan.attribute_label or "")
+        fact_attribute = normalize_attribute_name(fact.attribute_normalized or fact.attribute)
+        if plan_attribute and fact_attribute != plan_attribute:
+            return 0.0
+
+        score = 1.0
+        plan_systems = {plan_system}
+        plan_systems.update(
+            normalize_system_name(alias)
+            for alias in build_system_aliases(plan.system_phrase) + plan.system_aliases
+            if alias
+        )
+        plan_systems.discard("")
+
+        if fact_system in plan_systems:
+            score += 1.5
+        elif len(plan.system_significant_terms) <= 1:
+            system_hits = sum(1 for term in plan.system_terms if term and f" {term} " in f" {fact_system} ")
+            significant_hits = sum(1 for term in plan.system_significant_terms if term and f" {term} " in f" {fact_system} ")
+            if not system_hits and not significant_hits:
+                return 0.0
+            score += 0.3 * system_hits
+            score += 0.45 * significant_hits
+        else:
+            return 0.0
+        if plan.content_query:
+            normalized_evidence = f"{fact.evidence_text} {fact.value}".lower()
+            if plan.content_query in normalized_evidence:
+                score += 0.3
+        if plan.attribute_label == "type" and re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b", fact.value):
+            score += 0.35
+        if plan.attribute_label in {"capacity", "size", "power", "pressure", "temperature", "flow"} and re.search(r"\d", fact.value):
+            score += 0.25
+        return score
 
     def _build_ranked_bundles(
         self,
@@ -1413,6 +1599,7 @@ class HybridRetriever:
             return 0.0, False
         score = 0.0
         matched = False
+        lowered_heading = f"{heading} {parent_heading}".lower()
         for phrase in plan.attribute_terms:
             if has_term_overlap(heading, (phrase,)) or has_term_overlap(parent_heading, (phrase,)):
                 score += 0.95
@@ -1423,11 +1610,26 @@ class HybridRetriever:
         label = plan.attribute_label or ""
         lowered_full_text = full_text.lower()
         if label == "design_conditions":
+            if re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", lowered_heading):
+                score += 1.0
+                matched = True
             if re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", lowered_full_text):
                 score += 1.1
                 matched = True
-            value_hits = len(re.findall(r"\b\d+(?:\.\d+)?\s*(?:psi|psig|psia|degf|deg c|gpm|lb/hr|scfm|mw|mva|hp)\b", lowered_full_text, re.IGNORECASE))
-            score += min(0.75, value_hits * 0.18)
+            value_hits = len(
+                re.findall(
+                    r"\b\d+(?:\.\d+)?\s*(?:psi|psig|psia|degf|deg c|°f|°c|gpm|lb/hr|scfm|mw|mva|hp)\b",
+                    lowered_full_text,
+                    re.IGNORECASE,
+                )
+            )
+            score += min(1.1, value_hits * 0.22)
+            if value_hits >= 3:
+                score += 0.45
+                matched = True
+            if "site" in plan.focus_terms and has_term_overlap(heading, ("site",)):
+                score += 0.45
+                matched = True
         elif label == "configuration":
             if re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b", lowered_full_text):
                 score += 1.0

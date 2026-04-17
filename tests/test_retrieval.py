@@ -1,9 +1,24 @@
 from epc_smart_search.chunking import ChunkRecord
+from epc_smart_search.fact_extraction import extract_contract_facts
 from epc_smart_search.ocr_support import PageText
-from epc_smart_search.query_planner import REQUEST_SHAPE_BROAD_TOPIC, build_like_fallback, plan_query
+from epc_smart_search.query_planner import (
+    REQUEST_SHAPE_BROAD_TOPIC,
+    RETRIEVAL_MODE_FACT_LOOKUP,
+    RETRIEVAL_MODE_TOPIC_SUMMARY,
+    build_like_fallback,
+    plan_query,
+)
 from epc_smart_search.retrieval import HashingEmbedder, HybridRetriever
 from epc_smart_search.search_features import build_chunk_features
-from epc_smart_search.storage import ContractStore, pack_vector
+from epc_smart_search.storage import ContractFactRow, ContractStore, pack_vector
+
+
+def test_plan_query_does_not_bind_site_as_system_for_site_design_conditions() -> None:
+    plan = plan_query("what are the site design conditions")
+
+    assert plan.attribute_label == "design_conditions"
+    assert plan.system_phrase == ""
+    assert "site" in plan.focus_terms
 
 
 def test_direct_section_lookup_wins() -> None:
@@ -198,6 +213,17 @@ def test_query_plan_extracts_system_and_attribute_for_configuration_question() -
     assert "configuration" in plan.attribute_terms
 
 
+def test_query_plan_normalizes_explicit_system_aliases_for_fact_lookup() -> None:
+    plan = plan_query("What is the CCW configuration?")
+
+    assert plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
+    assert plan.system_phrase == "closed cooling water"
+    assert "ccw" in plan.system_aliases
+    assert "closed cooling water system" in plan.system_aliases
+    assert plan.attribute_label == "configuration"
+    assert plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
+
+
 def test_query_plan_normalizes_emission_guarantees_typo_and_keeps_general_intent() -> None:
     plan = plan_query("what are my emission guarentees")
 
@@ -232,6 +258,7 @@ def test_query_plan_marks_air_permits_prompt_as_broad_topic() -> None:
 
     assert plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
     assert plan.content_query == "air permits"
+    assert plan.retrieval_mode == RETRIEVAL_MODE_TOPIC_SUMMARY
 
 
 def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> None:
@@ -336,6 +363,39 @@ def test_hierarchical_search_prefers_exact_design_conditions_clause() -> None:
 
     assert ranked
     assert ranked[0].chunk_id == "compressor_conditions"
+
+
+def test_hierarchical_search_prefers_site_design_conditions_table_over_appendix_mentions() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "appendix_note",
+                "1.1",
+                "Design Basis for Guarantees",
+                (
+                    "The performance guarantees are stated for the following operating conditions and parameters. "
+                    "Additional design conditions are referenced in the guarantee appendix."
+                ),
+                3035,
+            ),
+            _chunk(
+                "site_design_conditions",
+                "2.1",
+                "Site Design Conditions",
+                (
+                    "Characteristic Specification GTG Equipment Location Outdoor ST/STG Location Outdoor "
+                    "Elevation 455 ft Ambient Pressure 14.457 psia Minimum Outdoor Ambient Temperature -5°F "
+                    "Maximum Outdoor Ambient Temperature 110°F Design Ambient Temperature 87°F"
+                ),
+                1591,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what are the site design conditions?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "site_design_conditions"
 
 
 def test_hierarchical_search_prefers_exact_power_clause_over_random_pump_schedule() -> None:
@@ -644,6 +704,70 @@ def test_retrieve_trace_prefers_semantic_system_clause_over_heading_only_noise()
     assert any(chunk.chunk_id == "ccw_system" for chunk in trace.recall_sources["semantic"])
 
 
+def test_fact_lookup_uses_shared_system_and_attribute_normalization() -> None:
+    db_path = "file:retrieval_fact_alias?mode=memory&cache=shared"
+    store = ContractStore(db_path)
+    embedder = HashingEmbedder(dimension=16)
+    chunk = _chunk(
+        "ccw_fact",
+        "5.18",
+        "Auxiliary Summary",
+        "The system summary table lists two parallel trains.",
+        261,
+    )
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc",
+        page_count=1,
+        chunks=[chunk],
+        pages=[PageText(page_num=261, text=chunk.full_text, ocr_used=False)],
+        features=build_chunk_features([chunk]),
+        facts=[
+            ContractFactRow(
+                document_id="doc1",
+                system="Closed Cooling Water System",
+                attribute="Configuration / Arrangement",
+                value="2 x 100%",
+                evidence_text="The closed cooling water system shall be arranged as 2 x 100%.",
+                source_chunk_id=chunk.chunk_id,
+                page_start=261,
+                page_end=261,
+            )
+        ],
+        embeddings={chunk.chunk_id: pack_vector(embedder.embed(chunk.full_text))},
+        model_name=embedder.model_name,
+        dimension=embedder.dimension,
+    )
+    retriever = HybridRetriever(store, embedder)
+
+    trace = retriever.retrieve_trace("What is the CCW configuration?")
+
+    assert trace.plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
+    assert trace.recall_sources["fact_lookup"]
+    assert trace.selected_bundle is not None
+    assert trace.selected_bundle.ranked_chunks[0].chunk_id == "ccw_fact"
+    assert trace.normalized_system == "closed cooling water"
+    assert trace.normalized_attribute == "configuration"
+    assert trace.fact_lookup_attempted is True
+    assert trace.fact_rows_returned == 1
+    assert trace.fallback_reason is None
+    assert trace.to_debug_dict() == {
+        "query": "What is the CCW configuration?",
+        "retrieval_mode": "fact_lookup",
+        "request_shape": "scalar",
+        "normalized_system": "closed cooling water",
+        "normalized_attribute": "configuration",
+        "fact_lookup_attempted": True,
+        "fact_rows_returned": 1,
+        "fallback_reason": None,
+        "selected_bundle_id": "ccw_fact",
+        "recall_source_counts": {"fact_lookup": 1},
+    }
+
+
 def test_retrieve_trace_can_use_gemma_to_break_close_bundle_ties() -> None:
     retriever = _seed_retriever(
         [
@@ -684,6 +808,136 @@ def test_retrieve_trace_can_use_gemma_to_break_close_bundle_ties() -> None:
     assert fake_gemma.calls[0]["response_style"] == "candidate_select"
     assert "Candidate ID: candidate_a" in fake_gemma.calls[0]["context"]
     assert "Candidate ID: candidate_b" in fake_gemma.calls[0]["context"]
+
+
+def test_fact_lookup_short_circuits_generic_recall_for_exact_value_questions() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_turbine",
+                "9.1",
+                "Steam Turbine",
+                "Turbine components shall comply with the applicable standards for rotating equipment.",
+                18,
+            ),
+            _chunk(
+                "selected_turbine",
+                "9.2",
+                "Selected Turbine Generator",
+                "The selected turbine generator model shall be Siemens SGT6-5000F for the project.",
+                19,
+            ),
+        ],
+        facts=[
+            ContractFactRow(
+                document_id="doc1",
+                system="turbine generator",
+                system_normalized="turbine generator",
+                attribute="model",
+                attribute_normalized="model",
+                value="Siemens SGT6-5000F for the project",
+                evidence_text="The selected turbine generator model shall be Siemens SGT6-5000F for the project.",
+                source_chunk_id="selected_turbine",
+                page_start=19,
+                page_end=19,
+            )
+        ],
+    )
+
+    trace = retriever.retrieve_trace("What model turbine is selected?")
+
+    assert trace.plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
+    assert list(trace.recall_sources) == ["fact_lookup"]
+    assert trace.recall_sources["fact_lookup"]
+    assert trace.merged_ranked
+    assert trace.merged_ranked[0].chunk_id == "selected_turbine"
+
+
+def test_topic_summary_keeps_broader_bundle_path_for_summary_questions() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "permit_overview",
+                "8.5",
+                "Air Permit Compliance",
+                "Contractor shall obtain air permits and maintain compliance with permit conditions.",
+                15,
+            ),
+            _chunk(
+                "permit_testing",
+                "8.5.1",
+                "Air Permit Testing",
+                "Contractor shall perform required emissions testing and submit reports demonstrating air permit compliance.",
+                16,
+                parent_chunk_id="permit_overview",
+            ),
+        ]
+    )
+
+    trace = retriever.retrieve_trace("give me information about air permits")
+
+    assert trace.plan.retrieval_mode == RETRIEVAL_MODE_TOPIC_SUMMARY
+    assert "fact_lookup" not in trace.recall_sources
+    assert trace.selected_bundle is not None
+    assert trace.selected_bundle.primary_chunk_id == "permit_overview"
+    assert {chunk.chunk_id for chunk in trace.selected_bundle.ranked_chunks[:2]} == {"permit_overview", "permit_testing"}
+    assert trace.fact_lookup_attempted is False
+    assert trace.fact_rows_returned == 0
+    assert trace.fallback_reason == "topic_summary_mode"
+    assert trace.to_debug_dict()["fact_lookup_attempted"] is False
+    assert trace.to_debug_dict()["recall_source_counts"]["planner_hints"] > 0
+
+
+def test_low_confidence_fact_lookup_falls_back_to_generic_recall() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "service_water_overview",
+                "6.1",
+                "Service Water Tank",
+                "The service water tank stores treated water for startup and shutdown operations.",
+                10,
+            ),
+            _chunk(
+                "service_water_capacity",
+                "6.2",
+                "Service Water Tank Data",
+                "The service water tank capacity shall be 500000 gallons.",
+                11,
+            ),
+        ],
+        facts=[
+            ContractFactRow(
+                document_id="doc1",
+                system="startup water header",
+                system_normalized="startup water header",
+                attribute="capacity",
+                attribute_normalized="capacity",
+                value="startup water",
+                evidence_text="The service water tank stores treated water for startup and shutdown operations.",
+                source_chunk_id="service_water_overview",
+                page_start=10,
+                page_end=10,
+            )
+        ],
+    )
+
+    trace = retriever.retrieve_trace("What is the capacity of the service water tank?")
+
+    assert trace.plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
+    assert "fact_lookup" in trace.recall_sources
+    assert "planner_hints" in trace.recall_sources
+    assert trace.merged_ranked
+    assert trace.merged_ranked[0].chunk_id == "service_water_capacity"
+    assert trace.normalized_system == "service water tank"
+    assert trace.normalized_attribute == "capacity"
+    assert trace.fact_lookup_attempted is True
+    assert trace.fact_rows_returned == 1
+    assert trace.fallback_reason == "fact_lookup_miss"
+    debug = trace.to_debug_dict()
+    assert debug["fallback_reason"] == "fact_lookup_miss"
+    assert debug["recall_source_counts"]["fact_lookup"] == 0
+    assert debug["recall_source_counts"]["planner_hints"] > 0
 
 
 def test_broad_topic_environmental_requirements_prefers_requirement_clause_over_appendix_header() -> None:
@@ -852,11 +1106,28 @@ def test_date_like_schedule_noise_is_penalized_for_equipment_queries() -> None:
     assert ranked[0].chunk_id == "steam_valves"
 
 
-def _seed_retriever(chunks: list[ChunkRecord]) -> HybridRetriever:
+def _seed_retriever(chunks: list[ChunkRecord], *, facts: list[ContractFactRow] | None = None) -> HybridRetriever:
     db_path = "file:retrieval_suite?mode=memory&cache=shared"
     store = ContractStore(db_path)
     embedder = HashingEmbedder(dimension=16)
     pages = [PageText(page_num=chunk.page_start, text=chunk.full_text, ocr_used=False) for chunk in chunks]
+    extracted_facts = facts
+    if extracted_facts is None:
+        extracted_facts = [
+            ContractFactRow(
+                document_id=fact.document_id,
+                system=fact.normalized_system,
+                system_normalized=fact.normalized_system,
+                attribute=fact.normalized_attribute,
+                attribute_normalized=fact.normalized_attribute,
+                value=fact.raw_value,
+                evidence_text=fact.evidence_text,
+                source_chunk_id=fact.source_chunk_id,
+                page_start=fact.page_start,
+                page_end=fact.page_end,
+            )
+            for fact in extract_contract_facts(chunks)
+        ]
     store.replace_document(
         document_id="doc1",
         display_name="Contract.pdf",
@@ -867,6 +1138,7 @@ def _seed_retriever(chunks: list[ChunkRecord]) -> HybridRetriever:
         chunks=chunks,
         pages=pages,
         features=build_chunk_features(chunks),
+        facts=extracted_facts,
         embeddings={chunk.chunk_id: pack_vector(embedder.embed(chunk.full_text)) for chunk in chunks},
         model_name=embedder.model_name,
         dimension=embedder.dimension,

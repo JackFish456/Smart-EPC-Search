@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
+from epc_smart_search.name_normalization import build_system_aliases, normalize_system_name
 from epc_smart_search.search_features import normalize_text
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{1,}")
@@ -243,9 +244,7 @@ def _register_phrase(registry: dict[str, dict[str, set[str]]], phrase: str, alia
     if len(significant_terms) < 2 and not alias:
         return
     bucket = registry.setdefault(canonical, {"aliases": set()})
-    bucket["aliases"].add(canonical)
-    singularized = _canonicalize_phrase(" ".join(terms))
-    bucket["aliases"].add(singularized)
+    bucket["aliases"].update(build_system_aliases(canonical))
     if alias:
         normalized_alias = _canonicalize_alias(alias)
         if normalized_alias:
@@ -258,15 +257,14 @@ def _canonicalize_phrase(phrase: str) -> str:
         return ""
     if tokens[-1] in TECHNICAL_HEADS:
         tokens[-1] = _singularize_token(tokens[-1])
-    return " ".join(tokens)
+    return normalize_system_name(" ".join(tokens))
 
 
 def _canonicalize_alias(alias: str) -> str:
+    normalized = normalize_system_name(alias)
+    if normalized:
+        return normalized
     terms = _normalized_terms(alias)
-    if not terms:
-        return ""
-    if len(terms) > 1 and terms[-1] in TECHNICAL_HEADS:
-        terms = (*terms[:-1], _singularize_token(terms[-1]))
     return " ".join(terms)
 
 

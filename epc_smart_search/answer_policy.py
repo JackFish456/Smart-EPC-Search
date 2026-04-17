@@ -10,10 +10,13 @@ from epc_smart_search.query_planner import (
     QueryPlan,
     REQUEST_SHAPE_BROAD_TOPIC,
     REQUEST_SHAPE_GROUPED_LIST,
+    RETRIEVAL_MODE_FACT_LOOKUP,
     has_term_overlap,
     plan_query,
 )
 from epc_smart_search.retrieval import Citation, ExactPageHit, RankedChunk
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{0,}")
 
 
 @dataclass(slots=True)
@@ -91,6 +94,9 @@ class AnswerPolicy:
     ) -> AssistantAnswer:
         effective_question = self.resolve_question(question, history)
         plan = self._plan_query(effective_question)
+        fact_answer = None if deep_think or expand_answer else self.build_fact_answer(effective_question, plan=plan)
+        if fact_answer is not None:
+            return fact_answer
         exact_hits = self.retriever.find_exact_page_hits(effective_question)
         exact_answer = None if expand_answer else self.build_exact_answer(effective_question, exact_hits)
         if exact_answer is not None and not deep_think:
@@ -105,6 +111,13 @@ class AnswerPolicy:
         elif trace is not None and trace.selected_bundle is not None:
             ranked = list(trace.selected_bundle.ranked_chunks)
             citations = list(trace.selected_bundle.citations)
+            if self.should_use_merged_ranked_for_requirements(plan, trace):
+                ranked = sorted(
+                    trace.merged_ranked,
+                    key=lambda chunk: self.score_requirement_candidate(chunk, plan),
+                    reverse=True,
+                )
+                citations = self.citations_from_ranked(ranked, effective_question)
         else:
             ranked = (
                 self.retriever.retrieve(effective_question, profile="deep")
@@ -122,9 +135,11 @@ class AnswerPolicy:
         refusal_citations = citations if not evidence_is_weak else []
         reference_answer = self.build_reference_answer(effective_question, ranked, citations)
         grouped_answer = self.build_grouped_answer(effective_question, ranked, citations)
+        page_attribute_answer = self.build_page_attribute_answer(effective_question, ranked, citations)
         compact_answer = self.build_compact_answer(effective_question, ranked, citations)
         extractive_answer = self.build_extractive_answer(effective_question, ranked, citations)
         broad_topic_answer = self.build_broad_topic_answer(effective_question, ranked, citations) if broad_topic_request else None
+        grounded_page_attribute_answer = None if evidence_is_weak else page_attribute_answer
         grounded_compact_answer = None if evidence_is_weak else compact_answer
         grounded_extractive_answer = None if evidence_is_weak else extractive_answer
         grounded_broad_topic_answer = None if evidence_is_weak else broad_topic_answer
@@ -133,6 +148,8 @@ class AnswerPolicy:
             return reference_answer
         if grouped_answer is not None and not summary_request and not deep_think and not expand_answer:
             return grouped_answer
+        if grounded_page_attribute_answer is not None and not summary_request and not deep_think and not expand_answer:
+            return grounded_page_attribute_answer
         if grounded_compact_answer is not None and not summary_request and not deep_think and not expand_answer:
             return grounded_compact_answer
         if grounded_extractive_answer is not None and not summary_request and not deep_think and not expand_answer:
@@ -223,6 +240,147 @@ class AnswerPolicy:
         if callable(build_evidence):
             return build_evidence(effective_question, ranked, citations)
         return ""
+
+    def build_page_attribute_answer(
+        self,
+        question: str,
+        ranked: list[RankedChunk],
+        citations: list[Citation],
+    ) -> AssistantAnswer | None:
+        if not ranked or self.store is None or self.retriever is None:
+            return None
+        plan = plan_query(question)
+        if plan.attribute_label != "design_conditions":
+            return None
+        resolve_document_id = getattr(self.retriever, "resolve_document_id", None)
+        if not callable(resolve_document_id):
+            return None
+        document_id = resolve_document_id()
+        if not document_id:
+            return None
+        for chunk in ranked[:4]:
+            if not self.is_strong_question_match(plan, chunk):
+                continue
+            page_rows = self.store.fetch_page_window(
+                document_id,
+                chunk.page_start,
+                chunk.page_end,
+                padding=0,
+                limit=max(1, min(2, chunk.page_end - chunk.page_start + 1)),
+            )
+            for row in page_rows:
+                entries = self.extract_design_conditions_table_entries(
+                    str(row["page_text"]),
+                    section_number=chunk.section_number,
+                    heading=chunk.heading,
+                )
+                if len(entries) < 4:
+                    continue
+                heading = " ".join(chunk.heading.split()) or "Design Conditions"
+                label = chunk.section_number or "Unnumbered clause"
+                pages = self.format_page_range(chunk.page_start, chunk.page_end)
+                lines = "\n".join(f"- {name}: {value}" for name, value in entries[:8])
+                body = f"{heading}:\n{lines}\nSection {label} - {heading}\nPages: {pages}"
+                return AssistantAnswer(body, citations, False)
+        return None
+
+    def build_fact_answer(
+        self,
+        question: str,
+        *,
+        plan: QueryPlan | None = None,
+    ) -> AssistantAnswer | None:
+        if self.store is None or self.retriever is None:
+            return None
+        plan = plan or self._plan_query(question)
+        if plan.retrieval_mode != RETRIEVAL_MODE_FACT_LOOKUP or not plan.system_phrase or not plan.attribute_label:
+            return None
+        resolve_document_id = getattr(self.retriever, "resolve_document_id", None)
+        if not callable(resolve_document_id):
+            return None
+        document_id = resolve_document_id()
+        if not document_id:
+            return None
+        rows = self.store.lookup_facts_by_system_attribute(document_id, plan.system_phrase, plan.attribute_label)
+        if not rows:
+            for alias in plan.system_aliases:
+                if not alias:
+                    continue
+                rows = self.store.lookup_facts_by_system_attribute(document_id, alias, plan.attribute_label)
+                if rows:
+                    break
+        if not rows:
+            return None
+        fact = rows[0]
+        chunk_row = self.store.fetch_chunk(fact.source_chunk_id)
+        section_number = chunk_row["section_number"] if chunk_row is not None else None
+        heading = " ".join(str(chunk_row["heading"]).split()) if chunk_row is not None else "Contract evidence"
+        citation = Citation(
+            chunk_id=fact.source_chunk_id,
+            section_number=section_number,
+            heading=heading,
+            attachment=None,
+            page_start=fact.page_start,
+            page_end=fact.page_end,
+            quote=fact.evidence_text,
+        )
+        section_label = section_number or "Unnumbered clause"
+        pages_label = f"{fact.page_start}" if fact.page_start == fact.page_end else f"{fact.page_start}-{fact.page_end}"
+        return AssistantAnswer(
+            f'"{fact.value}"\nSection {section_label} - {heading}\nPages: {pages_label}\nEvidence: "{fact.evidence_text}"',
+            [citation],
+            False,
+        )
+
+    @classmethod
+    def should_use_merged_ranked_for_requirements(cls, plan: QueryPlan, trace) -> bool:
+        if trace is None or trace.selected_bundle is None:
+            return False
+        if plan.request_shape != "scalar":
+            return False
+        if plan.attribute_label is not None or plan.count_question or plan.direct_text_question:
+            return False
+        if not cls.is_requirement_question(plan):
+            return False
+        selected_ranked = list(trace.selected_bundle.ranked_chunks)
+        merged_ranked = list(trace.merged_ranked)
+        if len(merged_ranked) <= 1:
+            return False
+        return cls.has_materially_stronger_requirement_candidate(plan, selected_ranked, merged_ranked)
+
+    @classmethod
+    def has_materially_stronger_requirement_candidate(
+        cls,
+        plan: QueryPlan,
+        selected_ranked: list[RankedChunk],
+        merged_ranked: list[RankedChunk],
+    ) -> bool:
+        selected_best = max((cls.score_requirement_candidate(chunk, plan) for chunk in selected_ranked[:3]), default=0.0)
+        merged_best = max((cls.score_requirement_candidate(chunk, plan) for chunk in merged_ranked[:6]), default=0.0)
+        return merged_best >= selected_best + 1.0
+
+    @classmethod
+    def score_requirement_candidate(cls, chunk: RankedChunk, plan: QueryPlan) -> float:
+        excerpt = cls.extract_ranked_excerpt(chunk.full_text, plan, limit=SUMMARY_EXCERPT_LIMIT)
+        if not excerpt:
+            return -10.0
+        lowered = excerpt.lower()
+        score = chunk.total_score
+        if plan.system_phrase and plan.system_phrase in lowered:
+            score += 1.4
+        score += 0.8 * sum(1 for term in plan.concept_terms if term and term in lowered)
+        score += 0.35 * cls.numeric_value_count(excerpt)
+        if re.search(r"\b(shall|must|required|responsible|obligated|provide|perform|submit|deliver|maintain|comply)\b", lowered):
+            score += 1.2
+        if re.search(r"\b\d+(?:\.\d+)?\s*%", lowered):
+            score += 1.0
+        if re.search(r"\bmixture of\b|\bconsist(?:s|ing)? of\b|\bcomprised of\b", lowered):
+            score += 1.2
+        if re.search(r"\bbasis for design\b|\bdesigned to provide\b|\bmeet the needs of\b", lowered):
+            score -= 1.0
+        if len(excerpt) <= 220:
+            score += 0.35
+        return score
 
     @classmethod
     def citations_from_ranked(cls, ranked: list[RankedChunk], question: str, *, limit: int = 5) -> list[Citation]:
@@ -334,7 +492,8 @@ class AnswerPolicy:
         if not hits:
             return None
         lowered = " ".join(question.lower().split())
-        if not self.prefer_exact_answer(lowered):
+        plan = plan_query(question)
+        if not self.prefer_exact_answer(lowered, plan):
             return None
         excerpts = [f"Page {hit.page_num}: {self.trim_page_excerpt(hit.page_text, lowered)}" for hit in hits[:4]]
         if self.is_count_question(lowered):
@@ -342,6 +501,10 @@ class AnswerPolicy:
             if quantity is not None:
                 body = f"Answer: {quantity}\n\nDirect contract text:\n" + "\n\n".join(excerpts)
                 return AssistantAnswer(body, [], False)
+        attribute_value = self.extract_attribute_value(question, hits, plan=plan)
+        if attribute_value is not None:
+            body = f"Answer: {attribute_value}\n\nDirect contract text:\n" + "\n\n".join(excerpts)
+            return AssistantAnswer(body, [], False)
         return AssistantAnswer("Direct contract text:\n" + "\n\n".join(excerpts), [], False)
 
     @staticmethod
@@ -349,8 +512,11 @@ class AnswerPolicy:
         return question.startswith("how many ")
 
     @staticmethod
-    def prefer_exact_answer(question: str) -> bool:
-        return question.startswith(("how many ", "show me ", "find ", "quote ", "where does ", "which page "))
+    def prefer_exact_answer(question: str, plan: QueryPlan | None = None) -> bool:
+        if question.startswith(("how many ", "show me ", "find ", "quote ", "where does ", "which page ")):
+            return True
+        exact_kind = AnswerPolicy.exact_attribute_kind(question, plan=plan)
+        return exact_kind is not None and question.startswith(("what is ", "what are ", "what model ", "which model "))
 
     @staticmethod
     def reference_lookup_kind(question: str) -> str | None:
@@ -407,6 +573,259 @@ class AnswerPolicy:
             re.compile(rf"((?:one|two|three|four|five|six|seven|eight|nine|ten|\(?\d+\)?)[^.]*?{singular})", re.IGNORECASE),
             re.compile(rf"({phrase}[^.]*?\(?\d+\)?\s*x\s*\d+%)", re.IGNORECASE),
             re.compile(rf"({singular}[^.]*?\(?\d+\)?\s*x\s*\d+%)", re.IGNORECASE),
+        ]
+
+    @classmethod
+    def extract_attribute_value(
+        cls,
+        question: str,
+        hits: list[ExactPageHit],
+        *,
+        plan: QueryPlan | None = None,
+    ) -> str | None:
+        plan = plan or plan_query(question)
+        kind = cls.exact_attribute_kind(question, plan=plan)
+        if kind is None:
+            return None
+        fact_value = cls.extract_attribute_fact_value(question, hits, plan, kind)
+        if fact_value is not None:
+            return fact_value
+        return cls.extract_attribute_evidence_value(question, hits, plan, kind)
+
+    @classmethod
+    def exact_attribute_kind(cls, question: str, *, plan: QueryPlan | None = None) -> str | None:
+        normalized = " ".join(question.lower().split())
+        plan = plan or plan_query(question)
+        if re.search(r"\bquantity\b|\bnumber of\b", normalized):
+            return "quantity"
+        if plan.attribute_label == "configuration":
+            return "configuration"
+        if plan.attribute_label == "capacity":
+            return "capacity"
+        if plan.attribute_label == "type" or re.search(r"\bmodel\b", normalized):
+            return "model"
+        if plan.attribute_label == "size" and re.search(r"\brating\b", normalized):
+            return "rating"
+        return None
+
+    @classmethod
+    def extract_attribute_fact_value(
+        cls,
+        question: str,
+        hits: list[ExactPageHit],
+        plan: QueryPlan,
+        kind: str,
+    ) -> str | None:
+        subject_terms = cls.attribute_subject_terms(plan, kind)
+        if not subject_terms:
+            return None
+        for hit in hits:
+            for label, value in cls.extract_fact_row_entries(hit.page_text):
+                if not cls.matches_attribute_row_label(label, subject_terms):
+                    continue
+                compact_value = cls.extract_value_from_text(value, plan, kind)
+                if compact_value is not None:
+                    return compact_value
+        return None
+
+    @classmethod
+    def extract_attribute_evidence_value(
+        cls,
+        question: str,
+        hits: list[ExactPageHit],
+        plan: QueryPlan,
+        kind: str,
+    ) -> str | None:
+        subject_terms = cls.attribute_subject_terms(plan, kind)
+        item_phrase = cls.quantity_item_phrase(question) if kind == "quantity" else ""
+        candidates: list[tuple[float, str]] = []
+        for hit in hits:
+            compact = " ".join(hit.page_text.split())
+            for sentence in cls.split_sentences(compact):
+                lowered = sentence.lower()
+                if subject_terms and not cls.matches_attribute_sentence(lowered, subject_terms):
+                    continue
+                score = cls.score_attribute_sentence(sentence, plan) if plan.attribute_label else cls.score_sentence(sentence, plan)
+                if kind == "quantity" and item_phrase and re.search(rf"\b{re.escape(item_phrase)}\b", lowered):
+                    score += 1.5
+                candidates.append((score, sentence))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        for _, sentence in candidates:
+            compact_value = cls.extract_value_from_text(sentence, plan, kind, item_phrase=item_phrase)
+            if compact_value is not None:
+                return compact_value
+        return None
+
+    @staticmethod
+    def attribute_subject_terms(plan: QueryPlan, kind: str) -> tuple[str, ...]:
+        excluded = set(plan.attribute_terms) | {"quantity", "number", "model", "rating"}
+        terms: list[str] = []
+        for term in plan.system_terms + plan.concept_terms + plan.focus_terms:
+            cleaned = term.strip().lower()
+            if not cleaned or cleaned in excluded or cleaned in GENERIC_SYSTEM_TERMS:
+                continue
+            terms.append(cleaned)
+        return tuple(dict.fromkeys(terms))
+
+    @classmethod
+    def extract_fact_row_entries(cls, page_text: str) -> list[tuple[str, str]]:
+        lines = [" ".join(line.split()).strip() for line in str(page_text).splitlines() if line and line.strip()]
+        if not lines:
+            return []
+        entries: list[tuple[str, str]] = []
+        for line in lines:
+            if ":" not in line:
+                continue
+            label, value = line.split(":", 1)
+            label = label.strip()
+            value = value.strip()
+            if label and value:
+                entries.append((label, value))
+        if entries:
+            return entries
+        for index in range(len(lines) - 1):
+            label = lines[index]
+            value = lines[index + 1]
+            if cls.looks_like_fact_row_label(label) and cls.looks_like_fact_row_value(value):
+                entries.append((label, value))
+        return entries
+
+    @staticmethod
+    def looks_like_fact_row_label(text: str) -> bool:
+        lowered = text.lower()
+        if re.search(r"\d", text):
+            return False
+        if lowered in {"characteristic", "specification", "value", "values"}:
+            return False
+        return len(TOKEN_RE.findall(text)) <= 8
+
+    @staticmethod
+    def looks_like_fact_row_value(text: str) -> bool:
+        lowered = text.lower()
+        if re.search(r"\d", text):
+            return True
+        return bool(re.search(r"\b(duplex|simplex|duty|standby|lead|lag|indoor|outdoor|n/?a)\b", lowered))
+
+    @staticmethod
+    def matches_attribute_row_label(label: str, subject_terms: tuple[str, ...]) -> bool:
+        lowered = label.lower()
+        hits = sum(1 for term in subject_terms if term in lowered)
+        required = max(1, min(len(subject_terms), 2))
+        return hits >= required
+
+    @staticmethod
+    def matches_attribute_sentence(text: str, subject_terms: tuple[str, ...]) -> bool:
+        hits = sum(1 for term in subject_terms if term in text)
+        required = max(1, min(len(subject_terms), 2))
+        return hits >= required
+
+    @classmethod
+    def extract_value_from_text(
+        cls,
+        text: str,
+        plan: QueryPlan,
+        kind: str,
+        *,
+        item_phrase: str = "",
+    ) -> str | None:
+        compact = " ".join(text.split())
+        if not compact:
+            return None
+        if kind == "configuration":
+            value = cls.extract_first_pattern_match(compact, cls.configuration_value_patterns())
+            return cls.normalize_exact_value(value)
+        if kind == "capacity":
+            patterns = (
+                re.compile(r"\b(\d+(?:\.\d+)?\s*%\s*capacity)\b", re.IGNORECASE),
+                re.compile(r"\bcapacity\s+(?:of|is|shall be|=)?\s*(\d+(?:\.\d+)?\s*(?:gpm|lb/hr|scfm|cfm|acfm|mmscfd|mw|kw|hp|tph|tpd|bpd|mbh|mmbtu/hr|kg/hr|lbm/hr|ft3/min|m3/hr|gal/min|gpd|%))\b", re.IGNORECASE),
+                re.compile(r"\brated\s+at\s+(\d+(?:\.\d+)?\s*(?:gpm|lb/hr|scfm|cfm|acfm|mmscfd|mw|kw|hp|tph|tpd|bpd|mbh|mmbtu/hr|kg/hr|lbm/hr|ft3/min|m3/hr|gal/min|gpd|%))\b", re.IGNORECASE),
+            )
+            value = cls.extract_first_pattern_match(compact, patterns)
+            return cls.normalize_exact_value(value)
+        if kind == "model":
+            patterns = (
+                re.compile(r"\bmodel(?:\s+\w+){0,3}\s+(?:shall be|is|:)?\s*([A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*)\b"),
+                re.compile(r"\bselected\s+\w+\s+model\s+shall\s+be\s+([A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*)\b", re.IGNORECASE),
+                re.compile(r"\b([A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*)\b"),
+            )
+            value = cls.extract_first_pattern_match(compact, patterns)
+            return cls.normalize_exact_value(value)
+        if kind == "rating":
+            patterns = (
+                re.compile(r"\brating(?:\s+of|\s+is|:)?\s*(\d+(?:\.\d+)?\s*(?:kv|v|volt(?:s)?|a|amp(?:s)?|ka|kva|mva|mw|kw|hp|psi|psig|psia|inch(?:es)?|mm|ft|%))\b", re.IGNORECASE),
+                re.compile(r"\brated\s+at\s+(\d+(?:\.\d+)?\s*(?:kv|v|volt(?:s)?|a|amp(?:s)?|ka|kva|mva|mw|kw|hp|psi|psig|psia|inch(?:es)?|mm|ft|%))\b", re.IGNORECASE),
+            )
+            value = cls.extract_first_pattern_match(compact, patterns)
+            return cls.normalize_exact_value(value)
+        if kind == "quantity":
+            count_token = r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)(?:\s*\(\d+\))?|\(?\d+\)?)"
+            if item_phrase:
+                patterns = cls.quantity_value_patterns(item_phrase)
+                value = cls.extract_first_pattern_match(compact, patterns)
+                return cls.normalize_exact_value(value)
+            value = cls.extract_first_pattern_match(
+                compact,
+                (
+                    re.compile(
+                        rf"\b({count_token}(?:\s*[xX]\s*\d+%\s*(?:capacity)?|\s+\d+%\s+capacity|\s+full\s+capacity)?)\b",
+                        re.IGNORECASE,
+                    ),
+                ),
+            )
+            return cls.normalize_exact_value(value)
+        compact_value = cls.extract_compact_attribute_value(compact, plan)
+        return cls.normalize_exact_value(compact_value or None)
+
+    @staticmethod
+    def extract_first_pattern_match(text: str, patterns: Sequence[re.Pattern[str]]) -> str | None:
+        for pattern in patterns:
+            match = pattern.search(text)
+            if match:
+                return match.group(1) if match.lastindex else match.group(0)
+        return None
+
+    @staticmethod
+    def normalize_exact_value(value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = " ".join(value.split()).strip(" ,;:.")
+        if not cleaned:
+            return None
+        cleaned = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", " x ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def quantity_item_phrase(question: str) -> str:
+        normalized = " ".join(question.lower().split()).strip(" ?.")
+        match = re.search(r"\b(?:quantity|number)\s+of\s+(.+)$", normalized)
+        if match:
+            phrase = match.group(1).strip()
+            return re.sub(r"^(?:the|a|an)\s+", "", phrase)
+        return ""
+
+    @staticmethod
+    def quantity_value_patterns(item_phrase: str) -> list[re.Pattern[str]]:
+        phrase = re.escape(item_phrase)
+        singular = re.escape(item_phrase[:-1]) if item_phrase.endswith("s") and len(item_phrase) > 4 else phrase
+        count_token = r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)(?:\s*\(\d+\))?|\(?\d+\)?)"
+        return [
+            re.compile(
+                rf"\b({count_token}(?:\s*[xX]\s*\d+%\s*(?:capacity)?|\s+\d+%\s+capacity|\s+full\s+capacity)?)\s+[^.]*?{phrase}\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"\b({count_token}(?:\s*[xX]\s*\d+%\s*(?:capacity)?|\s+\d+%\s+capacity|\s+full\s+capacity)?)\s+[^.]*?{singular}\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"\b{phrase}[^.]*?\b({count_token}(?:\s*[xX]\s*\d+%\s*(?:capacity)?|\s+\d+%\s+capacity|\s+full\s+capacity)?)\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"\b{singular}[^.]*?\b({count_token}(?:\s*[xX]\s*\d+%\s*(?:capacity)?|\s+\d+%\s+capacity|\s+full\s+capacity)?)\b",
+                re.IGNORECASE,
+            ),
         ]
 
     @staticmethod
@@ -746,6 +1165,66 @@ class AnswerPolicy:
     def truncate_text(text: str, limit: int = 340) -> str:
         compact = " ".join(text.split())
         return compact if len(compact) <= limit else compact[: limit - 3] + "..."
+
+    @classmethod
+    def extract_design_conditions_table_entries(
+        cls,
+        page_text: str,
+        *,
+        section_number: str | None = None,
+        heading: str = "",
+    ) -> list[tuple[str, str]]:
+        lines = [" ".join(line.split()) for line in str(page_text).splitlines() if line and line.strip()]
+        if not lines:
+            return []
+        if section_number:
+            normalized_section = section_number.strip().strip(".")
+            if lines and lines[0].strip().strip(".") == normalized_section:
+                lines = lines[1:]
+        normalized_heading = " ".join(heading.split()).lower()
+        if normalized_heading and lines and lines[0].lower() == normalized_heading:
+            lines = lines[1:]
+        if len(lines) >= 2 and lines[0].lower() == "characteristic" and lines[1].lower() == "specification":
+            lines = lines[2:]
+        entries: list[tuple[str, str]] = []
+        index = 0
+        while index + 1 < len(lines):
+            label = lines[index]
+            value = lines[index + 1]
+            if cls.is_design_conditions_header(label):
+                index += 1
+                continue
+            if cls.is_design_conditions_bullet(value):
+                break
+            if cls.looks_like_design_conditions_value(value):
+                entries.append((label, value))
+                index += 2
+                continue
+            index += 1
+        return entries
+
+    @staticmethod
+    def is_design_conditions_header(text: str) -> bool:
+        normalized = " ".join(text.lower().split())
+        return normalized in {"characteristic", "specification"}
+
+    @staticmethod
+    def is_design_conditions_bullet(text: str) -> bool:
+        normalized = text.strip()
+        return normalized in {"•", "\uf0b7"} or normalized.startswith(("• ", "\uf0b7 "))
+
+    @classmethod
+    def looks_like_design_conditions_value(cls, text: str) -> bool:
+        normalized = " ".join(text.lower().split())
+        if not normalized or cls.is_design_conditions_header(normalized) or cls.is_design_conditions_bullet(text):
+            return False
+        if normalized.endswith("conditions"):
+            return False
+        if re.search(r"\d", text):
+            return True
+        if normalized in {"yes", "no", "indoor", "outdoor", "inside", "outside", "n/a", "na"}:
+            return True
+        return len(TOKEN_RE.findall(text)) <= 4
 
     @classmethod
     def extract_ranked_excerpt(
@@ -1105,6 +1584,14 @@ class AnswerPolicy:
     def has_strong_ranked_evidence(cls, plan: QueryPlan, ranked: list[RankedChunk]) -> bool:
         if plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC:
             return cls.has_strong_broad_topic_evidence(plan, ranked)
+        if (
+            plan.request_shape == "scalar"
+            and plan.attribute_label is None
+            and not plan.count_question
+            and not plan.direct_text_question
+            and cls.is_requirement_question(plan)
+        ):
+            return max((cls.score_requirement_candidate(chunk, plan) for chunk in ranked[:5]), default=0.0) >= 7.0
         return any(cls.is_strong_question_match(plan, chunk) for chunk in ranked[:3])
 
     @classmethod
@@ -1296,7 +1783,7 @@ class AnswerPolicy:
             system_hits = sum(1 for term in plan.system_terms if term and term in combined)
             if system_hits < max(1, min(2, len(plan.system_terms))):
                 return False
-        if (plan.attribute_label or plan.count_question) and not AnswerPolicy.excerpt_matches_attribute(lowered, plan):
+        if ((plan.attribute_label and not plan.direct_text_question) or plan.count_question) and not AnswerPolicy.excerpt_matches_attribute(lowered, plan):
             return False
         if AnswerPolicy.is_requirement_question(plan) and not re.search(
             r"\b(shall|must|required|responsible|obligated|provide|perform|submit|deliver|maintain|comply)\b",

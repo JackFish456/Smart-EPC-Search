@@ -99,6 +99,10 @@ python -m pytest
 python -m ruff check .
 ```
 
+The regression benchmark lives in `tests/test_regression_benchmark.py` and seeds one shared synthetic EPC corpus from `assets/regression_benchmark_corpus.json`. Questions and expectations live in `assets/regression_benchmark_cases.json`, grouped into exact value, system summary, section lookup, page lookup, and no-answer coverage.
+
+To extend the benchmark, add or update sanitized chunks in the corpus file, then add a case with the category, question, and only the expectations needed for that prompt. Prefer reusing existing chunks, keep values and page numbers explicit, and avoid prompts that require Gemma so the suite stays deterministic in CI.
+
 ## Package
 
 For Windows portable bundles:

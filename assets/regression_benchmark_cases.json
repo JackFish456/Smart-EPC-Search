@@ -1,0 +1,298 @@
+[
+  {
+    "name": "exact_fire_water_pump_horsepower",
+    "category": "exact_value",
+    "question": "what is the fire water pump horse power",
+    "expected_top_chunk_ids": ["fire_water_pump"],
+    "expected_answer_contains": ["350 HP"],
+    "require_citations": true
+  },
+  {
+    "name": "exact_cooling_water_pump_horsepower",
+    "category": "exact_value",
+    "question": "what is the cooling water pump horse power",
+    "expected_top_chunk_ids": ["cooling_water_pump"],
+    "expected_answer_contains": ["425 HP"],
+    "require_citations": true
+  },
+  {
+    "name": "exact_dew_point_configuration",
+    "category": "exact_value",
+    "question": "What is the dew point configuration?",
+    "expected_top_chunk_ids": ["dew_point_configuration"],
+    "expected_answer_contains": ["duplex analyzer arrangement with automatic switchover"],
+    "require_citations": false
+  },
+  {
+    "name": "exact_dew_point_heater_configuration",
+    "category": "exact_value",
+    "question": "dew point heater configuration",
+    "expected_top_chunk_ids": ["dew_point_heater"],
+    "expected_answer_contains": ["4x50%"],
+    "require_citations": false
+  },
+  {
+    "name": "exact_compressor_design_conditions",
+    "category": "exact_value",
+    "question": "What are the compressor design conditions?",
+    "expected_top_chunk_ids": ["compressor_design_conditions"],
+    "expected_answer_contains": ["1250 psig", "105 degF"],
+    "require_citations": true
+  },
+  {
+    "name": "exact_closed_cooling_water_mixture",
+    "category": "exact_value",
+    "question": "what are the closed cooling water requirements",
+    "expected_top_chunk_ids": ["closed_cooling_water_mix"],
+    "expected_answer_contains": ["45% propylene glycol", "55% demineralized water"],
+    "require_citations": true
+  },
+  {
+    "name": "exact_demin_water_pump_count",
+    "category": "exact_value",
+    "question": "how many demineralized water pumps do we have",
+    "expected_top_chunk_ids": ["demin_water_pumps"],
+    "expected_answer_contains": ["two (2) x 100%"],
+    "require_citations": false
+  },
+  {
+    "name": "exact_condensate_storage_tank_capacity",
+    "category": "exact_value",
+    "question": "what is the condensate storage tank capacity",
+    "expected_top_chunk_ids": ["condensate_storage_tank"],
+    "expected_answer_contains": ["750,000 gallons"],
+    "require_citations": true
+  },
+  {
+    "name": "summary_air_permits",
+    "category": "system_summary",
+    "question": "give me information about air permit compliance",
+    "expected_top_chunk_ids": ["air_permit_compliance"],
+    "expected_answer_contains": ["air permit compliance", "air permits"],
+    "require_citations": true
+  },
+  {
+    "name": "summary_environmental_requirements",
+    "category": "system_summary",
+    "question": "give me information about environmental testing",
+    "expected_top_chunk_ids": ["environmental_testing"],
+    "expected_answer_contains": ["test reports within ten (10) days"],
+    "require_citations": true
+  },
+  {
+    "name": "summary_fuel_gas_system",
+    "category": "system_summary",
+    "question": "give me information about fuel gas system",
+    "expected_top_chunk_ids": ["fuel_gas_description", "fuel_gas_supply"],
+    "expected_answer_contains": ["fuel gas system", "conditions the gas"],
+    "require_citations": true
+  },
+  {
+    "name": "summary_closed_cooling_water",
+    "category": "system_summary",
+    "question": "give me information about closed cooling water",
+    "expected_top_chunk_ids": ["closed_cooling_water_mix", "closed_cooling_water_pumps"],
+    "expected_answer_contains": ["closed cooling water", "two 100% capacity"],
+    "require_citations": true
+  },
+  {
+    "name": "summary_water_treatment",
+    "category": "system_summary",
+    "question": "give me information about water treatment",
+    "expected_top_chunk_ids": ["water_treatment_requirements"],
+    "expected_answer_contains": ["chemical feed equipment", "conductivity monitoring"],
+    "require_citations": true
+  },
+  {
+    "name": "summary_electrical_distribution",
+    "category": "system_summary",
+    "question": "give me information about electrical distribution",
+    "expected_top_chunk_ids": ["electrical_distribution", "motor_control_centers"],
+    "expected_answer_contains": ["13.8 kV", "480 V"],
+    "require_citations": true
+  },
+  {
+    "name": "summary_instrument_air",
+    "category": "system_summary",
+    "question": "give me information about instrument air",
+    "expected_top_chunk_ids": ["instrument_air_compressors"],
+    "expected_answer_contains": ["oil-free rotary screw compressors"],
+    "require_citations": true
+  },
+  {
+    "name": "summary_fire_protection",
+    "category": "system_summary",
+    "question": "give me information about fire protection",
+    "expected_top_chunk_ids": ["fire_protection", "fire_water_pump"],
+    "expected_answer_contains": ["fire protection system", "yard loop"],
+    "require_citations": true
+  },
+  {
+    "name": "section_fire_water_pump_horsepower",
+    "category": "section_lookup",
+    "question": "what section covers the fire water pump horsepower",
+    "expected_top_chunk_ids": ["fire_water_pump"],
+    "expected_section": "6.1",
+    "require_citations": true
+  },
+  {
+    "name": "section_cooling_water_pump_horsepower",
+    "category": "section_lookup",
+    "question": "what section covers the cooling water pump horsepower",
+    "expected_top_chunk_ids": ["cooling_water_pump"],
+    "expected_section": "6.2",
+    "require_citations": true
+  },
+  {
+    "name": "section_dew_point_configuration",
+    "category": "section_lookup",
+    "question": "what section covers dew point configuration",
+    "expected_top_chunk_ids": ["dew_point_configuration"],
+    "expected_section": "5.4",
+    "require_citations": true
+  },
+  {
+    "name": "section_dew_point_heater_configuration",
+    "category": "section_lookup",
+    "question": "what section covers the dew point heater configuration",
+    "expected_top_chunk_ids": ["dew_point_heater"],
+    "expected_section": "5.5",
+    "require_citations": true
+  },
+  {
+    "name": "section_air_permit_compliance",
+    "category": "section_lookup",
+    "question": "what section covers air permit compliance",
+    "expected_top_chunk_ids": ["air_permit_compliance"],
+    "expected_section": "8.1",
+    "require_citations": true
+  },
+  {
+    "name": "section_environmental_testing_reports",
+    "category": "section_lookup",
+    "question": "what section covers environmental testing reports",
+    "expected_top_chunk_ids": ["environmental_testing"],
+    "expected_section": "8.2",
+    "require_citations": true
+  },
+  {
+    "name": "section_instrument_air_compressors",
+    "category": "section_lookup",
+    "question": "what section covers the instrument air compressors",
+    "expected_top_chunk_ids": ["instrument_air_compressors"],
+    "expected_section": "10.1",
+    "require_citations": true
+  },
+  {
+    "name": "section_nox_emission_guarantees",
+    "category": "section_lookup",
+    "question": "what section covers nox emission guarantees",
+    "expected_top_chunk_ids": ["emission_guarantees_limits", "emission_guarantees_header"],
+    "expected_section": "E.1",
+    "require_citations": true
+  },
+  {
+    "name": "page_fire_water_pump_horsepower",
+    "category": "page_lookup",
+    "question": "which page covers the fire water pump horsepower",
+    "expected_top_chunk_ids": ["fire_water_pump"],
+    "expected_page": 31
+  },
+  {
+    "name": "page_cooling_water_pump_horsepower",
+    "category": "page_lookup",
+    "question": "which page covers the cooling water pump horsepower",
+    "expected_top_chunk_ids": ["cooling_water_pump"],
+    "expected_page": 32
+  },
+  {
+    "name": "page_dew_point_configuration",
+    "category": "page_lookup",
+    "question": "which page covers dew point configuration",
+    "expected_top_chunk_ids": ["dew_point_configuration"],
+    "expected_page": 24
+  },
+  {
+    "name": "page_air_permit_compliance",
+    "category": "page_lookup",
+    "question": "which page covers air permit compliance",
+    "expected_top_chunk_ids": ["air_permit_compliance"],
+    "expected_page": 43
+  },
+  {
+    "name": "page_environmental_testing_reports",
+    "category": "page_lookup",
+    "question": "which page covers environmental testing reports",
+    "expected_top_chunk_ids": ["environmental_testing"],
+    "expected_page": 45
+  },
+  {
+    "name": "page_demin_water_pumps",
+    "category": "page_lookup",
+    "question": "which page covers demineralized water pumps",
+    "expected_top_chunk_ids": ["demin_water_pumps"],
+    "expected_page": 51
+  },
+  {
+    "name": "page_instrument_air_compressors",
+    "category": "page_lookup",
+    "question": "which page covers the instrument air compressors",
+    "expected_top_chunk_ids": ["instrument_air_compressors"],
+    "expected_page": 61
+  },
+  {
+    "name": "page_nox_emission_guarantees",
+    "category": "page_lookup",
+    "question": "which page covers nox emission guarantees",
+    "expected_top_chunk_ids": ["emission_guarantees_limits", "emission_guarantees_header"],
+    "expected_page": 72
+  },
+  {
+    "name": "no_answer_transformer_impedance",
+    "category": "no_answer",
+    "question": "what is the transformer impedance",
+    "expect_refusal": true
+  },
+  {
+    "name": "no_answer_generator_manufacturer",
+    "category": "no_answer",
+    "question": "what is the generator manufacturer",
+    "expect_refusal": true
+  },
+  {
+    "name": "no_answer_fire_water_pump_color",
+    "category": "no_answer",
+    "question": "what is the ammonia flow rate",
+    "expect_refusal": true
+  },
+  {
+    "name": "no_answer_chiller_count",
+    "category": "no_answer",
+    "question": "how many chillers are provided",
+    "expect_refusal": true
+  },
+  {
+    "name": "no_answer_stack_height",
+    "category": "no_answer",
+    "question": "what is the stack height",
+    "expect_refusal": true
+  },
+  {
+    "name": "no_answer_solar_section",
+    "category": "no_answer",
+    "question": "what is the cybersecurity protocol",
+    "expect_refusal": true
+  },
+  {
+    "name": "no_answer_refrigerant_page",
+    "category": "no_answer",
+    "question": "what is the drone inspection frequency",
+    "expect_refusal": true
+  },
+  {
+    "name": "no_answer_warranty_ld_amount",
+    "category": "no_answer",
+    "question": "what is the warranty liquidated damages amount",
+    "expect_refusal": true
+  }
+]

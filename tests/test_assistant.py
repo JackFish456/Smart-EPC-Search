@@ -3,8 +3,10 @@ from epc_smart_search.assistant import DEEP_MAX_NEW_TOKENS
 from epc_smart_search.assistant import SUMMARY_ENABLE_THINKING
 from epc_smart_search.assistant import SUMMARY_MAX_NEW_TOKENS
 from epc_smart_search.answer_policy import AnswerPolicy
+from epc_smart_search.query_planner import plan_query
 from epc_smart_search.retrieval import Citation, ExactPageHit
-from epc_smart_search.retrieval import RankedChunk
+from epc_smart_search.retrieval import EvidenceBundle, RankedChunk, RetrievalTrace
+from epc_smart_search.storage import ContractFactRow
 
 
 def test_limit_citations_prefers_distinct_pages() -> None:
@@ -268,6 +270,137 @@ def test_build_exact_answer_prefers_quantity_value_for_how_many_question() -> No
     assert answer is not None
     assert "Answer:" in answer.text
     assert "two (2) x 100%" in answer.text.lower()
+
+
+def test_build_exact_answer_returns_fact_row_configuration_value() -> None:
+    policy = AnswerPolicy(None, None)
+    hits = [
+        ExactPageHit(
+            page_num=2686,
+            snippet="Dew Point Heaters",
+            page_text=(
+                "Equipment\n"
+                "Configuration\n"
+                "Dew Point Heaters\n"
+                "4x50%\n"
+                "Fuel Gas Heaters\n"
+                "2x100%\n"
+            ),
+        )
+    ]
+
+    answer = policy.build_exact_answer("What is the configuration of the dew point heaters?", hits)
+
+    assert answer is not None
+    assert answer.text.startswith("Answer: 4 x 50%")
+    assert "Direct contract text:" in answer.text
+
+
+def test_build_exact_answer_returns_fact_row_capacity_value() -> None:
+    policy = AnswerPolicy(None, None)
+    hits = [
+        ExactPageHit(
+            page_num=261,
+            snippet="Closed Cooling Water Pumps",
+            page_text=(
+                "Closed Cooling Water Pumps: 100% capacity\n"
+                "Closed Cooling Water Pump Motors: 1200 HP\n"
+            ),
+        )
+    ]
+
+    answer = policy.build_exact_answer("What is the capacity of the closed cooling water pumps?", hits)
+
+    assert answer is not None
+    assert answer.text.startswith("Answer: 100% capacity")
+    assert "Direct contract text:" in answer.text
+
+
+def test_answer_policy_returns_store_backed_fact_answer_before_page_search() -> None:
+    class FakeStore:
+        def lookup_facts_by_system_attribute(self, document_id: str, system: str, attribute: str):
+            if document_id != "doc1" or "dew point heater" not in system or attribute != "configuration":
+                return []
+            return [
+                ContractFactRow(
+                    document_id="doc1",
+                    system="dew point heater",
+                    system_normalized="dew point heater",
+                    attribute="configuration",
+                    attribute_normalized="configuration",
+                    value="4 x 50%",
+                    evidence_text="Dew point heaters shall be furnished in a 4 x 50% configuration.",
+                    source_chunk_id="chunk_fact",
+                    page_start=41,
+                    page_end=41,
+                    fact_rowid=1,
+                )
+            ]
+
+        def fetch_chunk(self, chunk_id: str):
+            if chunk_id != "chunk_fact":
+                return None
+            return {
+                "section_number": "7.4.2",
+                "heading": "Dew Point Heaters",
+            }
+
+    class FakeRetriever:
+        def resolve_document_id(self) -> str:
+            return "doc1"
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called for a stored fact answer.")
+
+    policy = AnswerPolicy(FakeStore(), FakeRetriever())
+    answer = policy.answer("What is the configuration of the dew point heaters?", None, FakeGemma())
+
+    assert answer.refused is False
+    assert answer.text.startswith('"4 x 50%"')
+    assert "Section 7.4.2 - Dew Point Heaters" in answer.text
+    assert 'Evidence: "Dew point heaters shall be furnished in a 4 x 50% configuration."' in answer.text
+    assert answer.citations[0].chunk_id == "chunk_fact"
+
+
+def test_build_exact_answer_returns_quantity_value_for_quantity_question() -> None:
+    policy = AnswerPolicy(None, None)
+    hits = [
+        ExactPageHit(
+            page_num=290,
+            snippet="Demineralized water pumps",
+            page_text=(
+                "The Demineralized Water System includes two (2) x 100% demineralized water pumps. "
+                "These pumps deliver water to the storage tank."
+            ),
+        )
+    ]
+
+    answer = policy.build_exact_answer("What is the quantity of the demineralized water pumps?", hits)
+
+    assert answer is not None
+    assert answer.text.startswith("Answer: two (2) x 100%")
+    assert "Direct contract text:" in answer.text
+
+
+def test_build_exact_answer_falls_back_to_direct_text_when_exact_value_not_found() -> None:
+    policy = AnswerPolicy(None, None)
+    hits = [
+        ExactPageHit(
+            page_num=41,
+            snippet="Dew point configuration",
+            page_text=(
+                "The fuel gas dew point configuration shall use a duplex analyzer arrangement with automatic switchover. "
+                "Commissioning checks shall verify the analyzer alarms."
+            ),
+        )
+    ]
+
+    answer = policy.build_exact_answer("What is the configuration of the dew point heaters?", hits)
+
+    assert answer is not None
+    assert answer.text.startswith("Direct contract text:\n")
+    assert "Answer:" not in answer.text
 
 
 def test_build_extractive_answer_rejects_system_overview_for_how_many_question_without_quantity() -> None:
@@ -634,6 +767,98 @@ def test_build_compact_answer_returns_exact_function_line_for_how_it_works_quest
     assert "Section 5.2 - Fuel Gas System Description" in answer.text
 
 
+def test_answer_policy_uses_page_table_for_site_design_conditions() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="guarantee_basis",
+            section_number="1.1",
+            heading="Design Basis for Guarantees",
+            full_text=(
+                "The performance guarantees are stated for the following operating conditions and parameters. "
+                "Additional design conditions are referenced elsewhere."
+            ),
+            page_start=3035,
+            page_end=3035,
+            ordinal_in_document=1,
+            total_score=5.7,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        ),
+        RankedChunk(
+            chunk_id="site_conditions",
+            section_number="2.1",
+            heading="Site Design Conditions",
+            full_text=(
+                "2.1 Characteristic Specification GTG Equipment Location Outdoor ST/STG Location Outdoor "
+                "Elevation 455 ft Ambient Pressure"
+            ),
+            page_start=1591,
+            page_end=1591,
+            ordinal_in_document=2,
+            total_score=5.6,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        ),
+    ]
+    citations = [Citation("site_conditions", "2.1", "Site Design Conditions", None, 1591, 1591, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+        def resolve_document_id(self) -> str:
+            return "doc1"
+
+    class FakeStore:
+        def fetch_page_window(self, document_id: str, page_start: int, page_end: int, *, padding: int = 0, limit: int = 2):
+            if page_start != 1591:
+                return []
+            return [
+                {
+                    "page_num": 1591,
+                    "page_text": (
+                        "2.1\n"
+                        "Site Design Conditions\n"
+                        "Characteristic\n"
+                        "Specification\n"
+                        "GTG Equipment Location\n"
+                        "Outdoor\n"
+                        "ST/STG Location\n"
+                        "Outdoor\n"
+                        "Elevation\n"
+                        "455 ft\n"
+                        "Ambient Pressure\n"
+                        "14.457 psia\n"
+                        "Minimum Outdoor Ambient Temperature\n"
+                        "-5°F\n"
+                        "Maximum Outdoor Ambient Temperature\n"
+                        "110°F\n"
+                        "Design Ambient Temperature\n"
+                        "87°F\n"
+                    ),
+                }
+            ]
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called for a grounded design-conditions table answer")
+
+    policy = AnswerPolicy(FakeStore(), FakeRetriever())
+    answer = policy.answer("what are the site design conditions", None, FakeGemma())
+
+    assert "Site Design Conditions:" in answer.text
+    assert "- Elevation: 455 ft" in answer.text
+    assert "- Ambient Pressure: 14.457 psia" in answer.text
+    assert "- Maximum Outdoor Ambient Temperature: 110°F" in answer.text
+    assert "Section 2.1 - Site Design Conditions" in answer.text
+
+
 def test_system_attribute_question_refuses_when_best_match_is_blurry() -> None:
     ranked = [
         RankedChunk(
@@ -946,6 +1171,82 @@ def test_broad_topic_summary_prompt_context_skips_acronym_sections() -> None:
 
     assert "Heading: Air Permit Compliance" in context
     assert "Heading: Common Acronyms in Air Permits" not in context
+
+
+def test_requirement_question_can_use_merged_ranked_when_selected_bundle_is_too_thin() -> None:
+    generic = RankedChunk(
+        chunk_id="ccw_generic",
+        section_number="5.18",
+        heading="Closed Cooling Water",
+        full_text=(
+            "Basis for Design The closed cooling water pump and air coolers will be unitized and designed to provide 100 percent "
+            "of the required cooling water to meet the needs of a single Unit at the required head."
+        ),
+        page_start=261,
+        page_end=261,
+        ordinal_in_document=1,
+        total_score=9.3,
+        lexical_score=1.0,
+        semantic_score=0.0,
+    )
+    better = RankedChunk(
+        chunk_id="ccw_mix",
+        section_number="1",
+        heading="CLOSED COOLING WATER IS A MIXTURE OF 45% PROPYLENE GLYCOL AND 55% DEMINERALIZED WATER",
+        full_text="CLOSED COOLING WATER IS A MIXTURE OF 45% PROPYLENE GLYCOL AND 55% DEMINERALIZED WATER.",
+        page_start=262,
+        page_end=262,
+        ordinal_in_document=2,
+        total_score=9.3,
+        lexical_score=1.0,
+        semantic_score=0.0,
+    )
+    selected_bundle = EvidenceBundle(
+        bundle_id="ccw_generic",
+        primary_chunk_id="ccw_generic",
+        ranked_chunks=(generic,),
+        citations=(Citation("ccw_generic", "5.18", "Closed Cooling Water", None, 261, 261, "quote"),),
+        bundle_score=4.0,
+        confidence=0.7,
+        source_names=("raw_fts",),
+    )
+    trace = RetrievalTrace(
+        query="what are the closed cooling water requirements",
+        plan=plan_query("what are the closed cooling water requirements"),
+        recall_sources={},
+        merged_ranked=[generic, better],
+        bundles=[selected_bundle],
+        selected_bundle=selected_bundle,
+        used_gemma_disambiguation=False,
+    )
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve_trace(self, question: str, profile: str = "normal", gemma_client=None):
+            return trace
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            raise AssertionError("retrieve() should not be used when retrieve_trace() is available")
+
+        def expand_with_context(self, incoming_ranked):
+            return []
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called for this grounded requirement answer.")
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+    assistant.answer_policy = AnswerPolicy(None, assistant.retriever)
+
+    answer = assistant.ask("what are the closed cooling water requirements")
+
+    assert answer.refused is False
+    assert "45% PROPYLENE GLYCOL" in answer.text
+    assert "55% DEMINERALIZED WATER" in answer.text
 
 
 def test_deep_think_routes_non_summary_questions_through_gemma() -> None:

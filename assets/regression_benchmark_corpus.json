@@ -1,0 +1,232 @@
+[
+  {
+    "chunk_id": "fuel_gas_toc",
+    "section_number": "5.0",
+    "heading": "Contents",
+    "full_text": "5.2 Fuel Gas System Description 21. 5.3 Fuel Gas Supply 22. 5.4 Dew Point Configuration 24.",
+    "page_start": 4
+  },
+  {
+    "chunk_id": "environmental_definition",
+    "section_number": "1.2",
+    "heading": "Applicable Requirements",
+    "full_text": "\"Applicable Requirements\" means the legal obligations identified elsewhere in the contract.",
+    "page_start": 11,
+    "chunk_type": "definition"
+  },
+  {
+    "chunk_id": "air_permit_acronyms",
+    "section_number": "A.1",
+    "heading": "Common Acronyms in Air Permits",
+    "full_text": "APD means air permit documentation. CEMS means continuous emissions monitoring system. These acronyms are provided for convenience only.",
+    "page_start": 12,
+    "chunk_type": "definition"
+  },
+  {
+    "chunk_id": "fuel_gas_description",
+    "section_number": "5.2",
+    "heading": "Fuel Gas System Description",
+    "full_text": "The fuel gas system receives natural gas from the pipeline, conditions the gas, and distributes it to the combustion turbines. The system includes filtration, heating, pressure control, and dew point monitoring equipment.",
+    "page_start": 21
+  },
+  {
+    "chunk_id": "fuel_gas_supply",
+    "section_number": "5.3",
+    "heading": "Fuel Gas Supply",
+    "full_text": "Contractor shall supply and install the main fuel gas regulating station, the conditioning skids, and the connecting piping required for operation of the combustion turbines.",
+    "page_start": 22
+  },
+  {
+    "chunk_id": "generic_dew_point",
+    "section_number": "5.3A",
+    "heading": "Dew Point Testing",
+    "full_text": "Dew point testing shall be completed during startup and the test record shall be retained with the commissioning documentation.",
+    "page_start": 23
+  },
+  {
+    "chunk_id": "dew_point_configuration",
+    "section_number": "5.4",
+    "heading": "Fuel Gas Dew Point Configuration",
+    "full_text": "The fuel gas dew point configuration shall use a duplex analyzer arrangement with automatic switchover. Commissioning checks shall verify the analyzer alarms before first fire.",
+    "page_start": 24
+  },
+  {
+    "chunk_id": "dew_point_heater",
+    "section_number": "5.5",
+    "heading": "Dew Point Heater",
+    "full_text": "The dew point heater controls are configured as 4x50% electric heaters to achieve the minimum desired gas fuel temperature at the heater outlet based on the required temperature differential.",
+    "page_start": 25
+  },
+  {
+    "chunk_id": "pump_schedule_noise",
+    "section_number": "6.0",
+    "heading": "Motor Schedule",
+    "full_text": "Closed cooling water pump motor 1200 HP. Boiler feedwater pump motor 4750 HP. Condensate pump motor 250 HP.",
+    "page_start": 30
+  },
+  {
+    "chunk_id": "fire_water_pump",
+    "section_number": "6.1",
+    "heading": "Fire Water Pump",
+    "full_text": "Each fire water pump shall be rated at 350 HP for the project fire water service. The driver shall be suitable for emergency operation.",
+    "page_start": 31
+  },
+  {
+    "chunk_id": "cooling_water_pump",
+    "section_number": "6.2",
+    "heading": "Cooling Water Pump",
+    "full_text": "Each cooling water pump shall be rated at 425 HP for circulating cooling water service. The pump casing shall be stainless steel lined.",
+    "page_start": 32
+  },
+  {
+    "chunk_id": "closed_cooling_water_mix",
+    "section_number": "6.3",
+    "heading": "Closed Cooling Water Chemistry",
+    "full_text": "Closed cooling water is a mixture of 45% propylene glycol and 55% demineralized water. Contractor shall provide test reports confirming the initial fill concentration.",
+    "page_start": 33
+  },
+  {
+    "chunk_id": "closed_cooling_water_pumps",
+    "section_number": "6.4",
+    "heading": "Closed Cooling Water Pumps",
+    "full_text": "The closed cooling water system shall include two 100% capacity horizontal pumps with motors, piping, valves, and an expansion tank. The arrangement is duty-duty with both pumps sized to meet the full unit load.",
+    "page_start": 34
+  },
+  {
+    "chunk_id": "fire_protection",
+    "section_number": "6.5",
+    "heading": "Fire Protection System",
+    "full_text": "The fire protection system includes the fire water pumps, yard loop, hydrants, deluge valves, and foam connections serving the tank farm and turbine areas.",
+    "page_start": 35
+  },
+  {
+    "chunk_id": "design_temperature_general",
+    "section_number": "7.0",
+    "heading": "Design Temperature and Pressure",
+    "full_text": "The design pressure and temperature for piping will be based on the operating pressures and temperatures established for each service with appropriate design margin. Different systems may have different design temperatures.",
+    "page_start": 40
+  },
+  {
+    "chunk_id": "compressor_design_conditions",
+    "section_number": "7.1",
+    "heading": "Compressor Design Conditions",
+    "full_text": "The compressor design conditions shall be 1250 psig discharge pressure and 105 degF inlet temperature. The compressor recycle valve shall be sized using those conditions.",
+    "page_start": 41
+  },
+  {
+    "chunk_id": "site_design_conditions",
+    "section_number": "7.2",
+    "heading": "Site Design Conditions",
+    "full_text": "Elevation: 455 ft. Ambient pressure: 14.457 psia. Minimum outdoor ambient temperature: -5 degF. Maximum outdoor ambient temperature: 110 degF. Design ambient temperature: 87 degF.",
+    "page_start": 42
+  },
+  {
+    "chunk_id": "air_permit_compliance",
+    "section_number": "8.1",
+    "heading": "Air Permit Compliance",
+    "full_text": "Contractor shall obtain air permits, maintain compliance with permit conditions, and notify Owner before any required agency witnessing event. Operating data needed to demonstrate compliance shall be retained in the startup records.",
+    "page_start": 43
+  },
+  {
+    "chunk_id": "environmental_testing",
+    "section_number": "8.2",
+    "heading": "Environmental Testing",
+    "full_text": "Contractor shall perform environmental testing, maintain emissions records, and submit test reports within ten (10) days after each required compliance event. Supporting calculations shall accompany each report.",
+    "page_start": 45
+  },
+  {
+    "chunk_id": "water_treatment_requirements",
+    "section_number": "8.3",
+    "heading": "Water Treatment Requirements",
+    "full_text": "Contractor shall furnish the chemical feed equipment, online conductivity monitoring, and sample connections required for boiler makeup water treatment. Startup chemistry procedures shall be submitted for review.",
+    "page_start": 46
+  },
+  {
+    "chunk_id": "demin_water_pumps",
+    "section_number": "9.1",
+    "heading": "Demineralized Water Pumps",
+    "full_text": "The demineralized water system includes two (2) x 100% demineralized water pumps for transfer service from the storage tank to the polishing skid.",
+    "page_start": 51
+  },
+  {
+    "chunk_id": "condensate_storage_tank",
+    "section_number": "9.2",
+    "heading": "Condensate Storage Tank",
+    "full_text": "The condensate storage tank shall have a minimum usable capacity of 750,000 gallons. Level instrumentation shall include redundant transmitters and one local gauge.",
+    "page_start": 52
+  },
+  {
+    "chunk_id": "instrument_air_compressors",
+    "section_number": "10.1",
+    "heading": "Instrument Air Compressors",
+    "full_text": "The instrument air system shall include two 100% oil-free rotary screw compressors, twin heatless dryers, and a receiver sized for plant startup. One compressor may serve as standby during normal operation.",
+    "page_start": 61
+  },
+  {
+    "chunk_id": "motor_control_centers",
+    "section_number": "10.2",
+    "heading": "Motor Control Centers",
+    "full_text": "Motor control centers shall be 480 V, 3-phase, 60 Hz assemblies with arc-resistant construction in the electrical building.",
+    "page_start": 62
+  },
+  {
+    "chunk_id": "electrical_distribution",
+    "section_number": "10.3",
+    "heading": "Electrical Distribution",
+    "full_text": "The electrical distribution system includes the 13.8 kV incoming lineup, the 480 V motor control centers, station service transformers, and protective relays required for unit operation.",
+    "page_start": 63
+  },
+  {
+    "chunk_id": "controls_system",
+    "section_number": "10.4",
+    "heading": "Plant Control System",
+    "full_text": "The plant control system shall provide sequencing, alarms, historian functions, and operator graphics for the balance of plant equipment.",
+    "page_start": 64
+  },
+  {
+    "chunk_id": "emission_guarantees_header",
+    "section_number": "E",
+    "heading": "APPENDIX E - Emission Guarantees",
+    "full_text": "Appendix E lists the guaranteed emissions performance for the facility equipment.",
+    "page_start": 71,
+    "chunk_type": "exhibit"
+  },
+  {
+    "chunk_id": "emission_guarantees_limits",
+    "section_number": "E.1",
+    "heading": "Emission Guarantee Limits",
+    "full_text": "Seller guarantees NOx emissions shall not exceed 2.0 ppmvd at 15% oxygen and CO emissions shall not exceed 4.0 ppmvd at 15% oxygen during the guarantee test.",
+    "page_start": 72,
+    "parent_chunk_id": "emission_guarantees_header"
+  },
+  {
+    "chunk_id": "noise_guarantee",
+    "section_number": "E.2",
+    "heading": "Noise Guarantee",
+    "full_text": "Overall equipment sound pressure shall not exceed 85 dBA at one meter from the equipment skid during steady-state operation.",
+    "page_start": 73,
+    "parent_chunk_id": "emission_guarantees_header"
+  },
+  {
+    "chunk_id": "warranty_correction",
+    "section_number": "11.1",
+    "heading": "Warranty Correction Period",
+    "full_text": "The warranty correction period shall continue for twenty-four (24) months after Substantial Completion. Contractor shall correct defects discovered during that period.",
+    "page_start": 81
+  },
+  {
+    "chunk_id": "security_requirements",
+    "section_number": "11.2",
+    "heading": "Site Security Requirements",
+    "full_text": "All personnel shall complete badging, comply with site access procedures, and wear visible identification while on the site.",
+    "page_start": 82
+  },
+  {
+    "chunk_id": "appendix_admin",
+    "section_number": "AA",
+    "heading": "APPENDIX AA",
+    "full_text": "Appendix AA contains administrative forms, transmittal templates, and internal reference material for the project team.",
+    "page_start": 90,
+    "chunk_type": "exhibit"
+  }
+]
