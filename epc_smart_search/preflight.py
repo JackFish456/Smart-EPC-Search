@@ -111,6 +111,8 @@ def collect_package_preflight_issues(
     *,
     profile: str = "Lite",
     model_dir: str | None = None,
+    model_dir_min: str | None = None,
+    model_dir_high: str | None = None,
 ) -> list[PreflightIssue]:
     issues = collect_workspace_artifact_warnings()
     if importlib.util.find_spec("PyInstaller") is None:
@@ -156,64 +158,30 @@ def collect_package_preflight_issues(
             )
         )
     if profile.strip().lower() == "ai":
+        requested_model_dirs: list[tuple[str, str, str]] = []
         raw_model_dir = (model_dir or os.environ.get(MODEL_DIR_ENV_VAR, "")).strip()
-        if not raw_model_dir:
+        raw_model_dir_min = (model_dir_min or "").strip()
+        raw_model_dir_high = (model_dir_high or "").strip()
+        if raw_model_dir:
+            requested_model_dirs.append(("model_dir", raw_model_dir, "Bundled AI model directory"))
+        if raw_model_dir_min:
+            requested_model_dirs.append(("model_dir_min", raw_model_dir_min, "Bundled AI-Min model directory"))
+        if raw_model_dir_high:
+            requested_model_dirs.append(("model_dir_high", raw_model_dir_high, "Bundled AI-High model directory"))
+        if not requested_model_dirs:
             issues.append(
                 PreflightIssue(
                     severity="error",
                     code="missing_model_dir",
                     message=(
-                        f"Provide a bundled AI model directory via -ModelDir or {MODEL_DIR_ENV_VAR}. "
+                        f"Provide a bundled AI model directory via -ModelDir, -ModelDirMin, -ModelDirHigh, or {MODEL_DIR_ENV_VAR}. "
                         "Keep that folder outside the workspace."
                     ),
                 )
             )
             return issues
-        try:
-            resolved_model = validate_external_artifact_path(raw_model_dir, label="Bundled AI model directory")
-        except Exception as exc:
-            issues.append(PreflightIssue(severity="error", code="invalid_model_dir", message=str(exc)))
-            return issues
-        if not resolved_model.is_dir():
-            issues.append(
-                PreflightIssue(
-                    severity="error",
-                    code="model_dir_not_directory",
-                    message=f"Bundled AI model directory must be a folder: {resolved_model}",
-                )
-            )
-            return issues
-        config_path = resolved_model / "config.json"
-        if not config_path.exists():
-            issues.append(
-                PreflightIssue(
-                    severity="error",
-                    code="missing_model_config",
-                    message=f"Bundled AI model directory is missing config.json: {resolved_model}",
-                )
-            )
-            return issues
-        try:
-            import json
-
-            model_mode = infer_model_mode_from_config(json.loads(config_path.read_text(encoding="utf-8")))
-        except Exception as exc:
-            issues.append(
-                PreflightIssue(
-                    severity="error",
-                    code="invalid_model_config",
-                    message=f"Could not parse bundled AI model config at {config_path}: {exc}",
-                )
-            )
-            return issues
-        if model_mode != "text_only":
-            issues.append(
-                PreflightIssue(
-                    severity="error",
-                    code="model_not_text_only",
-                    message=f"Bundled AI model must be a text-only Gemma checkpoint: {resolved_model}",
-                )
-            )
+        for code_prefix, raw_path, label in requested_model_dirs:
+            issues.extend(_collect_model_dir_issues(raw_path, label=label, code_prefix=code_prefix))
     return issues
 
 
@@ -242,11 +210,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prebuilt-db")
     parser.add_argument("--profile", default="Lite")
     parser.add_argument("--model-dir")
+    parser.add_argument("--model-dir-min")
+    parser.add_argument("--model-dir-high")
     args = parser.parse_args(argv)
     issues = (
         collect_launch_preflight_issues()
         if args.mode == "launch"
-        else collect_package_preflight_issues(args.prebuilt_db, profile=args.profile, model_dir=args.model_dir)
+        else collect_package_preflight_issues(
+            args.prebuilt_db,
+            profile=args.profile,
+            model_dir=args.model_dir,
+            model_dir_min=args.model_dir_min,
+            model_dir_high=args.model_dir_high,
+        )
     )
     return report_issues(issues)
 
@@ -254,6 +230,51 @@ def main(argv: list[str] | None = None) -> int:
 def _python_import_check(python_executable: Path, modules: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
     imports = "; ".join(f"import {module}" for module in modules)
     return subprocess.run([str(python_executable), "-c", imports], capture_output=True, text=True, check=False)
+
+
+def _collect_model_dir_issues(raw_model_dir: str, *, label: str, code_prefix: str) -> list[PreflightIssue]:
+    try:
+        resolved_model = validate_external_artifact_path(raw_model_dir, label=label)
+    except Exception as exc:
+        return [PreflightIssue(severity="error", code=f"invalid_{code_prefix}", message=str(exc))]
+    if not resolved_model.is_dir():
+        return [
+            PreflightIssue(
+                severity="error",
+                code=f"{code_prefix}_not_directory",
+                message=f"{label} must be a folder: {resolved_model}",
+            )
+        ]
+    config_path = resolved_model / "config.json"
+    if not config_path.exists():
+        return [
+            PreflightIssue(
+                severity="error",
+                code=f"missing_config_{code_prefix}",
+                message=f"{label} is missing config.json: {resolved_model}",
+            )
+        ]
+    try:
+        import json
+
+        model_mode = infer_model_mode_from_config(json.loads(config_path.read_text(encoding="utf-8")))
+    except Exception as exc:
+        return [
+            PreflightIssue(
+                severity="error",
+                code=f"invalid_config_{code_prefix}",
+                message=f"Could not parse model config at {config_path}: {exc}",
+            )
+        ]
+    if model_mode != "text_only":
+        return [
+            PreflightIssue(
+                severity="error",
+                code=f"model_not_text_only_{code_prefix}",
+                message=f"{label} must be a text-only Gemma checkpoint: {resolved_model}",
+            )
+        ]
+    return []
 
 
 if __name__ == "__main__":

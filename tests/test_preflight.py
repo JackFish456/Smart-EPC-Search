@@ -88,26 +88,52 @@ def test_collect_package_preflight_issues_requires_external_prebuilt_db(monkeypa
     assert any(issue.code == "missing_prebuilt_db" for issue in issues)
 
 
-def test_collect_package_preflight_issues_ai_profile_requires_text_only_model_dir(monkeypatch) -> None:
+def test_collect_package_preflight_issues_lite_profile_passes_without_model_assets(monkeypatch) -> None:
+    prebuilt_db = _external_db("prebuilt_lite")
+
+    monkeypatch.setattr(preflight, "collect_workspace_artifact_warnings", lambda workspace_root=preflight.WORKSPACE_ROOT: [])
+    monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda name: object())
+
+    issues = preflight.collect_package_preflight_issues(str(prebuilt_db), profile="Lite")
+
+    assert issues == []
+
+
+def test_collect_package_preflight_issues_ai_profile_accepts_text_only_min_model_dir(monkeypatch) -> None:
     workspace = _test_dir("workspace_ai")
     prebuilt_db = _external_db("prebuilt")
-    model_dir = _external_model_dir("ai_model")
-    (model_dir / "config.json").write_text('{"architectures":["Gemma4ForCausalLM"]}', encoding="utf-8")
+    model_dir_min = _external_model_dir("ai_model_min")
+    (model_dir_min / "config.json").write_text('{"architectures":["Gemma4ForCausalLM"]}', encoding="utf-8")
 
     monkeypatch.setattr(preflight, "collect_workspace_artifact_warnings", lambda workspace_root=preflight.WORKSPACE_ROOT: [])
     monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda name: object())
     monkeypatch.setattr(preflight, "WORKSPACE_ROOT", workspace)
 
-    issues = preflight.collect_package_preflight_issues(str(prebuilt_db), profile="AI", model_dir=str(model_dir))
+    issues = preflight.collect_package_preflight_issues(str(prebuilt_db), profile="AI", model_dir_min=str(model_dir_min))
 
     assert issues == []
 
 
-def test_collect_package_preflight_issues_ai_profile_rejects_multimodal_model_dir(monkeypatch) -> None:
+def test_collect_package_preflight_issues_ai_profile_accepts_text_only_high_model_dir(monkeypatch) -> None:
+    workspace = _test_dir("workspace_ai_high")
+    prebuilt_db = _external_db("prebuilt_high")
+    model_dir_high = _external_model_dir("ai_model_high")
+    (model_dir_high / "config.json").write_text('{"architectures":["Gemma4ForCausalLM"]}', encoding="utf-8")
+
+    monkeypatch.setattr(preflight, "collect_workspace_artifact_warnings", lambda workspace_root=preflight.WORKSPACE_ROOT: [])
+    monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(preflight, "WORKSPACE_ROOT", workspace)
+
+    issues = preflight.collect_package_preflight_issues(str(prebuilt_db), profile="AI", model_dir_high=str(model_dir_high))
+
+    assert issues == []
+
+
+def test_collect_package_preflight_issues_ai_profile_rejects_multimodal_min_model_dir(monkeypatch) -> None:
     workspace = _test_dir("workspace_multimodal")
     prebuilt_db = _external_db("prebuilt_multi")
-    model_dir = _external_model_dir("ai_model_multimodal")
-    (model_dir / "config.json").write_text(
+    model_dir_min = _external_model_dir("ai_model_multimodal")
+    (model_dir_min / "config.json").write_text(
         '{"architectures":["Gemma4ForConditionalGeneration"],"vision_config":{"model_type":"gemma4_vision"}}',
         encoding="utf-8",
     )
@@ -116,9 +142,23 @@ def test_collect_package_preflight_issues_ai_profile_rejects_multimodal_model_di
     monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda name: object())
     monkeypatch.setattr(preflight, "WORKSPACE_ROOT", workspace)
 
-    issues = preflight.collect_package_preflight_issues(str(prebuilt_db), profile="AI", model_dir=str(model_dir))
+    issues = preflight.collect_package_preflight_issues(str(prebuilt_db), profile="AI", model_dir_min=str(model_dir_min))
 
-    assert any(issue.code == "model_not_text_only" for issue in issues)
+    assert any(issue.code == "model_not_text_only_model_dir_min" for issue in issues)
+
+
+def test_collect_package_preflight_issues_ai_profile_rejects_missing_high_model_config(monkeypatch) -> None:
+    workspace = _test_dir("workspace_missing_high_config")
+    prebuilt_db = _external_db("prebuilt_missing_high")
+    model_dir_high = _external_model_dir("ai_model_high_missing")
+
+    monkeypatch.setattr(preflight, "collect_workspace_artifact_warnings", lambda workspace_root=preflight.WORKSPACE_ROOT: [])
+    monkeypatch.setattr(preflight.importlib.util, "find_spec", lambda name: object())
+    monkeypatch.setattr(preflight, "WORKSPACE_ROOT", workspace)
+
+    issues = preflight.collect_package_preflight_issues(str(prebuilt_db), profile="AI", model_dir_high=str(model_dir_high))
+
+    assert any(issue.code == "missing_config_model_dir_high" for issue in issues)
 
 
 def _test_dir(label: str) -> Path:

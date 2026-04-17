@@ -36,6 +36,10 @@ class GemmaServiceClient:
     def get_availability(self) -> GemmaAvailability:
         launch_spec = resolve_gemma_launch_spec()
         if launch_spec.available:
+            if launch_spec.tier == "ai_high":
+                return GemmaAvailability(True, "AI-High mode is available on this machine.", launch_spec.mode)
+            if launch_spec.tier == "ai_min":
+                return GemmaAvailability(True, "AI-Min mode is available on this machine.", launch_spec.mode)
             if launch_spec.mode == "bundled_service":
                 return GemmaAvailability(True, "AI mode is available in this build.", launch_spec.mode)
             return GemmaAvailability(True, "AI mode is available from the local Gemma environment.", launch_spec.mode)
@@ -59,7 +63,7 @@ class GemmaServiceClient:
         self._stderr_handle = self.stderr_log_path.open("a", encoding="utf-8")
         self._write_launch_banner()
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        launch_env = self._build_launch_env(launch_spec.model_dir)
+        launch_env = self._build_launch_env(launch_spec.selected_model_dir)
         command = self._build_launch_command(launch_spec, self.port)
         launch_cwd = launch_spec.service_path.parent if launch_spec.mode == "bundled_service" else WORKSPACE_ROOT
         self._process = subprocess.Popen(

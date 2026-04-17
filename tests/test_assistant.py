@@ -1107,3 +1107,55 @@ def test_expand_answer_routes_through_gemma_with_previous_answer() -> None:
     assert assistant.gemma.calls[0]["response_style"] == "expand_answer"
     assert assistant.gemma.calls[0]["previous_answer"] == "Short grounded answer."
     assert "Previous answer shown to the user:" in assistant.gemma.calls[0]["context"]
+
+
+def test_contract_assistant_ask_delegates_to_answer_policy() -> None:
+    class FakePolicy:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def answer(
+            self,
+            question: str,
+            history,
+            gemma,
+            *,
+            deep_think: bool = False,
+            expand_answer: bool = False,
+            previous_answer: str | None = None,
+        ) -> AssistantAnswer:
+            self.calls.append(
+                {
+                    "question": question,
+                    "history": history,
+                    "gemma": gemma,
+                    "deep_think": deep_think,
+                    "expand_answer": expand_answer,
+                    "previous_answer": previous_answer,
+                }
+            )
+            return AssistantAnswer("Delegated answer.", [], False)
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.gemma = object()
+    assistant.answer_policy = FakePolicy()
+
+    answer = assistant.ask(
+        "What does the contract require for the fire water pump?",
+        history=[{"role": "user", "content": "fire water pump"}],
+        deep_think=True,
+        expand_answer=True,
+        previous_answer="Short answer.",
+    )
+
+    assert answer.text == "Delegated answer."
+    assert assistant.answer_policy.calls == [
+        {
+            "question": "What does the contract require for the fire water pump?",
+            "history": [{"role": "user", "content": "fire water pump"}],
+            "gemma": assistant.gemma,
+            "deep_think": True,
+            "expand_answer": True,
+            "previous_answer": "Short answer.",
+        }
+    ]
