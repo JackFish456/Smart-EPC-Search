@@ -87,7 +87,7 @@ def _collect_local_ai_launch_warnings() -> list[PreflightIssue]:
                 code="local_ai_unavailable",
                 message=(
                     (launch_spec.reason or f"Gemma helper Python was not found: {helper_python}")
-                    + " Retrieval mode is still available."
+                    + " Chat will still open in retrieval-only mode; AI summaries are unavailable."
                 ),
             )
         ]
@@ -99,7 +99,7 @@ def _collect_local_ai_launch_warnings() -> list[PreflightIssue]:
                 code="missing_flask_in_gemma_env",
                 message=(
                     f"Gemma environment at {helper_python} cannot import Flask. "
-                    "AI mode may not start, but retrieval mode is still available."
+                    "Chat will still open in retrieval-only mode; AI summaries may not start."
                 ),
             )
         ]

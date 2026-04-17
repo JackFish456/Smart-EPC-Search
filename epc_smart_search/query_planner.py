@@ -26,6 +26,10 @@ REQUEST_SHAPE_DIRECT_TEXT = "direct_text"
 REQUEST_SHAPE_BROAD_TOPIC = "broad_topic"
 
 ANSWER_FAMILY_GUARANTEE_OR_LIMIT = "guarantee_or_limit"
+RETRIEVAL_MODE_FACT_LOOKUP = "fact_lookup"
+RETRIEVAL_MODE_TOPIC_SUMMARY = "topic_summary"
+RETRIEVAL_MODE_FALLBACK = "fallback"
+EXACT_VALUE_ATTRIBUTE_LABELS = ("configuration", "capacity", "type", "size", "power", "pressure", "temperature", "flow")
 
 
 @dataclass(slots=True, frozen=True)
@@ -34,6 +38,7 @@ class QueryPlan:
     normalized_query: str
     content_query: str
     intent: str
+    retrieval_mode: str
     request_shape: str
     section_number: str | None
     count_question: bool
@@ -138,6 +143,7 @@ SYSTEM_FILLER = STOPWORDS | {
     "do",
     "does",
     "did",
+    "site",
     "we",
     "our",
     "using",
@@ -278,12 +284,21 @@ def plan_query(query: str, system_vocabulary: SystemVocabulary | None = None) ->
         else _system_aliases(system_phrase, system_terms)
     )
     system_significant = system_significant_terms(system_terms)
+    retrieval_mode = _determine_retrieval_mode(
+        request_shape=request_shape,
+        attribute_label=attribute_label,
+        system_phrase=system_phrase,
+        count_question=count_question,
+        direct_text_question=direct_text_question,
+        intent=intent,
+    )
 
     return QueryPlan(
         raw_query=query,
         normalized_query=normalized,
         content_query=content_query,
         intent=intent,
+        retrieval_mode=retrieval_mode,
         request_shape=request_shape,
         section_number=section_number,
         count_question=count_question,
@@ -463,6 +478,29 @@ def _determine_request_shape(
     if intent == "responsibility":
         return REQUEST_SHAPE_RESPONSIBILITY
     return REQUEST_SHAPE_SCALAR
+
+
+def _determine_retrieval_mode(
+    *,
+    request_shape: str,
+    attribute_label: str | None,
+    system_phrase: str,
+    count_question: bool,
+    direct_text_question: bool,
+    intent: str,
+) -> str:
+    if request_shape == REQUEST_SHAPE_BROAD_TOPIC:
+        return RETRIEVAL_MODE_TOPIC_SUMMARY
+    if (
+        request_shape == REQUEST_SHAPE_SCALAR
+        and attribute_label in EXACT_VALUE_ATTRIBUTE_LABELS
+        and bool(system_phrase)
+        and not count_question
+        and not direct_text_question
+        and intent not in {"definition", "responsibility"}
+    ):
+        return RETRIEVAL_MODE_FACT_LOOKUP
+    return RETRIEVAL_MODE_FALLBACK
 
 
 def _detect_concept_terms(

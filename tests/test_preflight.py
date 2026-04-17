@@ -49,6 +49,7 @@ def test_collect_launch_preflight_issues_warns_when_local_ai_is_unavailable(monk
     issues = preflight.collect_launch_preflight_issues()
 
     assert any(issue.code == "local_ai_unavailable" and issue.severity == "warning" for issue in issues)
+    assert any("retrieval-only mode" in issue.message for issue in issues if issue.code == "local_ai_unavailable")
 
 
 def test_collect_launch_preflight_issues_warns_when_flask_missing_in_gemma_env(monkeypatch) -> None:
@@ -77,6 +78,7 @@ def test_collect_launch_preflight_issues_warns_when_flask_missing_in_gemma_env(m
     issues = preflight.collect_launch_preflight_issues()
 
     assert any(issue.code == "missing_flask_in_gemma_env" and issue.severity == "warning" for issue in issues)
+    assert any("retrieval-only mode" in issue.message for issue in issues if issue.code == "missing_flask_in_gemma_env")
 
 
 def test_collect_package_preflight_issues_requires_external_prebuilt_db(monkeypatch) -> None:

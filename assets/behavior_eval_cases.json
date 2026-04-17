@@ -1,0 +1,54 @@
+[
+  {
+    "name": "steam_turbine_model_exact",
+    "question": "what steam turbine are we using",
+    "expected_request_shape": "scalar",
+    "expected_answer_mode": "grounded_fact",
+    "expected_refused": false,
+    "required_snippets": ["stf-d600"],
+    "expected_sections": ["8.2.1"]
+  },
+  {
+    "name": "closed_cooling_water_requirements_exact",
+    "question": "what are the closed cooling water requirements",
+    "expected_request_shape": "scalar",
+    "expected_answer_mode": "grounded_fact",
+    "expected_refused": false,
+    "required_snippets": ["45% propylene glycol", "55% demineralized water"]
+  },
+  {
+    "name": "closed_cooling_water_pump_count",
+    "question": "how many closed cooling water pumps do we have",
+    "expected_request_shape": "direct_text",
+    "expected_answer_mode": "grounded_fact",
+    "expected_refused": false,
+    "required_snippets": ["two 100% capacity"],
+    "expected_sections": ["5.18"]
+  },
+  {
+    "name": "environmental_requirements_broad_topic",
+    "question": "do we have any environmental requirements?",
+    "expected_request_shape": "broad_topic",
+    "expected_answer_mode": "broad_topic_summary",
+    "expected_refused": false,
+    "banned_snippets": ["section aa - appendix aa", "common acronyms"],
+    "banned_headings": ["APPENDIX AA", "Common Acronyms"]
+  },
+  {
+    "name": "air_permits_broad_topic",
+    "question": "give me information about air permits",
+    "expected_request_shape": "broad_topic",
+    "expected_answer_mode": "broad_topic_summary",
+    "expected_refused": false,
+    "required_snippets": ["air permit"],
+    "banned_snippets": ["common acronyms in air permits"],
+    "banned_headings": ["Common Acronyms in Air Permits"]
+  },
+  {
+    "name": "fire_water_pump_horsepower_refusal",
+    "question": "what is the fire water pump horse power",
+    "expected_request_shape": "scalar",
+    "expected_answer_mode": "refusal",
+    "expected_refused": true
+  }
+]

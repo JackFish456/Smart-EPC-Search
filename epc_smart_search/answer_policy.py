@@ -15,6 +15,8 @@ from epc_smart_search.query_planner import (
 )
 from epc_smart_search.retrieval import Citation, ExactPageHit, RankedChunk
 
+TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{0,}")
+
 
 @dataclass(slots=True)
 class AssistantAnswer:
@@ -105,6 +107,13 @@ class AnswerPolicy:
         elif trace is not None and trace.selected_bundle is not None:
             ranked = list(trace.selected_bundle.ranked_chunks)
             citations = list(trace.selected_bundle.citations)
+            if self.should_use_merged_ranked_for_requirements(plan, trace):
+                ranked = sorted(
+                    trace.merged_ranked,
+                    key=lambda chunk: self.score_requirement_candidate(chunk, plan),
+                    reverse=True,
+                )
+                citations = self.citations_from_ranked(ranked, effective_question)
         else:
             ranked = (
                 self.retriever.retrieve(effective_question, profile="deep")
@@ -122,9 +131,11 @@ class AnswerPolicy:
         refusal_citations = citations if not evidence_is_weak else []
         reference_answer = self.build_reference_answer(effective_question, ranked, citations)
         grouped_answer = self.build_grouped_answer(effective_question, ranked, citations)
+        page_attribute_answer = self.build_page_attribute_answer(effective_question, ranked, citations)
         compact_answer = self.build_compact_answer(effective_question, ranked, citations)
         extractive_answer = self.build_extractive_answer(effective_question, ranked, citations)
         broad_topic_answer = self.build_broad_topic_answer(effective_question, ranked, citations) if broad_topic_request else None
+        grounded_page_attribute_answer = None if evidence_is_weak else page_attribute_answer
         grounded_compact_answer = None if evidence_is_weak else compact_answer
         grounded_extractive_answer = None if evidence_is_weak else extractive_answer
         grounded_broad_topic_answer = None if evidence_is_weak else broad_topic_answer
@@ -133,6 +144,8 @@ class AnswerPolicy:
             return reference_answer
         if grouped_answer is not None and not summary_request and not deep_think and not expand_answer:
             return grouped_answer
+        if grounded_page_attribute_answer is not None and not summary_request and not deep_think and not expand_answer:
+            return grounded_page_attribute_answer
         if grounded_compact_answer is not None and not summary_request and not deep_think and not expand_answer:
             return grounded_compact_answer
         if grounded_extractive_answer is not None and not summary_request and not deep_think and not expand_answer:
@@ -223,6 +236,99 @@ class AnswerPolicy:
         if callable(build_evidence):
             return build_evidence(effective_question, ranked, citations)
         return ""
+
+    def build_page_attribute_answer(
+        self,
+        question: str,
+        ranked: list[RankedChunk],
+        citations: list[Citation],
+    ) -> AssistantAnswer | None:
+        if not ranked or self.store is None or self.retriever is None:
+            return None
+        plan = plan_query(question)
+        if plan.attribute_label != "design_conditions":
+            return None
+        resolve_document_id = getattr(self.retriever, "resolve_document_id", None)
+        if not callable(resolve_document_id):
+            return None
+        document_id = resolve_document_id()
+        if not document_id:
+            return None
+        for chunk in ranked[:4]:
+            if not self.is_strong_question_match(plan, chunk):
+                continue
+            page_rows = self.store.fetch_page_window(
+                document_id,
+                chunk.page_start,
+                chunk.page_end,
+                padding=0,
+                limit=max(1, min(2, chunk.page_end - chunk.page_start + 1)),
+            )
+            for row in page_rows:
+                entries = self.extract_design_conditions_table_entries(
+                    str(row["page_text"]),
+                    section_number=chunk.section_number,
+                    heading=chunk.heading,
+                )
+                if len(entries) < 4:
+                    continue
+                heading = " ".join(chunk.heading.split()) or "Design Conditions"
+                label = chunk.section_number or "Unnumbered clause"
+                pages = self.format_page_range(chunk.page_start, chunk.page_end)
+                lines = "\n".join(f"- {name}: {value}" for name, value in entries[:8])
+                body = f"{heading}:\n{lines}\nSection {label} - {heading}\nPages: {pages}"
+                return AssistantAnswer(body, citations, False)
+        return None
+
+    @classmethod
+    def should_use_merged_ranked_for_requirements(cls, plan: QueryPlan, trace) -> bool:
+        if trace is None or trace.selected_bundle is None:
+            return False
+        if plan.request_shape != "scalar":
+            return False
+        if plan.attribute_label is not None or plan.count_question or plan.direct_text_question:
+            return False
+        if not cls.is_requirement_question(plan):
+            return False
+        selected_ranked = list(trace.selected_bundle.ranked_chunks)
+        merged_ranked = list(trace.merged_ranked)
+        if len(merged_ranked) <= 1:
+            return False
+        return cls.has_materially_stronger_requirement_candidate(plan, selected_ranked, merged_ranked)
+
+    @classmethod
+    def has_materially_stronger_requirement_candidate(
+        cls,
+        plan: QueryPlan,
+        selected_ranked: list[RankedChunk],
+        merged_ranked: list[RankedChunk],
+    ) -> bool:
+        selected_best = max((cls.score_requirement_candidate(chunk, plan) for chunk in selected_ranked[:3]), default=0.0)
+        merged_best = max((cls.score_requirement_candidate(chunk, plan) for chunk in merged_ranked[:6]), default=0.0)
+        return merged_best >= selected_best + 1.0
+
+    @classmethod
+    def score_requirement_candidate(cls, chunk: RankedChunk, plan: QueryPlan) -> float:
+        excerpt = cls.extract_ranked_excerpt(chunk.full_text, plan, limit=SUMMARY_EXCERPT_LIMIT)
+        if not excerpt:
+            return -10.0
+        lowered = excerpt.lower()
+        score = chunk.total_score
+        if plan.system_phrase and plan.system_phrase in lowered:
+            score += 1.4
+        score += 0.8 * sum(1 for term in plan.concept_terms if term and term in lowered)
+        score += 0.35 * cls.numeric_value_count(excerpt)
+        if re.search(r"\b(shall|must|required|responsible|obligated|provide|perform|submit|deliver|maintain|comply)\b", lowered):
+            score += 1.2
+        if re.search(r"\b\d+(?:\.\d+)?\s*%", lowered):
+            score += 1.0
+        if re.search(r"\bmixture of\b|\bconsist(?:s|ing)? of\b|\bcomprised of\b", lowered):
+            score += 1.2
+        if re.search(r"\bbasis for design\b|\bdesigned to provide\b|\bmeet the needs of\b", lowered):
+            score -= 1.0
+        if len(excerpt) <= 220:
+            score += 0.35
+        return score
 
     @classmethod
     def citations_from_ranked(cls, ranked: list[RankedChunk], question: str, *, limit: int = 5) -> list[Citation]:
@@ -748,6 +854,66 @@ class AnswerPolicy:
         return compact if len(compact) <= limit else compact[: limit - 3] + "..."
 
     @classmethod
+    def extract_design_conditions_table_entries(
+        cls,
+        page_text: str,
+        *,
+        section_number: str | None = None,
+        heading: str = "",
+    ) -> list[tuple[str, str]]:
+        lines = [" ".join(line.split()) for line in str(page_text).splitlines() if line and line.strip()]
+        if not lines:
+            return []
+        if section_number:
+            normalized_section = section_number.strip().strip(".")
+            if lines and lines[0].strip().strip(".") == normalized_section:
+                lines = lines[1:]
+        normalized_heading = " ".join(heading.split()).lower()
+        if normalized_heading and lines and lines[0].lower() == normalized_heading:
+            lines = lines[1:]
+        if len(lines) >= 2 and lines[0].lower() == "characteristic" and lines[1].lower() == "specification":
+            lines = lines[2:]
+        entries: list[tuple[str, str]] = []
+        index = 0
+        while index + 1 < len(lines):
+            label = lines[index]
+            value = lines[index + 1]
+            if cls.is_design_conditions_header(label):
+                index += 1
+                continue
+            if cls.is_design_conditions_bullet(value):
+                break
+            if cls.looks_like_design_conditions_value(value):
+                entries.append((label, value))
+                index += 2
+                continue
+            index += 1
+        return entries
+
+    @staticmethod
+    def is_design_conditions_header(text: str) -> bool:
+        normalized = " ".join(text.lower().split())
+        return normalized in {"characteristic", "specification"}
+
+    @staticmethod
+    def is_design_conditions_bullet(text: str) -> bool:
+        normalized = text.strip()
+        return normalized in {"•", "\uf0b7"} or normalized.startswith(("• ", "\uf0b7 "))
+
+    @classmethod
+    def looks_like_design_conditions_value(cls, text: str) -> bool:
+        normalized = " ".join(text.lower().split())
+        if not normalized or cls.is_design_conditions_header(normalized) or cls.is_design_conditions_bullet(text):
+            return False
+        if normalized.endswith("conditions"):
+            return False
+        if re.search(r"\d", text):
+            return True
+        if normalized in {"yes", "no", "indoor", "outdoor", "inside", "outside", "n/a", "na"}:
+            return True
+        return len(TOKEN_RE.findall(text)) <= 4
+
+    @classmethod
     def extract_ranked_excerpt(
         cls,
         text: str,
@@ -1105,6 +1271,14 @@ class AnswerPolicy:
     def has_strong_ranked_evidence(cls, plan: QueryPlan, ranked: list[RankedChunk]) -> bool:
         if plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC:
             return cls.has_strong_broad_topic_evidence(plan, ranked)
+        if (
+            plan.request_shape == "scalar"
+            and plan.attribute_label is None
+            and not plan.count_question
+            and not plan.direct_text_question
+            and cls.is_requirement_question(plan)
+        ):
+            return max((cls.score_requirement_candidate(chunk, plan) for chunk in ranked[:5]), default=0.0) >= 7.0
         return any(cls.is_strong_question_match(plan, chunk) for chunk in ranked[:3])
 
     @classmethod

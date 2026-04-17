@@ -66,6 +66,16 @@ def _is_heading_text(text: str) -> bool:
     return True
 
 
+def _is_plausible_section_number(section_number: str) -> bool:
+    try:
+        parts = [int(part) for part in section_number.split(".")]
+    except ValueError:
+        return False
+    if not parts or parts[0] > 40:
+        return False
+    return all(part <= 99 for part in parts[1:])
+
+
 def _iter_lines(pages: list[PageText]) -> list[tuple[int, str]]:
     rows: list[tuple[int, str]] = []
     for page in pages:
@@ -132,15 +142,14 @@ def _match_exhibit(lines: list[tuple[int, str]], index: int) -> tuple[str, str, 
 def _match_section(lines: list[tuple[int, str]], index: int) -> tuple[str, str, int] | None:
     _, line = lines[index]
     match = SECTION_RE.match(line)
-    if match and _is_heading_text(match.group(2)):
+    if match and _is_plausible_section_number(match.group(1)) and _is_heading_text(match.group(2)):
         section_number = match.group(1)
-        if int(section_number.split(".", 1)[0]) <= 40:
-            return section_number, _clean_line(match.group(2)), index + 1
+        return section_number, _clean_line(match.group(2)), index + 1
     match = SECTION_ONLY_RE.match(line)
     if not match:
         return None
     section_number = match.group(1)
-    if int(section_number.split(".", 1)[0]) > 40:
+    if not _is_plausible_section_number(section_number):
         return None
     for scan in range(index + 1, min(index + 4, len(lines))):
         _, candidate = lines[scan]

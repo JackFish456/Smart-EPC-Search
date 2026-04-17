@@ -6,6 +6,14 @@ from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractStore, pack_vector
 
 
+def test_plan_query_does_not_bind_site_as_system_for_site_design_conditions() -> None:
+    plan = plan_query("what are the site design conditions")
+
+    assert plan.attribute_label == "design_conditions"
+    assert plan.system_phrase == ""
+    assert "site" in plan.focus_terms
+
+
 def test_direct_section_lookup_wins() -> None:
     db_path = "file:retrieval_contract?mode=memory&cache=shared"
     store = ContractStore(db_path)
@@ -336,6 +344,39 @@ def test_hierarchical_search_prefers_exact_design_conditions_clause() -> None:
 
     assert ranked
     assert ranked[0].chunk_id == "compressor_conditions"
+
+
+def test_hierarchical_search_prefers_site_design_conditions_table_over_appendix_mentions() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "appendix_note",
+                "1.1",
+                "Design Basis for Guarantees",
+                (
+                    "The performance guarantees are stated for the following operating conditions and parameters. "
+                    "Additional design conditions are referenced in the guarantee appendix."
+                ),
+                3035,
+            ),
+            _chunk(
+                "site_design_conditions",
+                "2.1",
+                "Site Design Conditions",
+                (
+                    "Characteristic Specification GTG Equipment Location Outdoor ST/STG Location Outdoor "
+                    "Elevation 455 ft Ambient Pressure 14.457 psia Minimum Outdoor Ambient Temperature -5°F "
+                    "Maximum Outdoor Ambient Temperature 110°F Design Ambient Temperature 87°F"
+                ),
+                1591,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what are the site design conditions?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "site_design_conditions"
 
 
 def test_hierarchical_search_prefers_exact_power_clause_over_random_pump_schedule() -> None:

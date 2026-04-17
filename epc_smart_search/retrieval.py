@@ -1413,6 +1413,7 @@ class HybridRetriever:
             return 0.0, False
         score = 0.0
         matched = False
+        lowered_heading = f"{heading} {parent_heading}".lower()
         for phrase in plan.attribute_terms:
             if has_term_overlap(heading, (phrase,)) or has_term_overlap(parent_heading, (phrase,)):
                 score += 0.95
@@ -1423,11 +1424,20 @@ class HybridRetriever:
         label = plan.attribute_label or ""
         lowered_full_text = full_text.lower()
         if label == "design_conditions":
+            if re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", lowered_heading):
+                score += 1.0
+                matched = True
             if re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", lowered_full_text):
                 score += 1.1
                 matched = True
             value_hits = len(re.findall(r"\b\d+(?:\.\d+)?\s*(?:psi|psig|psia|degf|deg c|gpm|lb/hr|scfm|mw|mva|hp)\b", lowered_full_text, re.IGNORECASE))
-            score += min(0.75, value_hits * 0.18)
+            score += min(1.1, value_hits * 0.22)
+            if value_hits >= 3:
+                score += 0.45
+                matched = True
+            if "site" in plan.focus_terms and has_term_overlap(heading, ("site",)):
+                score += 0.45
+                matched = True
         elif label == "configuration":
             if re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b", lowered_full_text):
                 score += 1.0

@@ -8,14 +8,14 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from epc_smart_search.app_paths import ASSETS_DIR
 from epc_smart_search.assistant import ContractAssistant
-from epc_smart_search.preflight import collect_workspace_artifact_warnings
+from epc_smart_search.preflight import collect_launch_preflight_issues
 from epc_smart_search.ui.avatar_window import AvatarWindow
 from epc_smart_search.ui.chat_dialog import ContractChatDialog
 
 
 def main() -> int:
-    for issue in collect_workspace_artifact_warnings():
-        print(f"[WARNING] {issue.message}", file=sys.stderr)
+    for issue in collect_launch_preflight_issues():
+        print(f"[{issue.severity.upper()}] {issue.message}", file=sys.stderr)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     assistant = ContractAssistant()

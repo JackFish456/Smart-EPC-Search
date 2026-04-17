@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from array import array
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.config import SEARCH_SCHEMA_VERSION
 from epc_smart_search.ocr_support import PageText
-from epc_smart_search.search_features import ChunkFeatures
+from epc_smart_search.search_features import ChunkFeatures, normalize_text
+
+FACT_KEY_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -127,6 +130,42 @@ CREATE TABLE IF NOT EXISTS chunk_search_features (
 CREATE INDEX IF NOT EXISTS idx_chunk_search_features_doc
 ON chunk_search_features(document_id, chunk_id);
 
+CREATE TABLE IF NOT EXISTS contract_facts (
+    fact_rowid INTEGER PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    system TEXT NOT NULL,
+    system_normalized TEXT NOT NULL,
+    attribute TEXT NOT NULL,
+    attribute_normalized TEXT NOT NULL,
+    value TEXT NOT NULL,
+    evidence_text TEXT NOT NULL,
+    source_chunk_id TEXT NOT NULL,
+    page_start INTEGER NOT NULL,
+    page_end INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(
+        document_id,
+        system_normalized,
+        attribute_normalized,
+        value,
+        evidence_text,
+        source_chunk_id,
+        page_start,
+        page_end
+    ),
+    FOREIGN KEY (document_id) REFERENCES documents(document_id),
+    FOREIGN KEY (source_chunk_id) REFERENCES contract_chunks(chunk_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_contract_facts_doc_system_attr
+ON contract_facts(document_id, system_normalized, attribute_normalized);
+
+CREATE INDEX IF NOT EXISTS idx_contract_facts_doc_system
+ON contract_facts(document_id, system_normalized);
+
+CREATE INDEX IF NOT EXISTS idx_contract_facts_source_chunk
+ON contract_facts(source_chunk_id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS contract_pages_fts USING fts5(
     page_text,
     document_id UNINDEXED,
@@ -209,6 +248,25 @@ END;
 """
 
 
+@dataclass(slots=True, frozen=True)
+class ContractFactRow:
+    document_id: str
+    system: str
+    attribute: str
+    value: str
+    evidence_text: str
+    source_chunk_id: str
+    page_start: int
+    page_end: int
+    fact_rowid: int | None = None
+    system_normalized: str = ""
+    attribute_normalized: str = ""
+
+
+def normalize_fact_key(value: str) -> str:
+    return " ".join(FACT_KEY_TOKEN_RE.findall(normalize_text(value)))
+
+
 class ContractStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
@@ -265,6 +323,7 @@ class ContractStore:
         chunks: list[ChunkRecord],
         pages: list[PageText],
         features: list[ChunkFeatures],
+        facts: list[ContractFactRow] | None = None,
         embeddings: dict[str, bytes],
         model_name: str,
         dimension: int,
@@ -274,6 +333,7 @@ class ContractStore:
                 "DELETE FROM chunk_embeddings WHERE chunk_id IN (SELECT chunk_id FROM contract_chunks WHERE document_id = ?)",
                 (document_id,),
             )
+            connection.execute("DELETE FROM contract_facts WHERE document_id = ?", (document_id,))
             connection.execute("DELETE FROM chunk_search_features WHERE document_id = ?", (document_id,))
             connection.execute("DELETE FROM contract_chunks WHERE document_id = ?", (document_id,))
             connection.execute("DELETE FROM contract_pages WHERE document_id = ?", (document_id,))
@@ -313,6 +373,7 @@ class ContractStore:
                 ],
             )
             self._insert_features(connection, features)
+            self._insert_contract_facts(connection, facts or [])
             connection.executemany(
                 """
                 INSERT INTO chunk_embeddings (chunk_id, model_name, vector_blob, dimension)
@@ -347,6 +408,66 @@ class ContractStore:
             [asdict(feature) for feature in features],
         )
 
+    @staticmethod
+    def _prepare_fact_row(fact: ContractFactRow) -> dict[str, object]:
+        return {
+            "document_id": fact.document_id,
+            "system": fact.system.strip(),
+            "system_normalized": normalize_fact_key(fact.system_normalized or fact.system),
+            "attribute": fact.attribute.strip(),
+            "attribute_normalized": normalize_fact_key(fact.attribute_normalized or fact.attribute),
+            "value": fact.value.strip(),
+            "evidence_text": fact.evidence_text.strip(),
+            "source_chunk_id": fact.source_chunk_id,
+            "page_start": fact.page_start,
+            "page_end": fact.page_end,
+        }
+
+    @classmethod
+    def _insert_contract_facts(cls, connection: sqlite3.Connection, facts: list[ContractFactRow]) -> int:
+        if not facts:
+            return 0
+        before = connection.total_changes
+        connection.executemany(
+            """
+            INSERT INTO contract_facts (
+                document_id,
+                system,
+                system_normalized,
+                attribute,
+                attribute_normalized,
+                value,
+                evidence_text,
+                source_chunk_id,
+                page_start,
+                page_end
+            ) VALUES (
+                :document_id,
+                :system,
+                :system_normalized,
+                :attribute,
+                :attribute_normalized,
+                :value,
+                :evidence_text,
+                :source_chunk_id,
+                :page_start,
+                :page_end
+            )
+            ON CONFLICT(
+                document_id,
+                system_normalized,
+                attribute_normalized,
+                value,
+                evidence_text,
+                source_chunk_id,
+                page_start,
+                page_end
+            ) DO NOTHING
+            """,
+            [cls._prepare_fact_row(fact) for fact in facts],
+        )
+        return connection.total_changes - before
+
     def replace_search_features(self, document_id: str, features: list[ChunkFeatures]) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM chunk_search_features WHERE document_id = ?", (document_id,))
@@ -360,6 +481,12 @@ class ContractStore:
                 (str(SEARCH_SCHEMA_VERSION),),
             )
             connection.commit()
+
+    def insert_contract_facts(self, facts: list[ContractFactRow]) -> int:
+        with self._connect() as connection:
+            inserted = self._insert_contract_facts(connection, facts)
+            connection.commit()
+        return inserted
 
     def get_metadata(self, key: str) -> str | None:
         with self._connect() as connection:
@@ -397,6 +524,78 @@ class ContractStore:
                 (document_id,),
             ).fetchone()
         return int(row["chunk_count"]) if row else 0
+
+    @staticmethod
+    def _fact_from_row(row: sqlite3.Row) -> ContractFactRow:
+        return ContractFactRow(
+            fact_rowid=int(row["fact_rowid"]),
+            document_id=str(row["document_id"]),
+            system=str(row["system"]),
+            system_normalized=str(row["system_normalized"]),
+            attribute=str(row["attribute"]),
+            attribute_normalized=str(row["attribute_normalized"]),
+            value=str(row["value"]),
+            evidence_text=str(row["evidence_text"]),
+            source_chunk_id=str(row["source_chunk_id"]),
+            page_start=int(row["page_start"]),
+            page_end=int(row["page_end"]),
+        )
+
+    def lookup_facts_by_system_attribute(
+        self,
+        document_id: str,
+        system: str,
+        attribute: str,
+    ) -> list[ContractFactRow]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    fact_rowid,
+                    document_id,
+                    system,
+                    system_normalized,
+                    attribute,
+                    attribute_normalized,
+                    value,
+                    evidence_text,
+                    source_chunk_id,
+                    page_start,
+                    page_end
+                FROM contract_facts
+                WHERE document_id = ?
+                  AND system_normalized = ?
+                  AND attribute_normalized = ?
+                ORDER BY page_start, page_end, fact_rowid
+                """,
+                (document_id, normalize_fact_key(system), normalize_fact_key(attribute)),
+            ).fetchall()
+        return [self._fact_from_row(row) for row in rows]
+
+    def lookup_facts_by_system(self, document_id: str, system: str) -> list[ContractFactRow]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    fact_rowid,
+                    document_id,
+                    system,
+                    system_normalized,
+                    attribute,
+                    attribute_normalized,
+                    value,
+                    evidence_text,
+                    source_chunk_id,
+                    page_start,
+                    page_end
+                FROM contract_facts
+                WHERE document_id = ?
+                  AND system_normalized = ?
+                ORDER BY attribute_normalized, page_start, page_end, fact_rowid
+                """,
+                (document_id, normalize_fact_key(system)),
+            ).fetchall()
+        return [self._fact_from_row(row) for row in rows]
 
     def section_lookup(self, document_id: str, section_number: str) -> list[sqlite3.Row]:
         with self._connect() as connection:
