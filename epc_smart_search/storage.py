@@ -7,6 +7,8 @@ from pathlib import Path
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.config import SEARCH_SCHEMA_VERSION
 from epc_smart_search.name_normalization import (
+    ATTRIBUTE_LABEL_ALIASES,
+    build_system_aliases,
     normalize_attribute_name,
     normalize_lookup_text,
     normalize_system_name,
@@ -415,9 +417,9 @@ class ContractStore:
         return {
             "document_id": fact.document_id,
             "system": fact.system.strip(),
-            "system_normalized": normalize_system_name(fact.system_normalized or fact.system),
+            "system_normalized": normalize_lookup_text(fact.system_normalized or fact.system),
             "attribute": fact.attribute.strip(),
-            "attribute_normalized": normalize_attribute_name(fact.attribute_normalized or fact.attribute),
+            "attribute_normalized": normalize_lookup_text(fact.attribute_normalized or fact.attribute),
             "value": fact.value.strip(),
             "evidence_text": fact.evidence_text.strip(),
             "source_chunk_id": fact.source_chunk_id,
@@ -558,15 +560,48 @@ class ContractStore:
             page_end=int(row["page_end"]),
         )
 
+    @staticmethod
+    def _system_lookup_variants(system: str) -> tuple[str, ...]:
+        variants = [normalize_lookup_text(system), normalize_system_name(system), *build_system_aliases(system)]
+        seen: set[str] = set()
+        out: list[str] = []
+        for variant in variants:
+            cleaned = normalize_lookup_text(variant)
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            out.append(cleaned)
+        return tuple(out)
+
+    @staticmethod
+    def _attribute_lookup_variants(attribute: str) -> tuple[str, ...]:
+        canonical = normalize_attribute_name(attribute)
+        variants = [normalize_lookup_text(attribute), canonical, *ATTRIBUTE_LABEL_ALIASES.get(canonical, ())]
+        seen: set[str] = set()
+        out: list[str] = []
+        for variant in variants:
+            cleaned = normalize_lookup_text(variant)
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            out.append(cleaned)
+        return tuple(out)
+
     def lookup_facts_by_system_attribute(
         self,
         document_id: str,
         system: str,
         attribute: str,
     ) -> list[ContractFactRow]:
+        system_variants = self._system_lookup_variants(system)
+        attribute_variants = self._attribute_lookup_variants(attribute)
+        if not system_variants or not attribute_variants:
+            return []
+        system_placeholders = ", ".join("?" for _ in system_variants)
+        attribute_placeholders = ", ".join("?" for _ in attribute_variants)
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT
                     fact_rowid,
                     document_id,
@@ -581,18 +616,22 @@ class ContractStore:
                     page_end
                 FROM contract_facts
                 WHERE document_id = ?
-                  AND system_normalized = ?
-                  AND attribute_normalized = ?
+                  AND system_normalized IN ({system_placeholders})
+                  AND attribute_normalized IN ({attribute_placeholders})
                 ORDER BY page_start, page_end, fact_rowid
                 """,
-                (document_id, normalize_system_name(system), normalize_attribute_name(attribute)),
+                (document_id, *system_variants, *attribute_variants),
             ).fetchall()
         return [self._fact_from_row(row) for row in rows]
 
     def lookup_facts_by_system(self, document_id: str, system: str) -> list[ContractFactRow]:
+        system_variants = self._system_lookup_variants(system)
+        if not system_variants:
+            return []
+        placeholders = ", ".join("?" for _ in system_variants)
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT
                     fact_rowid,
                     document_id,
@@ -607,17 +646,21 @@ class ContractStore:
                     page_end
                 FROM contract_facts
                 WHERE document_id = ?
-                  AND system_normalized = ?
-                ORDER BY attribute_normalized, page_start, page_end, fact_rowid
+                  AND system_normalized IN ({placeholders})
+                ORDER BY page_start, page_end, fact_rowid
                 """,
-                (document_id, normalize_system_name(system)),
+                (document_id, *system_variants),
             ).fetchall()
         return [self._fact_from_row(row) for row in rows]
 
     def lookup_facts_by_attribute(self, document_id: str, attribute: str) -> list[ContractFactRow]:
+        attribute_variants = self._attribute_lookup_variants(attribute)
+        if not attribute_variants:
+            return []
+        placeholders = ", ".join("?" for _ in attribute_variants)
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT
                     fact_rowid,
                     document_id,
@@ -632,10 +675,10 @@ class ContractStore:
                     page_end
                 FROM contract_facts
                 WHERE document_id = ?
-                  AND attribute_normalized = ?
+                  AND attribute_normalized IN ({placeholders})
                 ORDER BY page_start, page_end, fact_rowid
                 """,
-                (document_id, normalize_attribute_name(attribute)),
+                (document_id, *attribute_variants),
             ).fetchall()
         return [self._fact_from_row(row) for row in rows]
 

@@ -95,10 +95,19 @@ ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
     "configuration": ("configuration", "configured", "arrangement"),
     "capacity": ("capacity", "capacities"),
     "quantity": ("quantity", "quantities", "number"),
-    "rating": ("rating", "ratings", "rated"),
-    "model": ("model", "models", "type"),
+    "rating": ("rating", "ratings", "rated", "power", "horsepower", "horse power", "hp", "kw", "mw"),
+    "model": ("model", "models", "type", "selected"),
+    "size": ("size", "sizes", "diameter", "dimension", "dimensions", "rating", "ratings"),
+    "pressure": ("pressure", "pressures", "psig", "psia", "psi", "bar", "kpa"),
+    "temperature": ("temperature", "temperatures", "degf", "degc", "°f", "°c"),
+    "flow": ("flow", "flows", "flowrate", "flow rate", "throughput", "gpm", "scfm", "cfm"),
     "service": ("service", "services", "duty", "duties"),
 }
+POWER_VALUE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:HP|KW|MW)\b", re.IGNORECASE)
+PRESSURE_VALUE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:psig|psia|psi|bar|kpa)\b", re.IGNORECASE)
+TEMPERATURE_VALUE_RE = re.compile(r"\b-?\d+(?:\.\d+)?\s*(?:degf|degc|°f|°c|f|c)\b", re.IGNORECASE)
+FLOW_VALUE_RE = re.compile(r"\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:gpm|gal/min|gpd|scfm|cfm|acfm|mmscfd|lb/hr|lbm/hr|kg/hr|m3/hr|ft3/min)\b", re.IGNORECASE)
+MODEL_VALUE_RE = re.compile(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b")
 
 
 @dataclass(slots=True, frozen=True)
@@ -108,8 +117,13 @@ class ContractFactRecord:
     normalized_attribute: str
     raw_value: str
     evidence_text: str
-    page: int
+    page_start: int
+    page_end: int
     source_chunk_id: str
+
+    @property
+    def page(self) -> int:
+        return self.page_start
 
 
 @dataclass(slots=True, frozen=True)
@@ -143,7 +157,8 @@ def extract_contract_facts(chunks: list[ChunkRecord]) -> list[ContractFactRecord
                     normalized_attribute=candidate.normalized_attribute,
                     raw_value=candidate.raw_value,
                     evidence_text=candidate.evidence_text,
-                    page=chunk.page_start,
+                    page_start=chunk.page_start,
+                    page_end=chunk.page_end,
                     source_chunk_id=chunk.chunk_id,
                 )
             )
@@ -159,7 +174,8 @@ def extract_chunk_facts(chunk: ChunkRecord) -> list[ContractFactRecord]:
             normalized_attribute=candidate.normalized_attribute,
             raw_value=candidate.raw_value,
             evidence_text=candidate.evidence_text,
-            page=chunk.page_start,
+            page_start=chunk.page_start,
+            page_end=chunk.page_end,
             source_chunk_id=chunk.chunk_id,
         )
         for candidate in candidates
@@ -181,6 +197,8 @@ def _extract_chunk_fact_candidates(chunk: ChunkRecord) -> list[_CandidateFact]:
             if key not in seen:
                 seen.add(key)
                 candidates.append(candidate)
+        if "|" in evidence or "\t" in evidence:
+            continue
         for candidate in _extract_from_patterns(evidence, heading_system):
             key = (
                 candidate.normalized_system,
@@ -212,7 +230,7 @@ def _iter_evidence_units(text: str) -> list[str]:
         add(raw_line)
         for piece in re.split(r"\s*[;•]\s*", raw_line):
             add(piece)
-    flattened = text.replace("\n", " ")
+    flattened = text.replace("\n", ". ")
     for sentence in SENTENCE_SPLIT_RE.split(flattened):
         add(sentence)
     return out
@@ -317,6 +335,38 @@ def _extract_from_patterns(evidence: str, heading_system: str) -> list[_Candidat
             ),
             "service",
         ),
+        (
+            re.compile(
+                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\bmodel\b(?:\s+(?:shall\s+be|is|=)\b|\s*[:=\-])?\s*"
+                r"(?P<value>[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*)",
+                re.IGNORECASE,
+            ),
+            "model",
+        ),
+        (
+            re.compile(
+                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\bpressure\b(?:\s+(?:of|is|shall\s+be)\b|\s*[:=\-])?\s*"
+                r"(?P<value>[^.;\n]{1,60})",
+                re.IGNORECASE,
+            ),
+            "pressure",
+        ),
+        (
+            re.compile(
+                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\btemperature\b(?:\s+(?:of|is|shall\s+be)\b|\s*[:=\-])?\s*"
+                r"(?P<value>[^.;\n]{1,60})",
+                re.IGNORECASE,
+            ),
+            "temperature",
+        ),
+        (
+            re.compile(
+                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\bflow(?:\s+rate)?\b(?:\s+(?:of|is|shall\s+be)\b|\s*[:=\-])?\s*"
+                r"(?P<value>[^.;\n]{1,60})",
+                re.IGNORECASE,
+            ),
+            "flow",
+        ),
     ):
         match = pattern.search(evidence)
         if not match:
@@ -359,6 +409,16 @@ def _infer_attribute_from_value(value: str) -> str:
     cleaned = _clean_value(value)
     if CONFIG_VALUE_RE.search(cleaned):
         return "configuration"
+    if POWER_VALUE_RE.search(cleaned):
+        return "rating"
+    if PRESSURE_VALUE_RE.search(cleaned):
+        return "pressure"
+    if TEMPERATURE_VALUE_RE.search(cleaned):
+        return "temperature"
+    if FLOW_VALUE_RE.search(cleaned):
+        return "flow"
+    if MODEL_VALUE_RE.search(cleaned):
+        return "model"
     return ""
 
 
@@ -371,10 +431,6 @@ def _normalize_system(value: str) -> str:
         tokens.pop(0)
     while tokens and (tokens[-1] in TRAILING_SYSTEM_STOPWORDS or tokens[-1] in TRAILING_CONTEXT_TERMS):
         tokens.pop()
-    if len(tokens) >= 2 and tokens[-1] in TECHNICAL_HEADS:
-        tokens[-1] = _singularize(tokens[-1])
-    elif tokens and tokens[-1].endswith("s") and any(token in TECHNICAL_HEADS for token in tokens):
-        tokens[-1] = _singularize(tokens[-1])
     if len(tokens) < 2:
         return ""
     return " ".join(tokens)
@@ -386,14 +442,9 @@ def _clean_text(value: str) -> str:
 
 def _clean_value(value: str) -> str:
     cleaned = _clean_text(value)
+    cleaned = re.sub(r"^(?:at|for)\s+", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+(?:and|which|that)\b.*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.rstrip(".,;:")
     if len(cleaned) > 80:
         return ""
     return cleaned
-
-
-def _singularize(token: str) -> str:
-    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
-        return token[:-1]
-    return token

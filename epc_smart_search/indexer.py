@@ -50,8 +50,8 @@ def build_index(
             value=fact.raw_value,
             evidence_text=fact.evidence_text,
             source_chunk_id=fact.source_chunk_id,
-            page_start=fact.page,
-            page_end=fact.page,
+            page_start=fact.page_start,
+            page_end=fact.page_end,
         )
         for fact in extract_contract_facts(chunks)
     ]
@@ -118,5 +118,21 @@ def refresh_query_index(
         for row in rows
     ]
     features = build_chunk_features(chunks)
+    facts = [
+        ContractFactRow(
+            document_id=fact.document_id,
+            system=fact.normalized_system,
+            system_normalized=fact.normalized_system,
+            attribute=fact.normalized_attribute,
+            attribute_normalized=fact.normalized_attribute,
+            value=fact.raw_value,
+            evidence_text=fact.evidence_text,
+            source_chunk_id=fact.source_chunk_id,
+            page_start=fact.page_start,
+            page_end=fact.page_end,
+        )
+        for fact in extract_contract_facts(chunks)
+    ]
     store.replace_search_features(document_id, features)
+    store.replace_contract_facts(document_id, facts)
     return len(features)

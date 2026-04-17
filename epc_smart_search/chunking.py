@@ -235,7 +235,7 @@ def _is_prose_like(text: str) -> bool:
     tokens = _token_count(cleaned)
     if tokens >= 14:
         return True
-    if tokens >= 9 and re.search(r"[.;]$", cleaned):
+    if tokens >= 8 and re.search(r"[.;]$", cleaned):
         return True
     return tokens >= 11 and not _has_value_signal(cleaned) and not BULLET_RE.match(cleaned)
 
@@ -514,11 +514,15 @@ def _extract_definition_chunks(base_chunks: list[ChunkRecord]) -> list[ChunkReco
     return derived
 
 
+def _renumber_chunks(chunks: list[ChunkRecord]) -> list[ChunkRecord]:
+    return [replace(chunk, ordinal_in_document=index) for index, chunk in enumerate(chunks, start=1)]
+
+
 def parse_chunks(pages: list[PageText], document_id: str) -> list[ChunkRecord]:
     lines = _iter_lines(pages)
     if not lines:
         return []
-    chunks: list[ChunkRecord] = []
+    drafts: list[_ChunkDraft] = []
     current: _ChunkBuilder | None = None
     ordinal = 1
     article_context: str | None = None
@@ -527,39 +531,48 @@ def parse_chunks(pages: list[PageText], document_id: str) -> list[ChunkRecord]:
         page_num, line = lines[index]
         article_match = _match_article(lines, index)
         if article_match is not None:
-            ordinal = _flush_chunk(chunks, current, document_id, ordinal)
+            ordinal = _flush_chunk(drafts, current, document_id, ordinal)
             number, heading, next_index = article_match
-            current = _ChunkBuilder("article", number, heading, page_num, [line])
+            current = _ChunkBuilder("article", number, heading, page_num, [(page_num, line)])
             article_context = None
             index = next_index
             continue
         exhibit_match = _match_exhibit(lines, index)
         if exhibit_match is not None:
-            ordinal = _flush_chunk(chunks, current, document_id, ordinal)
+            ordinal = _flush_chunk(drafts, current, document_id, ordinal)
             number, heading, next_index = exhibit_match
-            current = _ChunkBuilder("exhibit", number, heading, page_num, [line])
+            current = _ChunkBuilder("exhibit", number, heading, page_num, [(page_num, line)])
             article_context = None
             index = next_index
             continue
         section_match = _match_section(lines, index)
         if section_match is not None:
-            ordinal = _flush_chunk(chunks, current, document_id, ordinal)
+            ordinal = _flush_chunk(drafts, current, document_id, ordinal)
             number, heading, next_index = section_match
             chunk_type = "section" if number.count(".") == 0 else "subsection"
-            current = _ChunkBuilder(chunk_type, number, heading, page_num, [line], article_context=article_context)
+            current = _ChunkBuilder(chunk_type, number, heading, page_num, [(page_num, line)], article_context=article_context)
             index = next_index
             continue
         if current is None:
             current = _ChunkBuilder("section", None, "Front Matter", page_num, [], None)
-        current.add_line(line)
+        current.add_line(page_num, line)
         index += 1
         if current.chunk_type in {"article", "exhibit"} and not article_context:
             seed = f"{document_id}|{current.chunk_type}|{current.section_number}|{current.heading}|{current.page_start}|{ordinal}"
             article_context = "chunk_" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
             current.article_context = None
-    _flush_chunk(chunks, current, document_id, ordinal)
-    chunks = _set_page_end(chunks, lines)
-    chunks = _assign_parents(chunks)
-    chunks.extend(_extract_definition_chunks(chunks))
-    chunks.sort(key=lambda chunk: chunk.ordinal_in_document)
-    return chunks
+    _flush_chunk(drafts, current, document_id, ordinal)
+    drafts = _set_page_end(drafts, lines)
+    drafts = _assign_parents(drafts)
+    base_chunks = [draft.record for draft in drafts]
+    structured_chunks = _extract_structured_chunks(drafts)
+    definition_chunks = _extract_definition_chunks(base_chunks)
+    structured_by_parent: dict[str, list[ChunkRecord]] = {}
+    for chunk in structured_chunks:
+        structured_by_parent.setdefault(chunk.parent_chunk_id or "", []).append(chunk)
+    ordered: list[ChunkRecord] = []
+    for chunk in base_chunks:
+        ordered.append(chunk)
+        ordered.extend(structured_by_parent.get(chunk.chunk_id, []))
+    ordered.extend(definition_chunks)
+    return _renumber_chunks(ordered)

@@ -10,6 +10,7 @@ from epc_smart_search.query_planner import (
     QueryPlan,
     REQUEST_SHAPE_BROAD_TOPIC,
     REQUEST_SHAPE_GROUPED_LIST,
+    RETRIEVAL_MODE_FACT_LOOKUP,
     has_term_overlap,
     plan_query,
 )
@@ -93,6 +94,9 @@ class AnswerPolicy:
     ) -> AssistantAnswer:
         effective_question = self.resolve_question(question, history)
         plan = self._plan_query(effective_question)
+        fact_answer = None if deep_think or expand_answer else self.build_fact_answer(effective_question, plan=plan)
+        if fact_answer is not None:
+            return fact_answer
         exact_hits = self.retriever.find_exact_page_hits(effective_question)
         exact_answer = None if expand_answer else self.build_exact_answer(effective_question, exact_hits)
         if exact_answer is not None and not deep_think:
@@ -279,6 +283,54 @@ class AnswerPolicy:
                 body = f"{heading}:\n{lines}\nSection {label} - {heading}\nPages: {pages}"
                 return AssistantAnswer(body, citations, False)
         return None
+
+    def build_fact_answer(
+        self,
+        question: str,
+        *,
+        plan: QueryPlan | None = None,
+    ) -> AssistantAnswer | None:
+        if self.store is None or self.retriever is None:
+            return None
+        plan = plan or self._plan_query(question)
+        if plan.retrieval_mode != RETRIEVAL_MODE_FACT_LOOKUP or not plan.system_phrase or not plan.attribute_label:
+            return None
+        resolve_document_id = getattr(self.retriever, "resolve_document_id", None)
+        if not callable(resolve_document_id):
+            return None
+        document_id = resolve_document_id()
+        if not document_id:
+            return None
+        rows = self.store.lookup_facts_by_system_attribute(document_id, plan.system_phrase, plan.attribute_label)
+        if not rows:
+            for alias in plan.system_aliases:
+                if not alias:
+                    continue
+                rows = self.store.lookup_facts_by_system_attribute(document_id, alias, plan.attribute_label)
+                if rows:
+                    break
+        if not rows:
+            return None
+        fact = rows[0]
+        chunk_row = self.store.fetch_chunk(fact.source_chunk_id)
+        section_number = chunk_row["section_number"] if chunk_row is not None else None
+        heading = " ".join(str(chunk_row["heading"]).split()) if chunk_row is not None else "Contract evidence"
+        citation = Citation(
+            chunk_id=fact.source_chunk_id,
+            section_number=section_number,
+            heading=heading,
+            attachment=None,
+            page_start=fact.page_start,
+            page_end=fact.page_end,
+            quote=fact.evidence_text,
+        )
+        section_label = section_number or "Unnumbered clause"
+        pages_label = f"{fact.page_start}" if fact.page_start == fact.page_end else f"{fact.page_start}-{fact.page_end}"
+        return AssistantAnswer(
+            f'"{fact.value}"\nSection {section_label} - {heading}\nPages: {pages_label}\nEvidence: "{fact.evidence_text}"',
+            [citation],
+            False,
+        )
 
     @classmethod
     def should_use_merged_ranked_for_requirements(cls, plan: QueryPlan, trace) -> bool:

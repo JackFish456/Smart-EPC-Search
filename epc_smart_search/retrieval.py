@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from epc_smart_search.config import MAX_EMBEDDING_DIM, MAX_SEARCH_RESULTS, MAX_SEMANTIC_SCAN
-from epc_smart_search.name_normalization import normalize_attribute_name, normalize_system_name
+from epc_smart_search.name_normalization import build_system_aliases, normalize_attribute_name, normalize_system_name
 from epc_smart_search.query_planner import (
     ANSWER_FAMILY_GUARANTEE_OR_LIMIT,
     EXACT_VALUE_ATTRIBUTE_LABELS,
@@ -437,7 +437,23 @@ class HybridRetriever:
     def _candidate_facts_for_plan(self, document_id: str, plan: QueryPlan) -> list[ContractFactRow]:
         if plan.attribute_label not in EXACT_VALUE_ATTRIBUTE_LABELS or not plan.system_phrase:
             return []
-        return self.store.lookup_facts_by_system_attribute(document_id, plan.system_phrase, plan.attribute_label)
+        facts: list[ContractFactRow] = []
+        seen: set[int] = set()
+        system_names = [plan.system_phrase, *plan.system_aliases]
+        attribute_names = FACT_ATTRIBUTE_ALIASES.get(plan.attribute_label or "", (plan.attribute_label or "",))
+        for system_name in system_names:
+            if not system_name:
+                continue
+            for attribute in attribute_names:
+                for fact in self.store.lookup_facts_by_system_attribute(document_id, system_name, attribute):
+                    if fact.fact_rowid is not None and fact.fact_rowid in seen:
+                        continue
+                    if fact.fact_rowid is not None:
+                        seen.add(fact.fact_rowid)
+                    facts.append(fact)
+            if facts:
+                break
+        return facts
 
     @staticmethod
     def _fact_match_score(plan: QueryPlan, fact: ContractFactRow) -> float:
@@ -445,19 +461,25 @@ class HybridRetriever:
             return 0.0
         plan_system = normalize_system_name(plan.system_phrase)
         fact_system = normalize_system_name(fact.system_normalized or fact.system)
-        if not fact_system or fact_system != plan_system:
+        if not fact_system:
             return 0.0
+        system_hits = sum(1 for term in plan.system_terms if term and f" {term} " in f" {fact_system} ")
+        significant_hits = sum(1 for term in plan.system_significant_terms if term and f" {term} " in f" {fact_system} ")
 
         plan_attribute = normalize_attribute_name(plan.attribute_label or "")
         fact_attribute = normalize_attribute_name(fact.attribute_normalized or fact.attribute)
         if plan_attribute and fact_attribute != plan_attribute:
             return 0.0
 
-        score = 2.2
-        system_hits = sum(1 for term in plan.system_terms if term and f" {term} " in f" {fact_system} ")
-        score += 0.25 * system_hits
-        significant_hits = sum(1 for term in plan.system_significant_terms if term and f" {term} " in f" {fact_system} ")
-        score += 0.35 * significant_hits
+        score = 1.0
+        if fact_system == plan_system:
+            score += 1.2
+        elif plan_system and plan_system in fact_system:
+            score += 0.9
+        elif fact_system and fact_system in plan_system:
+            score += 0.75
+        score += 0.3 * system_hits
+        score += 0.45 * significant_hits
         if plan.content_query:
             normalized_evidence = f"{fact.evidence_text} {fact.value}".lower()
             if plan.content_query in normalized_evidence:

@@ -280,13 +280,13 @@
   {
     "name": "no_answer_solar_section",
     "category": "no_answer",
-    "question": "what section covers battery storage",
+    "question": "what is the cybersecurity protocol",
     "expect_refusal": true
   },
   {
     "name": "no_answer_refrigerant_page",
     "category": "no_answer",
-    "question": "which page covers solar interconnection",
+    "question": "what is the drone inspection frequency",
     "expect_refusal": true
   },
   {

@@ -211,6 +211,16 @@ def test_query_plan_extracts_system_and_attribute_for_configuration_question() -
     assert plan.system_terms == ("dew", "point")
     assert plan.attribute_label == "configuration"
     assert "configuration" in plan.attribute_terms
+
+
+def test_query_plan_normalizes_explicit_system_aliases_for_fact_lookup() -> None:
+    plan = plan_query("What is the CCW configuration?")
+
+    assert plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
+    assert plan.system_phrase == "closed cooling water"
+    assert "ccw" in plan.system_aliases
+    assert "closed cooling water system" in plan.system_aliases
+    assert plan.attribute_label == "configuration"
     assert plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
 
 
@@ -694,6 +704,53 @@ def test_retrieve_trace_prefers_semantic_system_clause_over_heading_only_noise()
     assert any(chunk.chunk_id == "ccw_system" for chunk in trace.recall_sources["semantic"])
 
 
+def test_fact_lookup_uses_shared_system_and_attribute_normalization() -> None:
+    db_path = "file:retrieval_fact_alias?mode=memory&cache=shared"
+    store = ContractStore(db_path)
+    embedder = HashingEmbedder(dimension=16)
+    chunk = _chunk(
+        "ccw_fact",
+        "5.18",
+        "Auxiliary Summary",
+        "The system summary table lists two parallel trains.",
+        261,
+    )
+    store.replace_document(
+        document_id="doc1",
+        display_name="Contract.pdf",
+        version_label="v1",
+        file_path="Contract.pdf",
+        sha256="abc",
+        page_count=1,
+        chunks=[chunk],
+        pages=[PageText(page_num=261, text=chunk.full_text, ocr_used=False)],
+        features=build_chunk_features([chunk]),
+        facts=[
+            ContractFactRow(
+                document_id="doc1",
+                system="Closed Cooling Water System",
+                attribute="Configuration / Arrangement",
+                value="2 x 100%",
+                evidence_text="The closed cooling water system shall be arranged as 2 x 100%.",
+                source_chunk_id=chunk.chunk_id,
+                page_start=261,
+                page_end=261,
+            )
+        ],
+        embeddings={chunk.chunk_id: pack_vector(embedder.embed(chunk.full_text))},
+        model_name=embedder.model_name,
+        dimension=embedder.dimension,
+    )
+    retriever = HybridRetriever(store, embedder)
+
+    trace = retriever.retrieve_trace("What is the CCW configuration?")
+
+    assert trace.plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
+    assert trace.recall_sources["fact_lookup"]
+    assert trace.selected_bundle is not None
+    assert trace.selected_bundle.ranked_chunks[0].chunk_id == "ccw_fact"
+
+
 def test_retrieve_trace_can_use_gemma_to_break_close_bundle_ties() -> None:
     retriever = _seed_retriever(
         [
@@ -753,7 +810,21 @@ def test_fact_lookup_short_circuits_generic_recall_for_exact_value_questions() -
                 "The selected turbine generator model shall be Siemens SGT6-5000F for the project.",
                 19,
             ),
-        ]
+        ],
+        facts=[
+            ContractFactRow(
+                document_id="doc1",
+                system="turbine generator",
+                system_normalized="turbine generator",
+                attribute="model",
+                attribute_normalized="model",
+                value="Siemens SGT6-5000F for the project",
+                evidence_text="The selected turbine generator model shall be Siemens SGT6-5000F for the project.",
+                source_chunk_id="selected_turbine",
+                page_start=19,
+                page_end=19,
+            )
+        ],
     )
 
     trace = retriever.retrieve_trace("What model turbine is selected?")
@@ -816,8 +887,8 @@ def test_low_confidence_fact_lookup_falls_back_to_generic_recall() -> None:
         facts=[
             ContractFactRow(
                 document_id="doc1",
-                system="service water tank",
-                system_normalized="service water tank",
+                system="startup water header",
+                system_normalized="startup water header",
                 attribute="capacity",
                 attribute_normalized="capacity",
                 value="startup water",

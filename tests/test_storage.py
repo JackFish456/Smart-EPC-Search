@@ -126,8 +126,34 @@ def test_contract_fact_lookup_uses_normalized_matching() -> None:
     rows = store.lookup_facts_by_system_attribute("doc1", " dew point heaters ", "configuration arrangement")
 
     assert len(rows) == 1
-    assert rows[0].system_normalized == "dew point heaters"
-    assert rows[0].attribute_normalized == "configuration arrangement"
+    assert rows[0].system_normalized == "dew point heater"
+    assert rows[0].attribute_normalized == "configuration"
+
+
+def test_contract_fact_lookup_supports_explicit_system_aliases_without_collisions() -> None:
+    store, chunk = _seed_store("file:storage_contract_aliases?mode=memory&cache=shared")
+    store.insert_contract_facts(
+        [
+            ContractFactRow(
+                document_id="doc1",
+                system="Closed Cooling Water System",
+                attribute="Configuration / Arrangement",
+                value="2 x 100%",
+                evidence_text="The closed cooling water system shall be arranged as 2 x 100%.",
+                source_chunk_id=chunk.chunk_id,
+                page_start=10,
+                page_end=10,
+            )
+        ]
+    )
+
+    alias_rows = store.lookup_facts_by_system_attribute("doc1", "CCW", "configuration")
+    unrelated_rows = store.lookup_facts_by_system_attribute("doc1", "cooling water", "configuration")
+
+    assert len(alias_rows) == 1
+    assert alias_rows[0].system_normalized == "closed cooling water"
+    assert alias_rows[0].attribute_normalized == "configuration"
+    assert unrelated_rows == []
 
 
 def test_contract_fact_inserts_are_duplicate_safe() -> None:

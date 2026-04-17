@@ -6,6 +6,7 @@ from epc_smart_search.answer_policy import AnswerPolicy
 from epc_smart_search.query_planner import plan_query
 from epc_smart_search.retrieval import Citation, ExactPageHit
 from epc_smart_search.retrieval import EvidenceBundle, RankedChunk, RetrievalTrace
+from epc_smart_search.storage import ContractFactRow
 
 
 def test_limit_citations_prefers_distinct_pages() -> None:
@@ -313,6 +314,53 @@ def test_build_exact_answer_returns_fact_row_capacity_value() -> None:
     assert answer is not None
     assert answer.text.startswith("Answer: 100% capacity")
     assert "Direct contract text:" in answer.text
+
+
+def test_answer_policy_returns_store_backed_fact_answer_before_page_search() -> None:
+    class FakeStore:
+        def lookup_facts_by_system_attribute(self, document_id: str, system: str, attribute: str):
+            if document_id != "doc1" or "dew point heater" not in system or attribute != "configuration":
+                return []
+            return [
+                ContractFactRow(
+                    document_id="doc1",
+                    system="dew point heater",
+                    system_normalized="dew point heater",
+                    attribute="configuration",
+                    attribute_normalized="configuration",
+                    value="4 x 50%",
+                    evidence_text="Dew point heaters shall be furnished in a 4 x 50% configuration.",
+                    source_chunk_id="chunk_fact",
+                    page_start=41,
+                    page_end=41,
+                    fact_rowid=1,
+                )
+            ]
+
+        def fetch_chunk(self, chunk_id: str):
+            if chunk_id != "chunk_fact":
+                return None
+            return {
+                "section_number": "7.4.2",
+                "heading": "Dew Point Heaters",
+            }
+
+    class FakeRetriever:
+        def resolve_document_id(self) -> str:
+            return "doc1"
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called for a stored fact answer.")
+
+    policy = AnswerPolicy(FakeStore(), FakeRetriever())
+    answer = policy.answer("What is the configuration of the dew point heaters?", None, FakeGemma())
+
+    assert answer.refused is False
+    assert answer.text.startswith('"4 x 50%"')
+    assert "Section 7.4.2 - Dew Point Heaters" in answer.text
+    assert 'Evidence: "Dew point heaters shall be furnished in a 4 x 50% configuration."' in answer.text
+    assert answer.citations[0].chunk_id == "chunk_fact"
 
 
 def test_build_exact_answer_returns_quantity_value_for_quantity_question() -> None:
