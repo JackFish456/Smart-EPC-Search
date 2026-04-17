@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import html
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Sequence
 
 from epc_smart_search.name_normalization import build_system_aliases, normalize_attribute_name, normalize_system_name
@@ -14,6 +14,7 @@ from epc_smart_search.query_planner import (
     REQUEST_SHAPE_GROUPED_LIST,
     REQUEST_SHAPE_REFERENCE_LOOKUP,
     RETRIEVAL_MODE_FACT_LOOKUP,
+    RETRIEVAL_MODE_TOPIC_SUMMARY,
     has_term_overlap,
     plan_query,
 )
@@ -99,6 +100,33 @@ GENERIC_SUBJECT_TERMS = {
     "value",
     "values",
 }
+SUMMARY_COMPRESSION_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "about",
+    "any",
+    "do",
+    "does",
+    "explain",
+    "for",
+    "give",
+    "how",
+    "information",
+    "is",
+    "me",
+    "of",
+    "on",
+    "or",
+    "provide",
+    "show",
+    "summarize",
+    "summarise",
+    "tell",
+    "the",
+    "what",
+}
 
 
 class AnswerPolicy:
@@ -144,6 +172,7 @@ class AnswerPolicy:
         if broad_topic_request and trace is not None:
             ranked = list(trace.merged_ranked)
             citations = self.citations_from_ranked(ranked, grounded_question)
+            citations = self._merge_ranked_context_enrichment(ranked, citations)
         elif trace is not None and trace.selected_bundle is not None:
             ranked = list(trace.selected_bundle.ranked_chunks)
             citations = list(trace.selected_bundle.citations)
@@ -154,6 +183,7 @@ class AnswerPolicy:
                     reverse=True,
                 )
                 citations = self.citations_from_ranked(ranked, grounded_question)
+                citations = self._merge_ranked_context_enrichment(ranked, citations)
         else:
             ranked = (
                 self.retriever.retrieve(grounded_question, profile="deep")
@@ -161,6 +191,14 @@ class AnswerPolicy:
                 else self.retriever.retrieve(grounded_question)
             )
             citations = self.retriever.expand_with_context(ranked) if ranked else []
+        summary_ranked = ranked
+        if self.should_compress_summary_context(plan, trace, summary_request=summary_request):
+            summary_ranked = self.compress_context(
+                ranked,
+                grounded_question,
+                plan.system_terms,
+                plan.attribute_terms,
+            )
         citations = self.limit_citations(citations) if citations else []
 
         if not deep_think and not ranked:
@@ -175,7 +213,7 @@ class AnswerPolicy:
             citations,
             evidence_is_weak=evidence_is_weak,
         )
-        broad_topic_answer = self.build_broad_topic_answer(grounded_question, ranked, citations) if broad_topic_request else None
+        broad_topic_answer = self.build_broad_topic_answer(grounded_question, summary_ranked, citations) if broad_topic_request else None
         grounded_broad_topic_answer = None if evidence_is_weak else broad_topic_answer
 
         if (
@@ -206,7 +244,7 @@ class AnswerPolicy:
                 return AssistantAnswer("I can't verify that from the contract.", refusal_citations, True)
         else:
             prompt_context = (
-                self.build_summary_prompt_context(grounded_question, ranked)
+                self.build_summary_prompt_context(grounded_question, summary_ranked)
                 if summary_request
                 else self._build_standard_prompt_context(grounded_question, ranked, citations, trace)
             )
@@ -275,6 +313,122 @@ class AnswerPolicy:
         if callable(build_evidence):
             return build_evidence(effective_question, ranked, citations)
         return ""
+
+    @staticmethod
+    def should_compress_summary_context(plan: QueryPlan, trace, *, summary_request: bool) -> bool:
+        if not summary_request:
+            return False
+        trace_mode = getattr(trace, "retrieval_mode", None) if trace is not None else None
+        active_mode = trace_mode or plan.retrieval_mode
+        return active_mode == RETRIEVAL_MODE_TOPIC_SUMMARY
+
+    @classmethod
+    def compress_context(
+        cls,
+        chunks: Sequence[RankedChunk],
+        query: str,
+        system_terms: Sequence[str],
+        attribute_terms: Sequence[str],
+    ) -> list[RankedChunk]:
+        query_terms = cls.summary_compression_terms(query)
+        system_keywords = cls.summary_compression_keywords(system_terms)
+        attribute_keywords = cls.summary_compression_keywords(attribute_terms)
+        compressed: list[RankedChunk] = []
+        for chunk in chunks:
+            compact = " ".join(chunk.full_text.split())
+            if not compact:
+                continue
+            compressed_text = cls.compress_chunk_text(
+                compact,
+                query_terms=query_terms,
+                system_keywords=system_keywords,
+                attribute_keywords=attribute_keywords,
+            )
+            if not compressed_text:
+                continue
+            compressed.append(replace(chunk, full_text=compressed_text))
+        return compressed
+
+    @classmethod
+    def compress_chunk_text(
+        cls,
+        text: str,
+        *,
+        query_terms: set[str],
+        system_keywords: tuple[str, ...],
+        attribute_keywords: tuple[str, ...],
+    ) -> str:
+        sentences = cls.split_sentences(text)
+        if not sentences:
+            return text
+        kept: list[str] = []
+        for sentence in sentences:
+            if cls.should_keep_compressed_sentence(
+                sentence,
+                query_terms=query_terms,
+                system_keywords=system_keywords,
+                attribute_keywords=attribute_keywords,
+            ):
+                kept.append(sentence.strip())
+        return " ".join(kept).strip()
+
+    @classmethod
+    def should_keep_compressed_sentence(
+        cls,
+        sentence: str,
+        *,
+        query_terms: set[str],
+        system_keywords: tuple[str, ...],
+        attribute_keywords: tuple[str, ...],
+    ) -> bool:
+        lowered = sentence.lower()
+        sentence_terms = cls.summary_compression_terms(lowered)
+        system_hits = cls.summary_keyword_hits(lowered, sentence_terms, system_keywords)
+        attribute_hits = cls.summary_keyword_hits(lowered, sentence_terms, attribute_keywords)
+        query_hits = len(query_terms.intersection(sentence_terms))
+        if system_hits > 0 or attribute_hits > 0:
+            return True
+        if not query_terms:
+            return False
+        overlap_threshold = 2 if len(query_terms) >= 3 else 1
+        if query_hits >= overlap_threshold:
+            return True
+        return bool(query_hits >= 1 and re.search(r"\d", sentence))
+
+    @staticmethod
+    def summary_compression_keywords(terms: Sequence[str]) -> tuple[str, ...]:
+        keywords: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            normalized = " ".join(str(term).lower().split())
+            if not normalized or normalized in SUMMARY_COMPRESSION_STOPWORDS or normalized in seen:
+                continue
+            seen.add(normalized)
+            keywords.append(normalized)
+        return tuple(keywords)
+
+    @staticmethod
+    def summary_compression_terms(text: str) -> set[str]:
+        terms: set[str] = set()
+        for token in TOKEN_RE.findall(str(text).lower()):
+            normalized = token.lower()
+            if len(normalized) <= 2 or normalized in SUMMARY_COMPRESSION_STOPWORDS:
+                continue
+            terms.add(normalized)
+            if len(normalized) > 3 and normalized.endswith("s") and not normalized.endswith("ss"):
+                terms.add(normalized[:-1])
+        return terms
+
+    @staticmethod
+    def summary_keyword_hits(lowered_sentence: str, sentence_terms: set[str], keywords: Sequence[str]) -> int:
+        hits = 0
+        for keyword in keywords:
+            if " " in keyword:
+                if keyword in lowered_sentence:
+                    hits += 1
+            elif keyword in sentence_terms:
+                hits += 1
+        return hits
 
     def build_page_attribute_answer(
         self,
@@ -363,6 +517,13 @@ class AnswerPolicy:
             page_end=int(getattr(fact, "page_end", 0) or 0),
             quote=str(getattr(fact, "evidence_text", "") or ""),
         )
+        citations = [citation]
+        extra_fn = getattr(self.retriever, "fact_hit_context_citations", None)
+        if callable(extra_fn):
+            for extra in extra_fn(fact):
+                if extra.chunk_id == citation.chunk_id:
+                    continue
+                citations.append(extra)
         page_start = int(getattr(fact, "page_start", 0) or 0)
         page_end = int(getattr(fact, "page_end", 0) or 0)
         value = str(getattr(fact, "value", "") or "")
@@ -371,7 +532,7 @@ class AnswerPolicy:
         pages_label = f"{page_start}" if page_start == page_end else f"{page_start}-{page_end}"
         return AssistantAnswer(
             f'"{value}"\nSection {section_label} - {heading}\nPages: {pages_label}\nEvidence: "{evidence}"',
-            [citation],
+            citations,
             False,
         )
 
@@ -601,6 +762,18 @@ class AnswerPolicy:
             if len(citations) >= limit:
                 break
         return citations
+
+    def _merge_ranked_context_enrichment(
+        self,
+        ranked: list[RankedChunk],
+        citations: list[Citation],
+        *,
+        limit: int = 5,
+    ) -> list[Citation]:
+        merge_fn = getattr(self.retriever, "merge_ranked_enrichment_citations", None)
+        if not callable(merge_fn) or not ranked:
+            return citations[:limit]
+        return merge_fn(ranked, citations, limit=limit)
 
     @classmethod
     def resolve_question(cls, question: str, history: Sequence[dict[str, str]] | None = None) -> str:

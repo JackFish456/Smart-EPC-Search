@@ -814,7 +814,10 @@ class ContractStore:
                 (document_id, like, like, like, like, like, like, limit),
             ).fetchall()
 
-    def fetch_context_neighbors(self, document_id: str, ordinal: int) -> list[sqlite3.Row]:
+    def fetch_context_neighbors(self, document_id: str, ordinal: int, *, radius: int = 1) -> list[sqlite3.Row]:
+        safe_radius = max(0, int(radius))
+        low = int(ordinal) - safe_radius
+        high = int(ordinal) + safe_radius
         with self._connect() as connection:
             return connection.execute(
                 """
@@ -832,7 +835,7 @@ class ContractStore:
                   AND c.ordinal_in_document BETWEEN ? AND ?
                 ORDER BY c.ordinal_in_document
                 """,
-                (document_id, ordinal - 1, ordinal + 1),
+                (document_id, low, high),
             ).fetchall()
 
     def fetch_parent(self, parent_chunk_id: str | None) -> sqlite3.Row | None:

@@ -10,7 +10,7 @@ from epc_smart_search.query_planner import (
     build_like_fallback,
     plan_query,
 )
-from epc_smart_search.retrieval import HashingEmbedder, HybridRetriever
+from epc_smart_search.retrieval import ContextEnrichmentSettings, HashingEmbedder, HybridRetriever, RankedChunk, format_trace_debug
 from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractFactRow, ContractStore, pack_vector
 
@@ -271,6 +271,22 @@ def test_query_plan_marks_system_summary_prompt_as_broad_topic() -> None:
     assert plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
     assert plan.retrieval_mode == RETRIEVAL_MODE_TOPIC_SUMMARY
     assert plan.system_phrase == ""
+
+
+def test_query_plan_marks_describe_prompt_as_topic_summary() -> None:
+    plan = plan_query("Describe the closed cooling water system")
+
+    assert plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
+    assert plan.retrieval_mode == RETRIEVAL_MODE_TOPIC_SUMMARY
+    assert plan.content_query == "closed cooling water system"
+
+
+def test_query_plan_keeps_attribute_queries_on_fact_lookup_even_with_describe_wording() -> None:
+    plan = plan_query("Describe the CCW configuration")
+
+    assert plan.attribute_label == "configuration"
+    assert plan.system_phrase == "closed cooling water"
+    assert plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
 
 
 def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> None:
@@ -764,6 +780,15 @@ def test_fact_lookup_uses_shared_system_and_attribute_normalization() -> None:
     assert trace.normalized_system == "closed cooling water"
     assert trace.normalized_attribute == "configuration"
     assert trace.fact_lookup_attempted is True
+    assert trace.chunk_fallback_used is False
+    assert "ccw" in trace.system_aliases_used
+    assert trace.fts_hits == []
+    assert trace.embedding_hits == []
+    assert trace.keyword_hits == []
+    assert len(trace.candidate_chunks) == 1
+    assert trace.candidate_chunks[0].chunk_id == "ccw_fact"
+    assert trace.candidate_chunks[0].source_type == "fact_lookup"
+    assert [chunk.chunk_id for chunk in trace.selected_chunks] == ["ccw_fact"]
     assert [row.value for row in trace.fact_rows] == ["2 x 100%"]
     assert trace.fact_hit is not None
     assert trace.fact_hit.value == "2 x 100%"
@@ -776,12 +801,19 @@ def test_fact_lookup_uses_shared_system_and_attribute_normalization() -> None:
     assert debug["request_shape"] == "scalar"
     assert debug["normalized_system"] == "closed cooling water"
     assert debug["normalized_attribute"] == "configuration"
+    assert "ccw" in debug["system_aliases_used"]
     assert debug["fact_lookup_attempted"] is True
+    assert debug["chunk_fallback_used"] is False
     assert debug["fact_rows_returned"] == 1
     assert debug["fact_fallback_reason"] is None
     assert debug["fallback_reason"] is None
     assert debug["selected_bundle_id"] == "ccw_fact"
     assert debug["recall_source_counts"] == {"fact_lookup": 1}
+    assert debug["fts_hits"] == []
+    assert debug["embedding_hits"] == []
+    assert debug["keyword_hits"] == []
+    assert debug["candidate_chunks"][0]["source_type"] == "fact_lookup"
+    assert debug["selected_chunks"][0]["chunk_id"] == "ccw_fact"
     assert len(debug["fact_rows"]) == 1
     assert debug["fact_rows"][0]["system_normalized"] == "closed cooling water"
     assert debug["fact_rows"][0]["attribute_normalized"] == "configuration"
@@ -860,6 +892,7 @@ def test_topic_summary_keeps_bundle_path_for_closed_cooling_water_summary() -> N
     assert trace.plan.retrieval_mode == RETRIEVAL_MODE_TOPIC_SUMMARY
     assert "fact_lookup" not in trace.recall_sources
     assert trace.fact_lookup_attempted is False
+    assert trace.chunk_fallback_used is False
     assert trace.selected_bundle is not None
     assert trace.selected_bundle.primary_chunk_id == "ccw_summary"
 
@@ -978,6 +1011,7 @@ def test_topic_summary_keeps_broader_bundle_path_for_summary_questions() -> None
     assert trace.selected_bundle.primary_chunk_id == "permit_overview"
     assert {chunk.chunk_id for chunk in trace.selected_bundle.ranked_chunks[:2]} == {"permit_overview", "permit_testing"}
     assert trace.fact_lookup_attempted is False
+    assert trace.chunk_fallback_used is False
     assert trace.fact_rows_returned == 0
     assert trace.fallback_reason == "topic_summary_mode"
     assert trace.to_debug_dict()["fact_lookup_attempted"] is False
@@ -1040,6 +1074,14 @@ def test_low_confidence_fact_lookup_falls_back_to_generic_recall() -> None:
     assert trace.normalized_system == "service water tank"
     assert trace.normalized_attribute == "capacity"
     assert trace.fact_lookup_attempted is True
+    assert trace.chunk_fallback_used is True
+    assert trace.fts_hits
+    assert trace.embedding_hits
+    assert isinstance(trace.keyword_hits, list)
+    assert trace.candidate_chunks
+    assert any("fact_lookup" in candidate.source_names for candidate in trace.candidate_chunks)
+    assert any(len(candidate.source_names) > 1 for candidate in trace.candidate_chunks)
+    assert trace.selected_chunks
     assert trace.fact_rows_returned == 2
     assert trace.fact_hit is None
     assert trace.fact_fallback_reason == "conflicting_fact_values"
@@ -1047,9 +1089,100 @@ def test_low_confidence_fact_lookup_falls_back_to_generic_recall() -> None:
     debug = trace.to_debug_dict()
     assert debug["fact_fallback_reason"] == "conflicting_fact_values"
     assert debug["fallback_reason"] == "conflicting_fact_values"
+    assert debug["chunk_fallback_used"] is True
     assert len(debug["fact_rows"]) == 2
+    assert debug["fts_hits"]
+    assert debug["embedding_hits"]
+    assert isinstance(debug["keyword_hits"], list)
+    assert debug["candidate_chunks"]
+    assert debug["selected_chunks"]
     assert debug["recall_source_counts"]["fact_lookup"] == 2
     assert debug["recall_source_counts"]["planner_hints"] > 0
+
+
+def test_format_trace_debug_distinguishes_fact_hit_and_fallback_paths() -> None:
+    fact_trace = _seed_retriever(
+        [
+            _chunk(
+                "dew_point_fact",
+                "7.4.2",
+                "Dew Point Heaters",
+                "Dew point heaters shall be furnished in a 4 x 50% configuration.",
+                41,
+            )
+        ],
+        facts=[
+            ContractFactRow(
+                document_id="doc1",
+                system="Dew Point Heaters",
+                system_normalized="dew point heater",
+                attribute="Configuration / Arrangement",
+                attribute_normalized="configuration",
+                value="4 x 50%",
+                evidence_text="Dew point heaters shall be furnished in a 4 x 50% configuration.",
+                source_chunk_id="dew_point_fact",
+                page_start=41,
+                page_end=41,
+            )
+        ],
+    ).retrieve_trace("What is the configuration of the dew point heaters?")
+
+    fallback_trace = _seed_retriever(
+        [
+            _chunk(
+                "service_water_overview",
+                "6.1",
+                "Service Water Tank",
+                "The service water tank stores treated water for startup and shutdown operations.",
+                10,
+            ),
+            _chunk(
+                "service_water_capacity",
+                "6.2",
+                "Service Water Tank Data",
+                "The service water tank capacity shall be 500000 gallons.",
+                11,
+            ),
+        ],
+        facts=[
+            ContractFactRow(
+                document_id="doc1",
+                system="service water tank",
+                system_normalized="service water tank",
+                attribute="capacity",
+                attribute_normalized="capacity",
+                value="startup water",
+                evidence_text="The service water tank stores treated water for startup and shutdown operations.",
+                source_chunk_id="service_water_overview",
+                page_start=10,
+                page_end=10,
+            ),
+            ContractFactRow(
+                document_id="doc1",
+                system="service water tank",
+                system_normalized="service water tank",
+                attribute="capacity",
+                attribute_normalized="capacity",
+                value="500000 gallons",
+                evidence_text="The service water tank capacity shall be 500000 gallons.",
+                source_chunk_id="service_water_capacity",
+                page_start=11,
+                page_end=11,
+            ),
+        ],
+    ).retrieve_trace("What is the capacity of the service water tank?")
+
+    fact_debug = format_trace_debug(fact_trace)
+    fallback_debug = format_trace_debug(fallback_trace)
+
+    assert "Fact Hit: Dew Point Heaters | Configuration / Arrangement = 4 x 50%" in fact_debug
+    assert "Chunk Fallback Used: no" in fact_debug
+    assert "Fallback Reason: none" in fact_debug
+    assert "Fact Hit: none" in fallback_debug
+    assert "Chunk Fallback Used: yes" in fallback_debug
+    assert "Fallback Reason: conflicting_fact_values" in fallback_debug
+    assert "Candidate Chunks:" in fact_debug
+    assert "Selected Chunks:" in fallback_debug
 
 
 def test_broad_topic_environmental_requirements_prefers_requirement_clause_over_appendix_header() -> None:
@@ -1218,6 +1351,239 @@ def test_date_like_schedule_noise_is_penalized_for_equipment_queries() -> None:
     assert ranked[0].chunk_id == "steam_valves"
 
 
+def test_context_enrichment_includes_parent_and_neighbors_in_order() -> None:
+    chunks = [
+        _chunk(
+            "parent_sec",
+            "1",
+            "Article Scope",
+            "Parent section establishes scope and obligations for the work described herein.",
+            10,
+            chunk_type="section",
+            ordinal_in_document=10,
+        ),
+        _chunk(
+            "mid",
+            "1.1",
+            "Detail clause",
+            "Mid detail clause requires contractor coordination and sufficient descriptive text.",
+            11,
+            chunk_type="subsection",
+            parent_chunk_id="parent_sec",
+            ordinal_in_document=11,
+        ),
+        _chunk(
+            "after",
+            "1.2",
+            "Following clause",
+            "Following subsection text continues requirements after the detail clause.",
+            12,
+            chunk_type="subsection",
+            parent_chunk_id="parent_sec",
+            ordinal_in_document=12,
+        ),
+    ]
+    retriever = _seed_retriever(chunks)
+    ranked = RankedChunk(
+        chunk_id="mid",
+        section_number="1.1",
+        heading="Detail clause",
+        full_text=chunks[1].full_text,
+        page_start=11,
+        page_end=11,
+        ordinal_in_document=11,
+        total_score=1.0,
+        lexical_score=0.5,
+        semantic_score=0.5,
+    )
+    citations = retriever.expand_with_context([ranked])
+    ids = [c.chunk_id for c in citations]
+    assert ids[0] == "parent_sec"
+    assert "mid" in ids
+    assert "after" in ids
+    assert len(ids) == len(set(ids))
+
+
+def test_context_enrichment_boundary_low_ordinal_includes_only_existing_neighbors() -> None:
+    chunks = [
+        _chunk(
+            "first",
+            "A",
+            "Opening",
+            "Opening clause establishes the first obligations with sufficient token length.",
+            10,
+            ordinal_in_document=0,
+        ),
+        _chunk(
+            "second",
+            "B",
+            "Next",
+            "Next clause provides ordinal neighbor to the right with more requirement language.",
+            11,
+            ordinal_in_document=1,
+        ),
+    ]
+    retriever = _seed_retriever(chunks)
+    ranked = RankedChunk(
+        chunk_id="first",
+        section_number="A",
+        heading="Opening",
+        full_text=chunks[0].full_text,
+        page_start=10,
+        page_end=10,
+        ordinal_in_document=0,
+        total_score=1.0,
+        lexical_score=0.5,
+        semantic_score=0.5,
+    )
+    citations = retriever.expand_with_context([ranked], enrichment=ContextEnrichmentSettings(max_neighbors=2))
+    ids = [c.chunk_id for c in citations]
+    assert ids[0] == "first"
+    assert "second" in ids
+    assert len(ids) == len(set(ids))
+
+
+def test_context_enrichment_dedupes_when_multiple_ranked_share_context() -> None:
+    chunks = [
+        _chunk("p", "1", "Parent", "Parent text for hierarchy with adequate length for indexing.", 50, chunk_type="section", ordinal_in_document=5),
+        _chunk(
+            "a",
+            "1.1",
+            "Clause A",
+            "Clause A text about obligations and contractor duties under this agreement.",
+            51,
+            chunk_type="subsection",
+            parent_chunk_id="p",
+            ordinal_in_document=6,
+        ),
+        _chunk(
+            "b",
+            "1.2",
+            "Clause B",
+            "Clause B text continues neighboring content for ordinal expansion testing.",
+            52,
+            chunk_type="subsection",
+            parent_chunk_id="p",
+            ordinal_in_document=7,
+        ),
+    ]
+    retriever = _seed_retriever(chunks)
+    r_a = RankedChunk(
+        chunk_id="a",
+        section_number="1.1",
+        heading="Clause A",
+        full_text=chunks[1].full_text,
+        page_start=51,
+        page_end=51,
+        ordinal_in_document=6,
+        total_score=2.0,
+        lexical_score=1.0,
+        semantic_score=1.0,
+    )
+    r_b = RankedChunk(
+        chunk_id="b",
+        section_number="1.2",
+        heading="Clause B",
+        full_text=chunks[2].full_text,
+        page_start=52,
+        page_end=52,
+        ordinal_in_document=7,
+        total_score=1.0,
+        lexical_score=0.5,
+        semantic_score=0.5,
+    )
+    citations = retriever.expand_with_context([r_a, r_b])
+    ids = [c.chunk_id for c in citations]
+    assert len(ids) == len(set(ids))
+    assert ids.count("p") == 1
+
+
+def test_context_enrichment_includes_children_for_section_chunks() -> None:
+    chunks = [
+        _chunk(
+            "sec",
+            "5",
+            "Equipment section",
+            "This section summarizes equipment packages and related obligations for the contractor.",
+            100,
+            chunk_type="section",
+            ordinal_in_document=100,
+        ),
+        _chunk(
+            "c1",
+            "5.1",
+            "Pump package",
+            "Pump package subsection includes rated flow and driver details for procurement.",
+            101,
+            chunk_type="subsection",
+            parent_chunk_id="sec",
+            ordinal_in_document=101,
+        ),
+        _chunk(
+            "c2",
+            "5.2",
+            "Motor package",
+            "Motor package subsection lists efficiency and enclosure requirements for the plant.",
+            102,
+            chunk_type="subsection",
+            parent_chunk_id="sec",
+            ordinal_in_document=102,
+        ),
+    ]
+    retriever = _seed_retriever(chunks)
+    ranked = RankedChunk(
+        chunk_id="sec",
+        section_number="5",
+        heading="Equipment section",
+        full_text=chunks[0].full_text,
+        page_start=100,
+        page_end=100,
+        ordinal_in_document=100,
+        total_score=1.0,
+        lexical_score=0.5,
+        semantic_score=0.5,
+    )
+    citations = retriever.expand_with_context([ranked], enrichment=ContextEnrichmentSettings(max_neighbors=0, include_parent=False))
+    ids = [c.chunk_id for c in citations]
+    assert "c1" in ids
+    assert "c2" in ids
+    assert ids.index("sec") < ids.index("c1")
+
+
+def test_context_enrichment_respects_include_parent_false() -> None:
+    chunks = [
+        _chunk("parent_sec", "1", "Parent", "Parent section text with enough content for the test database.", 20, chunk_type="section", ordinal_in_document=20),
+        _chunk(
+            "child",
+            "1.1",
+            "Child",
+            "Child subsection text describes specific duties with adequate length here.",
+            21,
+            chunk_type="subsection",
+            parent_chunk_id="parent_sec",
+            ordinal_in_document=21,
+        ),
+    ]
+    retriever = _seed_retriever(chunks)
+    ranked = RankedChunk(
+        chunk_id="child",
+        section_number="1.1",
+        heading="Child",
+        full_text=chunks[1].full_text,
+        page_start=21,
+        page_end=21,
+        ordinal_in_document=21,
+        total_score=1.0,
+        lexical_score=0.5,
+        semantic_score=0.5,
+    )
+    citations = retriever.expand_with_context(
+        [ranked],
+        enrichment=ContextEnrichmentSettings(include_parent=False, max_neighbors=1),
+    )
+    assert all(c.chunk_id != "parent_sec" for c in citations)
+
+
 def _seed_retriever(chunks: list[ChunkRecord], *, facts: list[ContractFactRow] | None = None) -> HybridRetriever:
     db_path = "file:retrieval_suite?mode=memory&cache=shared"
     store = ContractStore(db_path)
@@ -1267,6 +1633,7 @@ def _chunk(
     *,
     chunk_type: str = "section",
     parent_chunk_id: str | None = None,
+    ordinal_in_document: int | None = None,
 ) -> ChunkRecord:
     return ChunkRecord(
         chunk_id=chunk_id,
@@ -1278,5 +1645,5 @@ def _chunk(
         page_start=page_num,
         page_end=page_num,
         parent_chunk_id=parent_chunk_id,
-        ordinal_in_document=page_num,
+        ordinal_in_document=page_num if ordinal_in_document is None else ordinal_in_document,
     )

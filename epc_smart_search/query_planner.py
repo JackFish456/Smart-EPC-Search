@@ -98,6 +98,8 @@ class QueryPlan:
 QUERY_PREFIXES = (
     "summarize the ",
     "summarize ",
+    "describe the ",
+    "describe ",
     "summary of ",
     "give me information about ",
     "information about ",
@@ -129,6 +131,7 @@ STOPWORDS = {
     "contract",
     "does",
     "details",
+    "describe",
     "exact",
     "for",
     "from",
@@ -578,6 +581,8 @@ def _detect_broad_topic_request(
     broad_prefixes = (
         "summarize the ",
         "summarize ",
+        "describe the ",
+        "describe ",
         "summary of ",
         "give me information about ",
         "information about ",

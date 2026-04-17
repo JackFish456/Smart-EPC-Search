@@ -85,6 +85,25 @@ class RetrievalProfile:
     use_query_expansion: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class ContextEnrichmentSettings:
+    """Post-retrieval context expansion for answer prompts only (does not affect ranking)."""
+
+    max_neighbors: int = 2
+    include_parent: bool = True
+    include_children: bool = True
+
+
+@dataclass(slots=True, frozen=True)
+class ChunkContextEnrichment:
+    """Structured window around one selected chunk for prompt construction."""
+
+    primary_chunk: RankedChunk
+    neighbors: tuple[RankedChunk, ...]
+    parent: RankedChunk | None
+    children: tuple[RankedChunk, ...]
+
+
 @dataclass(slots=True)
 class EvidenceBundle:
     bundle_id: str
@@ -98,6 +117,20 @@ class EvidenceBundle:
     supporting_quote: str = ""
 
 
+@dataclass(slots=True, frozen=True)
+class TraceChunkCandidate:
+    chunk_id: str
+    section_number: str | None
+    heading: str
+    page_start: int
+    page_end: int
+    total_score: float
+    lexical_score: float
+    semantic_score: float
+    source_type: str
+    source_names: tuple[str, ...] = ()
+
+
 @dataclass(slots=True)
 class RetrievalTrace:
     query: str
@@ -109,7 +142,10 @@ class RetrievalTrace:
     used_gemma_disambiguation: bool = False
     normalized_system: str = ""
     normalized_attribute: str = ""
+    system_aliases_used: tuple[str, ...] = ()
     fact_lookup_attempted: bool = False
+    chunk_fallback_used: bool = False
+    candidate_chunks: list[TraceChunkCandidate] = field(default_factory=list)
     fact_rows: list[ContractFactRow] = field(default_factory=list)
     fact_hit: ContractFactRow | None = None
     fact_rows_returned: int = 0
@@ -123,6 +159,22 @@ class RetrievalTrace:
     def fact_fallback_reason(self) -> str | None:
         return self.fallback_reason
 
+    @property
+    def fts_hits(self) -> list[RankedChunk]:
+        return self._flatten_recall_sources(("raw_fts", "planner_hints"))
+
+    @property
+    def embedding_hits(self) -> list[RankedChunk]:
+        return list(self.recall_sources.get("semantic", ()))
+
+    @property
+    def keyword_hits(self) -> list[RankedChunk]:
+        return list(self.recall_sources.get("keyword", ()))
+
+    @property
+    def selected_chunks(self) -> list[RankedChunk]:
+        return list(self.merged_ranked)
+
     def to_debug_dict(self) -> dict[str, object]:
         return {
             "query": self.query,
@@ -130,7 +182,18 @@ class RetrievalTrace:
             "request_shape": self.plan.request_shape,
             "normalized_system": self.normalized_system,
             "normalized_attribute": self.normalized_attribute,
+            "system_aliases_used": list(self.system_aliases_used),
+            "recall_sources": {
+                name: [self._ranked_chunk_to_debug_dict(row) for row in rows]
+                for name, rows in self.recall_sources.items()
+            },
+            "fts_hits": [self._ranked_chunk_to_debug_dict(row) for row in self.fts_hits],
+            "embedding_hits": [self._ranked_chunk_to_debug_dict(row) for row in self.embedding_hits],
+            "keyword_hits": [self._ranked_chunk_to_debug_dict(row) for row in self.keyword_hits],
+            "candidate_chunks": [self._candidate_to_debug_dict(row) for row in self.candidate_chunks],
+            "selected_chunks": [self._ranked_chunk_to_debug_dict(row) for row in self.selected_chunks],
             "fact_lookup_attempted": self.fact_lookup_attempted,
+            "chunk_fallback_used": self.chunk_fallback_used,
             "fact_rows": [self._fact_row_to_debug_dict(row) for row in self.fact_rows],
             "fact_hit": self._fact_row_to_debug_dict(self.fact_hit) if self.fact_hit is not None else None,
             "fact_rows_returned": self.fact_rows_returned,
@@ -138,6 +201,46 @@ class RetrievalTrace:
             "fallback_reason": self.fallback_reason,
             "selected_bundle_id": self.selected_bundle.bundle_id if self.selected_bundle is not None else None,
             "recall_source_counts": {name: len(rows) for name, rows in self.recall_sources.items()},
+        }
+
+    def _flatten_recall_sources(self, source_names: Sequence[str]) -> list[RankedChunk]:
+        flattened: list[RankedChunk] = []
+        seen_chunk_ids: set[str] = set()
+        for source_name in source_names:
+            for row in self.recall_sources.get(source_name, ()):
+                if row.chunk_id in seen_chunk_ids:
+                    continue
+                seen_chunk_ids.add(row.chunk_id)
+                flattened.append(row)
+        flattened.sort(key=lambda item: item.total_score, reverse=True)
+        return flattened
+
+    @staticmethod
+    def _ranked_chunk_to_debug_dict(row: RankedChunk) -> dict[str, object]:
+        return {
+            "chunk_id": row.chunk_id,
+            "section_number": row.section_number,
+            "heading": row.heading,
+            "page_start": row.page_start,
+            "page_end": row.page_end,
+            "total_score": row.total_score,
+            "lexical_score": row.lexical_score,
+            "semantic_score": row.semantic_score,
+        }
+
+    @staticmethod
+    def _candidate_to_debug_dict(row: TraceChunkCandidate) -> dict[str, object]:
+        return {
+            "chunk_id": row.chunk_id,
+            "section_number": row.section_number,
+            "heading": row.heading,
+            "page_start": row.page_start,
+            "page_end": row.page_end,
+            "total_score": row.total_score,
+            "lexical_score": row.lexical_score,
+            "semantic_score": row.semantic_score,
+            "source_type": row.source_type,
+            "source_names": list(row.source_names),
         }
 
     @staticmethod
@@ -155,6 +258,68 @@ class RetrievalTrace:
             "page_start": row.page_start,
             "page_end": row.page_end,
         }
+
+
+def format_trace_debug(trace: RetrievalTrace) -> str:
+    def _page_range(page_start: int, page_end: int) -> str:
+        if page_start == page_end:
+            return f"p.{page_start}"
+        return f"pp.{page_start}-{page_end}"
+
+    def _format_ranked_rows(title: str, rows: Sequence[RankedChunk]) -> list[str]:
+        lines = [f"{title}: {len(rows)}"]
+        for row in rows:
+            lines.append(
+                "  - "
+                f"{row.chunk_id} | {row.heading} | {_page_range(row.page_start, row.page_end)} | "
+                f"total={row.total_score:.3f} lex={row.lexical_score:.3f} sem={row.semantic_score:.3f}"
+            )
+        return lines
+
+    def _format_candidate_rows(title: str, rows: Sequence[TraceChunkCandidate]) -> list[str]:
+        lines = [f"{title}: {len(rows)}"]
+        for row in rows:
+            source_names = ", ".join(row.source_names) or row.source_type
+            lines.append(
+                "  - "
+                f"{row.chunk_id} | {row.heading} | {_page_range(row.page_start, row.page_end)} | "
+                f"source={source_names} | total={row.total_score:.3f} "
+                f"lex={row.lexical_score:.3f} sem={row.semantic_score:.3f}"
+            )
+        return lines
+
+    lines = [
+        f"Query: {trace.query}",
+        f"Retrieval Mode: {trace.retrieval_mode}",
+        f"Request Shape: {trace.plan.request_shape}",
+        f"Normalized System: {trace.normalized_system or 'n/a'}",
+        f"Normalized Attribute: {trace.normalized_attribute or 'n/a'}",
+        "System Aliases Used: "
+        + (", ".join(trace.system_aliases_used) if trace.system_aliases_used else "none"),
+        f"Fact Lookup Attempted: {'yes' if trace.fact_lookup_attempted else 'no'}",
+        f"Chunk Fallback Used: {'yes' if trace.chunk_fallback_used else 'no'}",
+        f"Fact Rows Returned: {trace.fact_rows_returned}",
+        f"Fallback Reason: {trace.fallback_reason or 'none'}",
+        f"Selected Bundle: {trace.selected_bundle.bundle_id if trace.selected_bundle is not None else 'none'}",
+        f"Gemma Disambiguation: {'yes' if trace.used_gemma_disambiguation else 'no'}",
+    ]
+    if trace.fact_hit is not None:
+        lines.append(
+            "Fact Hit: "
+            f"{trace.fact_hit.system} | {trace.fact_hit.attribute} = {trace.fact_hit.value} | "
+            f"{_page_range(trace.fact_hit.page_start, trace.fact_hit.page_end)}"
+        )
+    else:
+        lines.append("Fact Hit: none")
+    lines.extend(_format_ranked_rows("FTS Hits", trace.fts_hits))
+    lines.extend(_format_ranked_rows("Embedding Hits", trace.embedding_hits))
+    lines.extend(_format_ranked_rows("Keyword Hits", trace.keyword_hits))
+    lines.extend(_format_candidate_rows("Candidate Chunks", trace.candidate_chunks))
+    lines.extend(_format_ranked_rows("Selected Chunks", trace.selected_chunks))
+    lines.append("Recall Sources:")
+    for source_name, rows in trace.recall_sources.items():
+        lines.append(f"  - {source_name}: {len(rows)}")
+    return "\n".join(lines)
 
 
 @dataclass(slots=True, frozen=True)
@@ -279,6 +444,7 @@ class HybridRetriever:
                 normalized_system=normalize_system_name(plan.system_phrase),
                 normalized_attribute=normalize_attribute_name(plan.attribute_label or ""),
                 fact_lookup_attempted=False,
+                chunk_fallback_used=False,
                 fact_rows=[],
                 fact_hit=None,
                 fact_rows_returned=0,
@@ -309,7 +475,9 @@ class HybridRetriever:
         combined: dict[str, SearchCandidate] = {}
         normalized_system = normalize_system_name(plan.system_phrase)
         normalized_attribute = normalize_attribute_name(plan.attribute_label or "")
+        system_aliases_used: tuple[str, ...] = ()
         fact_lookup_attempted = False
+        chunk_fallback_used = False
         fact_rows: list[ContractFactRow] = []
         fact_hit: ContractFactRow | None = None
         fact_rows_returned = 0
@@ -328,7 +496,13 @@ class HybridRetriever:
             fact_hit = fact_outcome.fact_hit
             fact_rows_returned = fact_outcome.rows_returned
             fallback_reason = fact_outcome.fallback_reason
+            system_aliases_used = self._system_aliases_used_for_trace(
+                plan,
+                fact_lookup_used=True,
+                recall_used=not fact_outcome.confident,
+            )
             if not fact_outcome.confident:
+                chunk_fallback_used = True
                 fallback_sources, fallback_candidates = self._collect_recall_candidates(
                     document_id,
                     query,
@@ -345,6 +519,7 @@ class HybridRetriever:
             elif plan.retrieval_mode:
                 fallback_reason = f"retrieval_mode:{plan.retrieval_mode}"
             recall_sources, combined = self._collect_recall_candidates(document_id, query, query_vector, plan, active_profile)
+            system_aliases_used = self._system_aliases_used_for_trace(plan, fact_lookup_used=False, recall_used=True)
         if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
             merged_limit = GROUPED_MERGED_RECALL_KEEP
         elif plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC:
@@ -352,6 +527,7 @@ class HybridRetriever:
         else:
             merged_limit = MERGED_RECALL_KEEP
         merged = sorted(combined.values(), key=lambda item: item.total_score, reverse=True)[:merged_limit]
+        candidate_chunks = [self._trace_candidate_from_search_candidate(item) for item in merged]
         bundles = self._build_ranked_bundles(document_id, query_vector, plan, merged, active_profile)
         selected_bundle = bundles[0] if bundles else None
         used_gemma_disambiguation = False
@@ -387,7 +563,10 @@ class HybridRetriever:
             used_gemma_disambiguation=used_gemma_disambiguation,
             normalized_system=normalized_system,
             normalized_attribute=normalized_attribute,
+            system_aliases_used=system_aliases_used,
             fact_lookup_attempted=fact_lookup_attempted,
+            chunk_fallback_used=chunk_fallback_used,
+            candidate_chunks=candidate_chunks,
             fact_rows=fact_rows,
             fact_hit=fact_hit,
             fact_rows_returned=fact_rows_returned,
@@ -897,6 +1076,44 @@ class HybridRetriever:
             return
         existing.source_names = source_names
 
+    @staticmethod
+    def _trace_candidate_from_search_candidate(candidate: SearchCandidate) -> TraceChunkCandidate:
+        source_names = tuple(candidate.source_names)
+        return TraceChunkCandidate(
+            chunk_id=str(candidate.row["chunk_id"]),
+            section_number=HybridRetriever._row_value(candidate.row, "section_number"),
+            heading=str(HybridRetriever._row_value(candidate.row, "heading", "")),
+            page_start=int(HybridRetriever._row_value(candidate.row, "page_start", 0) or 0),
+            page_end=int(HybridRetriever._row_value(candidate.row, "page_end", 0) or 0),
+            total_score=float(candidate.total_score),
+            lexical_score=float(candidate.lexical_score),
+            semantic_score=float(candidate.semantic_score),
+            source_type=source_names[0] if len(source_names) == 1 else "mixed",
+            source_names=source_names,
+        )
+
+    @staticmethod
+    def _system_aliases_used_for_trace(
+        plan: QueryPlan,
+        *,
+        fact_lookup_used: bool,
+        recall_used: bool,
+    ) -> tuple[str, ...]:
+        aliases: list[str] = []
+        if fact_lookup_used:
+            aliases.extend(alias for alias in plan.system_aliases if alias)
+        if recall_used:
+            aliases.extend(alias for alias in plan.system_aliases[:2] if alias)
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for alias in aliases:
+            normalized = " ".join(str(alias).split()).lower()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(" ".join(str(alias).split()))
+        return tuple(deduped)
+
     def _citations_from_rows(self, rows: Sequence[dict], *, limit: int = 8) -> list[Citation]:
         citations: list[Citation] = []
         seen_ids: set[str] = set()
@@ -987,37 +1204,198 @@ class HybridRetriever:
             semantic_score=candidate.semantic_score,
         )
 
-    def expand_with_context(self, ranked: list[RankedChunk]) -> list[Citation]:
+    @staticmethod
+    def _neutral_ranked_from_row(row: dict) -> RankedChunk:
+        return RankedChunk(
+            chunk_id=str(row["chunk_id"]),
+            section_number=row["section_number"],
+            heading=str(row["heading"]),
+            full_text=str(row["full_text"]),
+            page_start=int(row["page_start"]),
+            page_end=int(row["page_end"]),
+            ordinal_in_document=int(row["ordinal_in_document"]),
+            total_score=0.0,
+            lexical_score=0.0,
+            semantic_score=0.0,
+        )
+
+    def build_chunk_context_enrichments(
+        self,
+        document_id: str,
+        ranked: Sequence[RankedChunk],
+        settings: ContextEnrichmentSettings | None = None,
+    ) -> list[ChunkContextEnrichment]:
+        """Build structured context windows for each selected chunk (prompt-only; preserves chunk order)."""
+        active = settings or ContextEnrichmentSettings()
+        radius = max(0, min(12, int(active.max_neighbors)))
+        out: list[ChunkContextEnrichment] = []
+        for chunk in ranked:
+            row = self.store.fetch_chunk(chunk.chunk_id)
+            if row is None:
+                out.append(ChunkContextEnrichment(primary_chunk=chunk, neighbors=(), parent=None, children=()))
+                continue
+            parent_id = str(self._row_value(row, "parent_chunk_id") or "")
+            parent_ranked: RankedChunk | None = None
+            if active.include_parent:
+                parent_row = self.store.fetch_parent(self._row_value(row, "parent_chunk_id"))
+                if parent_row is not None:
+                    parent_ranked = self._neutral_ranked_from_row(dict(parent_row))
+            neighbor_rows = self.store.fetch_context_neighbors(document_id, chunk.ordinal_in_document, radius=radius)
+            neighbor_ranked: list[RankedChunk] = []
+            for nrow in neighbor_rows:
+                nid = str(nrow["chunk_id"])
+                if nid == chunk.chunk_id:
+                    continue
+                if not active.include_parent and parent_id and nid == parent_id:
+                    continue
+                neighbor_ranked.append(self._neutral_ranked_from_row(dict(nrow)))
+            neighbor_ranked.sort(key=lambda item: item.ordinal_in_document)
+            children_ranked: list[RankedChunk] = []
+            if active.include_children and str(self._row_value(row, "chunk_type", "")).lower() == "section":
+                for crow in self.store.fetch_children(str(self._row_value(row, "chunk_id", "")), limit=6):
+                    children_ranked.append(self._neutral_ranked_from_row(dict(crow)))
+            out.append(
+                ChunkContextEnrichment(
+                    primary_chunk=chunk,
+                    neighbors=tuple(neighbor_ranked),
+                    parent=parent_ranked,
+                    children=tuple(children_ranked),
+                )
+            )
+        return out
+
+    def citations_from_chunk_enrichments(
+        self,
+        enrichments: Sequence[ChunkContextEnrichment],
+        *,
+        limit: int = 6,
+    ) -> list[Citation]:
+        """Flatten enrichments into citations: deterministic, deduped by chunk_id, order follows ranked input."""
+        chosen_ids: set[str] = set()
+        citations: list[Citation] = []
+        for enrichment in enrichments:
+            ordered_chunks: list[RankedChunk] = []
+            if enrichment.parent is not None:
+                ordered_chunks.append(enrichment.parent)
+            ordered_chunks.append(enrichment.primary_chunk)
+            ordered_chunks.extend(enrichment.neighbors)
+            ordered_chunks.extend(enrichment.children)
+            for ranked in ordered_chunks:
+                if ranked.chunk_id in chosen_ids:
+                    continue
+                chosen_ids.add(ranked.chunk_id)
+                citations.append(
+                    Citation(
+                        chunk_id=ranked.chunk_id,
+                        section_number=ranked.section_number,
+                        heading=self._compact_heading(str(ranked.heading)),
+                        attachment=self._attachment_label(ranked.chunk_id),
+                        page_start=ranked.page_start,
+                        page_end=ranked.page_end,
+                        quote=self._short_quote(str(ranked.full_text)),
+                    )
+                )
+                if len(citations) >= limit:
+                    return citations
+        return citations
+
+    def merge_ranked_enrichment_citations(
+        self,
+        ranked: list[RankedChunk],
+        base_citations: list[Citation],
+        *,
+        settings: ContextEnrichmentSettings | None = None,
+        limit: int = 5,
+        ranked_scan: int = 6,
+    ) -> list[Citation]:
+        """Append parent-section citations not already present.
+
+        Ordinal neighbors stay in ``expand_with_context`` / ``fact_hit_context_citations``;
+        this merge targets excerpt lists (e.g. broad-topic summaries) where adjacent chunks
+        can be high-recall noise that should not inflate citation headings.
+        """
+        document_id = self.resolve_document_id()
+        if not document_id or not ranked:
+            return base_citations[:limit]
+        seen = {c.chunk_id for c in base_citations}
+        merged = list(base_citations)
+        enrichments = self.build_chunk_context_enrichments(document_id, ranked[:ranked_scan], settings)
+        for enrichment in enrichments:
+            if enrichment.parent is None:
+                continue
+            ranked_chunk = enrichment.parent
+            if ranked_chunk.chunk_id in seen:
+                continue
+            seen.add(ranked_chunk.chunk_id)
+            merged.append(
+                Citation(
+                    chunk_id=ranked_chunk.chunk_id,
+                    section_number=ranked_chunk.section_number,
+                    heading=self._compact_heading(str(ranked_chunk.heading)),
+                    attachment=self._attachment_label(ranked_chunk.chunk_id),
+                    page_start=ranked_chunk.page_start,
+                    page_end=ranked_chunk.page_end,
+                    quote=self._short_quote(str(ranked_chunk.full_text)),
+                )
+            )
+            if len(merged) >= limit:
+                return merged
+        return merged[:limit]
+
+    @staticmethod
+    def _enrichment_support_chunks(enrichment: ChunkContextEnrichment) -> tuple[RankedChunk, ...]:
+        parts: list[RankedChunk] = []
+        if enrichment.parent is not None:
+            parts.append(enrichment.parent)
+        parts.extend(enrichment.neighbors)
+        parts.extend(enrichment.children)
+        return tuple(parts)
+
+    def fact_hit_context_citations(
+        self,
+        fact: ContractFactRow,
+        *,
+        settings: ContextEnrichmentSettings | None = None,
+    ) -> list[Citation]:
+        """Supplemental citations around a fact's source chunk (parent section and ordinal neighbors)."""
+        document_id = self.resolve_document_id()
+        if not document_id:
+            return []
+        row = self.store.fetch_chunk(fact.source_chunk_id)
+        if row is None:
+            return []
+        primary = self._neutral_ranked_from_row(dict(row))
+        enrichment = self.build_chunk_context_enrichments(document_id, [primary], settings)[0]
+        out: list[Citation] = []
+        seen: set[str] = {str(fact.source_chunk_id)}
+        for ranked in self._enrichment_support_chunks(enrichment):
+            if ranked.chunk_id in seen:
+                continue
+            seen.add(ranked.chunk_id)
+            out.append(
+                Citation(
+                    chunk_id=ranked.chunk_id,
+                    section_number=ranked.section_number,
+                    heading=self._compact_heading(str(ranked.heading)),
+                    attachment=self._attachment_label(ranked.chunk_id),
+                    page_start=ranked.page_start,
+                    page_end=ranked.page_end,
+                    quote=self._short_quote(str(ranked.full_text)),
+                )
+            )
+        return out
+
+    def expand_with_context(
+        self,
+        ranked: list[RankedChunk],
+        *,
+        enrichment: ContextEnrichmentSettings | None = None,
+    ) -> list[Citation]:
         document_id = self.resolve_document_id()
         if not document_id or not ranked:
             return []
-        chosen_ids: set[str] = set()
-        citations: list[Citation] = []
-        primary = self._select_primary_ranked_chunk(ranked)
-        primary_row = self.store.fetch_chunk(primary.chunk_id)
-        candidate_rows = [primary_row] if primary_row is not None else []
-        parent = self.store.fetch_parent(primary_row["parent_chunk_id"]) if primary_row is not None else None
-        if parent is not None:
-            candidate_rows.append(parent)
-        candidate_rows.extend(self.store.fetch_context_neighbors(document_id, primary.ordinal_in_document))
-        candidate_rows.extend(self.store.fetch_chunks_on_pages(document_id, primary.page_start, primary.page_end, limit=4))
-        for row in candidate_rows:
-            if row["chunk_id"] in chosen_ids:
-                continue
-            heading = self._compact_heading(str(row["heading"]))
-            chosen_ids.add(str(row["chunk_id"]))
-            citations.append(
-                Citation(
-                    chunk_id=str(row["chunk_id"]),
-                    section_number=row["section_number"],
-                    heading=heading,
-                    attachment=self._attachment_label(str(row["chunk_id"])),
-                    page_start=int(row["page_start"]),
-                    page_end=int(row["page_end"]),
-                    quote=self._short_quote(str(row["full_text"])),
-                )
-            )
-        return citations[:6]
+        enrichments = self.build_chunk_context_enrichments(document_id, ranked, enrichment)
+        return self.citations_from_chunk_enrichments(enrichments, limit=6)
 
     def build_prompt_context(self, citations: list[Citation], page_context: list[str] | None = None) -> str:
         blocks: list[str] = []

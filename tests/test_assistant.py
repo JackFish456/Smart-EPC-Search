@@ -1304,6 +1304,39 @@ def test_build_summary_prompt_context_uses_ranked_chunks_and_filters_noise() -> 
     assert "5.22" not in context
 
 
+def test_compress_context_removes_irrelevant_sentences_and_preserves_exact_values() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="fuel_gas_summary",
+            section_number="5.23",
+            heading="Fuel Gas Supply",
+            full_text=(
+                "The fuel gas system receives natural gas from the offsite pipeline. "
+                "Administrative notices for bid forms are listed in Appendix Z. "
+                "The fuel gas regulating skid shall maintain 4 x 50% valve train capacity during startup."
+            ),
+            page_start=270,
+            page_end=271,
+            ordinal_in_document=1,
+            total_score=3.0,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+
+    compressed = AnswerPolicy.compress_context(
+        ranked,
+        "summarize the fuel gas system",
+        ("fuel", "gas", "system"),
+        (),
+    )
+
+    assert len(compressed) == 1
+    assert "receives natural gas from the offsite pipeline" in compressed[0].full_text
+    assert "Administrative notices for bid forms are listed in Appendix Z." not in compressed[0].full_text
+    assert "4 x 50% valve train capacity" in compressed[0].full_text
+
+
 def test_summary_requests_use_reasoning_and_fall_back_to_extractive() -> None:
     ranked = [
         RankedChunk(
@@ -1360,6 +1393,82 @@ def test_summary_requests_use_reasoning_and_fall_back_to_extractive() -> None:
     assert assistant.gemma.calls[0]["enable_thinking"] is SUMMARY_ENABLE_THINKING
     assert assistant.gemma.calls[0]["max_new_tokens"] == SUMMARY_MAX_NEW_TOKENS
     assert assistant.gemma.calls[0]["response_style"] == "detailed_summary"
+
+
+def test_topic_summary_request_compresses_context_before_generation() -> None:
+    chunk = RankedChunk(
+        chunk_id="chunk1",
+        section_number="5.23",
+        heading="Fuel Gas Supply",
+        full_text=(
+            "The fuel gas system receives, conditions, and transports natural gas supplied from an offsite pipeline. "
+            "Administrative notices for vendor forms are listed in Appendix Z. "
+            "The fuel gas regulating station shall maintain 4 x 50% train capacity during startup."
+        ),
+        page_start=270,
+        page_end=271,
+        ordinal_in_document=1,
+        total_score=3.0,
+        lexical_score=1.0,
+        semantic_score=0.0,
+    )
+    trace = RetrievalTrace(
+        query="summarize the fuel gas system",
+        plan=plan_query("summarize the fuel gas system"),
+        recall_sources={},
+        merged_ranked=[chunk],
+        bundles=[
+            EvidenceBundle(
+                bundle_id="chunk1",
+                primary_chunk_id="chunk1",
+                ranked_chunks=(chunk,),
+                citations=(Citation("chunk1", "5.23", "Fuel Gas Supply", None, 270, 271, "quote"),),
+                bundle_score=4.0,
+                confidence=0.8,
+                source_names=("semantic",),
+            )
+        ],
+        selected_bundle=EvidenceBundle(
+            bundle_id="chunk1",
+            primary_chunk_id="chunk1",
+            ranked_chunks=(chunk,),
+            citations=(Citation("chunk1", "5.23", "Fuel Gas Supply", None, 270, 271, "quote"),),
+            bundle_score=4.0,
+            confidence=0.8,
+            source_names=("semantic",),
+        ),
+        used_gemma_disambiguation=False,
+    )
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve_trace(self, question: str, profile: str = "normal", gemma_client=None):
+            return trace
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            raise AssertionError("retrieve() should not be used when retrieve_trace() is available")
+
+        def expand_with_context(self, incoming_ranked):
+            return []
+
+    class FakeGemma:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def ask(self, question: str, context: str, *, enable_thinking=None, max_new_tokens=None, response_style=None):
+            self.calls.append({"question": question, "context": context, "response_style": response_style})
+            return "Grounded summary."
+
+    policy = AnswerPolicy(None, FakeRetriever())
+    gemma = FakeGemma()
+
+    answer = policy.answer("summarize the fuel gas system", None, gemma)
+
+    assert answer.text == "Grounded summary."
+    assert "Administrative notices for vendor forms are listed in Appendix Z." not in gemma.calls[0]["context"]
+    assert "The fuel gas system receives, conditions, and transports natural gas supplied from an offsite pipeline." in gemma.calls[0]["context"]
 
 
 def test_summary_request_does_not_change_following_normal_request_behavior() -> None:
@@ -1481,8 +1590,8 @@ def test_broad_topic_summary_falls_back_to_contract_only_bullets_when_gemma_refu
     assert answer.refused is False
     assert answer.text.startswith("Here are the strongest contract-supported points about air permits:")
     assert "- Air Permit Compliance:" in answer.text
-    assert "environmental testing" in answer.text.lower()
-    assert "permit limits" in answer.text.lower()
+    assert "air permits" in answer.text.lower()
+    assert "required emissions testing" in answer.text.lower()
 
 
 def test_broad_topic_summary_still_works_with_ai_disabled() -> None:
@@ -1543,6 +1652,84 @@ def test_broad_topic_summary_still_works_with_ai_disabled() -> None:
     assert answer.refused is False
     assert answer.text.startswith("Here are the strongest contract-supported points about air permits:")
     assert len(answer.citations) == 2
+
+
+def test_summary_style_fact_lookup_request_does_not_apply_compression() -> None:
+    chunk = RankedChunk(
+        chunk_id="chunk1",
+        section_number="7.4.2",
+        heading="Dew Point Heaters",
+        full_text=(
+            "The dew point heaters shall be furnished in a 4 x 50% configuration. "
+            "Administrative notices for construction records are listed in Appendix Q."
+        ),
+        page_start=41,
+        page_end=41,
+        ordinal_in_document=1,
+        total_score=4.2,
+        lexical_score=1.0,
+        semantic_score=0.0,
+    )
+    selected_bundle = EvidenceBundle(
+        bundle_id="chunk1",
+        primary_chunk_id="chunk1",
+        ranked_chunks=(chunk,),
+        citations=(Citation("chunk1", "7.4.2", "Dew Point Heaters", None, 41, 41, "quote"),),
+        bundle_score=4.0,
+        confidence=0.8,
+        source_names=("fact_lookup",),
+    )
+    trace = RetrievalTrace(
+        query="Explain the dew point heater configuration.",
+        plan=plan_query("Explain the dew point heater configuration."),
+        recall_sources={"fact_lookup": [chunk]},
+        merged_ranked=[chunk],
+        bundles=[selected_bundle],
+        selected_bundle=selected_bundle,
+        used_gemma_disambiguation=False,
+        fact_lookup_attempted=True,
+        fact_rows=[],
+        fact_hit=None,
+        fact_rows_returned=0,
+        fallback_reason="fact_lookup_miss",
+    )
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve_trace(self, question: str, profile: str = "normal", gemma_client=None):
+            return trace
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            raise AssertionError("retrieve() should not be used when retrieve_trace() is available")
+
+        def expand_with_context(self, incoming_ranked):
+            return list(selected_bundle.citations)
+
+    class FakeGemma:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def ask(self, question: str, context: str, *, enable_thinking=None, max_new_tokens=None, response_style=None):
+            self.calls.append({"question": question, "context": context, "response_style": response_style})
+            return "Grounded summary."
+
+    policy = AnswerPolicy(None, FakeRetriever())
+    gemma = FakeGemma()
+    original_compress_context = AnswerPolicy.__dict__["compress_context"]
+
+    def fail_if_called(cls, chunks, query, system_terms, attribute_terms):
+        raise AssertionError("compress_context() should not be used for fact_lookup summary-style requests.")
+
+    AnswerPolicy.compress_context = classmethod(fail_if_called)
+    try:
+        answer = policy.answer("Explain the dew point heater configuration.", None, gemma)
+    finally:
+        AnswerPolicy.compress_context = original_compress_context
+
+    assert answer.text == "Grounded summary."
+    assert "4 x 50% configuration" in gemma.calls[0]["context"]
 
 
 def test_summary_style_fact_question_does_not_let_gemma_overwrite_grounded_value() -> None:
