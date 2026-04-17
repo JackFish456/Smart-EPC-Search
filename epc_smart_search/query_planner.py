@@ -3,6 +3,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from epc_smart_search.name_normalization import (
+    ATTRIBUTE_LABEL_ALIASES,
+    attribute_terms_for_label,
+    build_system_aliases,
+    normalize_attribute_name,
+    normalize_system_name,
+)
 from epc_smart_search.search_features import (
     ACTION_LEXICON,
     ACTOR_LEXICON,
@@ -153,19 +160,6 @@ SYSTEM_FILLER = STOPWORDS | {
     "works",
 }
 
-ATTRIBUTE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("design_conditions", ("design conditions", "design condition", "operating conditions", "operating condition", "design basis")),
-    ("configuration", ("configuration", "configured", "arrangement", "arranged")),
-    ("size", ("size", "sizes", "diameter", "rating", "dimensions")),
-    ("capacity", ("capacity", "capacities", "output", "duty", "throughput")),
-    ("power", ("horsepower", "horse power", "hp", "kw", "kilowatt", "kilowatts", "motor power")),
-    ("pressure", ("pressure", "pressures", "psig", "psi")),
-    ("temperature", ("temperature", "temperatures")),
-    ("flow", ("flow", "flows", "flowrate", "flow rate", "throughput")),
-    ("type", ("type", "kind", "model", "selected", "selection")),
-    ("definition", ("defined", "definition", "means", "meaning")),
-)
-
 QUESTION_TAIL_PATTERNS = (
     r"\bdo we have$",
     r"\bdo we use$",
@@ -176,21 +170,6 @@ QUESTION_TAIL_PATTERNS = (
     r"\bdo we need$",
     r"\bdo we require$",
 )
-
-ATTRIBUTE_LABEL_TERMS: dict[str, tuple[str, ...]] = {
-    "configuration": ("configuration", "configured", "arrangement"),
-    "design_conditions": ("design conditions", "design condition", "design basis", "operating conditions"),
-    "type": ("type", "kind", "model", "selected", "manufacturer"),
-    "size": ("size", "diameter", "rating", "dimension"),
-    "capacity": ("capacity", "output", "duty", "throughput"),
-    "power": ("horsepower", "horse power", "hp", "kw", "kilowatt", "motor power"),
-    "pressure": ("pressure", "pressures", "psi", "psig"),
-    "temperature": ("temperature", "temperatures"),
-    "flow": ("flow", "flow rate", "flowrate", "throughput"),
-    "responsibility": ("responsible", "provide", "provided", "supply", "furnish"),
-    "definition": ("means", "defined", "definition"),
-    "function": ("work", "works", "operate", "operation", "process"),
-}
 
 GENERIC_SYSTEM_HEADS = {
     "system",
@@ -276,12 +255,15 @@ def plan_query(query: str, system_vocabulary: SystemVocabulary | None = None) ->
     bind_system_phrase = request_shape not in {REQUEST_SHAPE_GROUPED_LIST, REQUEST_SHAPE_BROAD_TOPIC}
     extracted_system_phrase = extracted_system_phrase if bind_system_phrase else ""
     matched_system = matched_system if bind_system_phrase else None
-    system_phrase = matched_system.canonical_phrase if matched_system is not None else extracted_system_phrase
+    system_phrase = matched_system.canonical_phrase if matched_system is not None else normalize_system_name(extracted_system_phrase)
     system_terms = matched_system.terms if matched_system is not None else _focus_terms(system_phrase)
     system_aliases = (
-        _dedupe(((extracted_system_phrase,) if extracted_system_phrase else ()) + matched_system.aliases)
+        _dedupe(
+            tuple(alias for alias in build_system_aliases(extracted_system_phrase) if alias != system_phrase)
+            + matched_system.aliases
+        )
         if matched_system is not None
-        else _system_aliases(system_phrase, system_terms)
+        else _system_aliases(extracted_system_phrase or system_phrase, system_terms)
     )
     system_significant = system_significant_terms(system_terms)
     retrieval_mode = _determine_retrieval_mode(
@@ -403,17 +385,18 @@ def _detect_attribute(normalized_query: str, content_query: str) -> tuple[str | 
     content = f" {content_query} "
     normalized = f" {normalized_query} "
     if normalized_query.startswith(("how does ", "how do ")) or content_query.endswith((" work", " works")):
-        return "function", ATTRIBUTE_LABEL_TERMS["function"]
+        return "function", attribute_terms_for_label("function")
     if re.search(r"\bwe (?:are )?using\b", normalized_query) or re.search(r"\b(?:using|used)\b", content_query):
-        return "type", ATTRIBUTE_LABEL_TERMS["type"]
+        return "type", attribute_terms_for_label("type")
     if re.search(
         r"\b(who is responsible|who provides|who furnishes|who supplies|provided by|responsible for|required to provide|required to furnish|required to supply)\b",
         normalized_query,
     ):
-        return "responsibility", ATTRIBUTE_LABEL_TERMS["responsibility"]
-    for label, patterns in ATTRIBUTE_PATTERNS:
+        return "responsibility", attribute_terms_for_label("responsibility")
+    for label, patterns in ATTRIBUTE_LABEL_ALIASES.items():
         if any(f" {normalize_text(pattern)} " in normalized or f" {normalize_text(pattern)} " in content for pattern in patterns):
-            return label, ATTRIBUTE_LABEL_TERMS[label]
+            normalized_label = normalize_attribute_name(label)
+            return normalized_label, attribute_terms_for_label(normalized_label)
     return None, ()
 
 
@@ -579,27 +562,13 @@ def _extract_system_phrase(content_query: str, attribute_terms: tuple[str, ...],
     ]
     if not tokens:
         return ""
-    return " ".join(tokens)
+    return normalize_system_name(" ".join(tokens))
 
 
-def _system_aliases(system_phrase: str, system_terms: tuple[str, ...]) -> tuple[str, ...]:
+def _system_aliases(system_phrase: str, _system_terms: tuple[str, ...]) -> tuple[str, ...]:
     if not system_phrase:
         return ()
-    aliases: list[str] = []
-    singularized = _singularize_phrase(system_phrase)
-    if singularized != system_phrase:
-        aliases.append(singularized)
-    return _dedupe(tuple(alias for alias in aliases if alias and alias != system_phrase))
-
-
-def _singularize_phrase(phrase: str) -> str:
-    terms = list(_focus_terms(phrase))
-    if not terms:
-        return phrase
-    tail = terms[-1]
-    if len(tail) > 3 and tail.endswith("s") and not tail.endswith("ss"):
-        terms[-1] = tail[:-1]
-    return " ".join(terms)
+    return _dedupe(tuple(alias for alias in build_system_aliases(system_phrase) if alias and alias != normalize_system_name(system_phrase)))
 
 
 def _refine_topic_terms(

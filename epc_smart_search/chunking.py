@@ -16,6 +16,30 @@ DEFINITION_RE = re.compile(
     r"(?P<verb>means|shall mean|is defined as)\b",
     re.IGNORECASE,
 )
+TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{0,}")
+BULLET_RE = re.compile(r"^(?:[-*•]|[A-Za-z]\)|\([A-Za-z0-9]+\)|\d+[.)])\s+\S")
+VALUE_SIGNAL_RE = re.compile(
+    r"\d|[%$]|°|[A-Za-z]{1,5}/[A-Za-z]{1,5}|"
+    r"\b(?:psia|psig|hp|kw|mw|mva|amps?|volts?|hz|gpm|ppm)\b",
+    re.IGNORECASE,
+)
+GENERIC_TABLE_HEADERS = {
+    "characteristic",
+    "description",
+    "equipment",
+    "item",
+    "items",
+    "parameter",
+    "qty",
+    "quantity",
+    "remarks",
+    "service",
+    "specification",
+    "unit",
+    "units",
+    "value",
+    "values",
+}
 
 
 @dataclass(slots=True)
@@ -38,12 +62,18 @@ class _ChunkBuilder:
     section_number: str | None
     heading: str
     page_start: int
-    lines: list[str]
+    rows: list[tuple[int, str]]
     article_context: str | None = None
 
-    def add_line(self, text: str) -> None:
+    def add_line(self, page_num: int, text: str) -> None:
         if text:
-            self.lines.append(text)
+            self.rows.append((page_num, text))
+
+
+@dataclass(slots=True)
+class _ChunkDraft:
+    record: ChunkRecord
+    rows: list[tuple[int, str]]
 
 
 def build_document_id(display_name: str, version_label: str) -> str:
@@ -86,26 +116,29 @@ def _iter_lines(pages: list[PageText]) -> list[tuple[int, str]]:
     return rows
 
 
-def _flush_chunk(chunks: list[ChunkRecord], builder: _ChunkBuilder | None, document_id: str, ordinal: int) -> int:
+def _flush_chunk(chunks: list[_ChunkDraft], builder: _ChunkBuilder | None, document_id: str, ordinal: int) -> int:
     if builder is None:
         return ordinal
-    full_text = "\n".join(builder.lines).strip()
+    full_text = "\n".join(text for _, text in builder.rows).strip()
     if not full_text:
         return ordinal
     seed = f"{document_id}|{builder.chunk_type}|{builder.section_number}|{builder.heading}|{builder.page_start}|{ordinal}"
     chunk_id = "chunk_" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
     chunks.append(
-        ChunkRecord(
-            chunk_id=chunk_id,
-            document_id=document_id,
-            chunk_type=builder.chunk_type,
-            section_number=builder.section_number,
-            heading=builder.heading[:MAX_HEADING_LENGTH],
-            full_text=full_text,
-            page_start=builder.page_start,
-            page_end=builder.page_start,
-            parent_chunk_id=builder.article_context,
-            ordinal_in_document=ordinal,
+        _ChunkDraft(
+            record=ChunkRecord(
+                chunk_id=chunk_id,
+                document_id=document_id,
+                chunk_type=builder.chunk_type,
+                section_number=builder.section_number,
+                heading=builder.heading[:MAX_HEADING_LENGTH],
+                full_text=full_text,
+                page_start=builder.page_start,
+                page_end=builder.page_start,
+                parent_chunk_id=builder.article_context,
+                ordinal_in_document=ordinal,
+            ),
+            rows=list(builder.rows),
         )
     )
     return ordinal + 1
@@ -158,34 +191,281 @@ def _match_section(lines: list[tuple[int, str]], index: int) -> tuple[str, str, 
     return None
 
 
-def _set_page_end(chunks: list[ChunkRecord], lines: list[tuple[int, str]]) -> list[ChunkRecord]:
-    out: list[ChunkRecord] = []
+def _set_page_end(chunks: list[_ChunkDraft], lines: list[tuple[int, str]]) -> list[_ChunkDraft]:
+    out: list[_ChunkDraft] = []
     for idx, chunk in enumerate(chunks):
-        next_page = chunks[idx + 1].page_start - 1 if idx + 1 < len(chunks) else lines[-1][0]
-        out.append(replace(chunk, page_end=max(chunk.page_start, next_page)))
+        next_page = chunks[idx + 1].record.page_start - 1 if idx + 1 < len(chunks) else lines[-1][0]
+        out.append(replace(chunk, record=replace(chunk.record, page_end=max(chunk.record.page_start, next_page))))
     return out
 
 
-def _assign_parents(chunks: list[ChunkRecord]) -> list[ChunkRecord]:
+def _assign_parents(chunks: list[_ChunkDraft]) -> list[_ChunkDraft]:
     latest_by_section: dict[str, str] = {}
     latest_major: str | None = None
-    resolved: list[ChunkRecord] = []
+    resolved: list[_ChunkDraft] = []
     for chunk in chunks:
-        parent_chunk_id = chunk.parent_chunk_id
-        if chunk.chunk_type in {"article", "exhibit"}:
-            latest_major = chunk.chunk_id
+        record = chunk.record
+        parent_chunk_id = record.parent_chunk_id
+        if record.chunk_type in {"article", "exhibit"}:
+            latest_major = record.chunk_id
             parent_chunk_id = None
-        elif chunk.section_number:
-            if "." in chunk.section_number:
-                parent_key = chunk.section_number.rsplit(".", 1)[0]
+        elif record.section_number:
+            if "." in record.section_number:
+                parent_key = record.section_number.rsplit(".", 1)[0]
                 parent_chunk_id = latest_by_section.get(parent_key, latest_major)
             else:
                 parent_chunk_id = latest_major
-            latest_by_section[chunk.section_number] = chunk.chunk_id
+            latest_by_section[record.section_number] = record.chunk_id
         elif parent_chunk_id is None:
             parent_chunk_id = latest_major
-        resolved.append(replace(chunk, parent_chunk_id=parent_chunk_id))
+        resolved.append(replace(chunk, record=replace(record, parent_chunk_id=parent_chunk_id)))
     return resolved
+
+
+def _token_count(text: str) -> int:
+    return len(TOKEN_RE.findall(text))
+
+
+def _has_value_signal(text: str) -> bool:
+    return bool(VALUE_SIGNAL_RE.search(text))
+
+
+def _is_prose_like(text: str) -> bool:
+    cleaned = _clean_line(text)
+    tokens = _token_count(cleaned)
+    if tokens >= 14:
+        return True
+    if tokens >= 9 and re.search(r"[.;]$", cleaned):
+        return True
+    return tokens >= 11 and not _has_value_signal(cleaned) and not BULLET_RE.match(cleaned)
+
+
+def _is_table_header_like(text: str) -> bool:
+    return _clean_line(text).strip(":").lower() in GENERIC_TABLE_HEADERS
+
+
+def _is_compact_line(text: str) -> bool:
+    cleaned = _clean_line(text)
+    if not cleaned or BULLET_RE.match(cleaned):
+        return False
+    if _is_prose_like(cleaned):
+        return False
+    return _token_count(cleaned) <= 10
+
+
+def _matches_parent_marker(parent: ChunkRecord, text: str) -> bool:
+    cleaned = _clean_line(text)
+    if cleaned == _clean_line(parent.heading):
+        return True
+    if not parent.section_number:
+        return False
+    return bool(
+        re.match(
+            rf"^(?:section\s+)?{re.escape(parent.section_number)}(?:[.)]?\s+.*)?$",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _structured_rows(parent: ChunkRecord, rows: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    trimmed = list(rows)
+    while trimmed and _matches_parent_marker(parent, trimmed[0][1]):
+        trimmed = trimmed[1:]
+    return trimmed
+
+
+def _is_structured_run(rows: list[tuple[int, str]]) -> bool:
+    if len(rows) < 2:
+        return False
+    bullet_count = sum(1 for _, text in rows if BULLET_RE.match(text))
+    compact_count = sum(1 for _, text in rows if _is_compact_line(text))
+    value_count = sum(1 for _, text in rows if _has_value_signal(text))
+    if bullet_count >= 2:
+        return True
+    if len(rows) >= 3 and compact_count >= len(rows) - 1:
+        return True
+    return len(rows) >= 4 and value_count >= 2 and compact_count >= 3
+
+
+def _collect_structured_runs(parent: ChunkRecord, rows: list[tuple[int, str]]) -> list[list[tuple[int, str]]]:
+    runs: list[list[tuple[int, str]]] = []
+    current: list[tuple[int, str]] = []
+    for row in _structured_rows(parent, rows):
+        _, text = row
+        if _is_prose_like(text):
+            if _is_structured_run(current):
+                runs.append(current)
+            current = []
+            continue
+        current.append(row)
+    if _is_structured_run(current):
+        runs.append(current)
+    return runs
+
+
+def _strip_bullet_marker(text: str) -> str:
+    return re.sub(r"^(?:[-*•]|[A-Za-z]\)|\([A-Za-z0-9]+\)|\d+[.)])\s+", "", _clean_line(text))
+
+
+def _build_bullet_items(rows: list[tuple[int, str]]) -> list[list[tuple[int, str]]]:
+    items: list[list[tuple[int, str]]] = []
+    for row in rows:
+        if BULLET_RE.match(row[1]) or not items:
+            items.append([row])
+        else:
+            items[-1].append(row)
+    return [item for item in items if item]
+
+
+def _can_pair_compact_rows(current: str, following: str, *, allow_generic_pairs: bool) -> bool:
+    current_clean = _clean_line(current)
+    following_clean = _clean_line(following)
+    if not current_clean or not following_clean:
+        return False
+    if _is_table_header_like(current_clean) or _is_table_header_like(following_clean):
+        return False
+    if BULLET_RE.match(current_clean) or BULLET_RE.match(following_clean):
+        return False
+    if _is_prose_like(current_clean) or _is_prose_like(following_clean):
+        return False
+    if _token_count(current_clean) > 8 or _token_count(following_clean) > 8:
+        return False
+    if _has_value_signal(current_clean):
+        return False
+    return _has_value_signal(following_clean) or allow_generic_pairs
+
+
+def _extract_compact_items(
+    rows: list[tuple[int, str]],
+) -> tuple[list[tuple[int, str]], list[list[tuple[int, str]]], int]:
+    header_rows: list[tuple[int, str]] = []
+    index = 0
+    while index < len(rows) and len(header_rows) < 2 and _is_table_header_like(rows[index][1]):
+        header_rows.append(rows[index])
+        index += 1
+    items: list[list[tuple[int, str]]] = []
+    pair_count = 0
+    while index < len(rows):
+        row = rows[index]
+        if index + 1 < len(rows) and _can_pair_compact_rows(
+            row[1],
+            rows[index + 1][1],
+            allow_generic_pairs=bool(header_rows),
+        ):
+            items.append([row, rows[index + 1]])
+            pair_count += 1
+            index += 2
+            continue
+        items.append([row])
+        index += 1
+    return header_rows, items, pair_count
+
+
+def _group_items(items: list[list[tuple[int, str]]], group_size: int) -> list[list[list[tuple[int, str]]]]:
+    if len(items) < 2:
+        return []
+    groups: list[list[list[tuple[int, str]]]] = []
+    index = 0
+    while index < len(items):
+        remaining = len(items) - index
+        take = group_size
+        if remaining == 4:
+            take = 2
+        elif remaining == 1 and groups:
+            groups[-1].append(items[index])
+            break
+        groups.append(items[index:index + take])
+        index += take
+    if len(groups) >= 2 and len(groups[-1]) == 1:
+        groups[-2].append(groups[-1][0])
+        groups.pop()
+    return groups
+
+
+def _detail_from_items(items: list[list[tuple[int, str]]], *, bullet: bool) -> str:
+    if not items or not items[0]:
+        return ""
+    text = items[0][0][1]
+    detail = _strip_bullet_marker(text) if bullet else _clean_line(text)
+    if _is_table_header_like(detail):
+        return ""
+    return detail[:60]
+
+
+def _compose_structured_heading(parent: ChunkRecord, chunk_type: str, detail: str) -> str:
+    kind = {
+        "bullet_group": "Bullets",
+        "schedule_block": "Schedule",
+        "line_item_group": "Line Items",
+    }[chunk_type]
+    if detail:
+        return f"{parent.heading} - {kind}: {detail}"[:MAX_HEADING_LENGTH]
+    return f"{parent.heading} - {kind}"[:MAX_HEADING_LENGTH]
+
+
+def _new_structured_chunk(
+    parent: ChunkRecord,
+    chunk_type: str,
+    heading: str,
+    rows: list[tuple[int, str]],
+    ordinal_seed: str,
+) -> ChunkRecord:
+    full_text = "\n".join(text for _, text in rows).strip()
+    seed = f"{parent.chunk_id}|{chunk_type}|{ordinal_seed}|{heading}|{rows[0][0]}|{rows[-1][0]}"
+    chunk_id = "chunk_" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+    return ChunkRecord(
+        chunk_id=chunk_id,
+        document_id=parent.document_id,
+        chunk_type=chunk_type,
+        section_number=parent.section_number,
+        heading=heading[:MAX_HEADING_LENGTH],
+        full_text=full_text,
+        page_start=rows[0][0],
+        page_end=rows[-1][0],
+        parent_chunk_id=parent.chunk_id,
+        ordinal_in_document=0,
+    )
+
+
+def _extract_structured_chunks(base_chunks: list[_ChunkDraft]) -> list[ChunkRecord]:
+    derived: list[ChunkRecord] = []
+    for draft in base_chunks:
+        parent = draft.record
+        if parent.chunk_type == "definition":
+            continue
+        for run_index, run_rows in enumerate(_collect_structured_runs(parent, draft.rows), start=1):
+            if sum(1 for _, text in run_rows if BULLET_RE.match(text)) >= 2:
+                items = _build_bullet_items(run_rows)
+                for group_index, group in enumerate(_group_items(items, group_size=3), start=1):
+                    rows = [row for item in group for row in item]
+                    heading = _compose_structured_heading(parent, "bullet_group", _detail_from_items(group, bullet=True))
+                    derived.append(
+                        _new_structured_chunk(
+                            parent,
+                            "bullet_group",
+                            heading,
+                            rows,
+                            ordinal_seed=f"{run_index}:{group_index}",
+                        )
+                    )
+                continue
+            header_rows, items, pair_count = _extract_compact_items(run_rows)
+            chunk_type = "schedule_block" if header_rows or pair_count >= 2 else "line_item_group"
+            group_size = 2 if chunk_type == "schedule_block" else 3
+            for group_index, group in enumerate(_group_items(items, group_size=group_size), start=1):
+                rows = [*header_rows, *(row for item in group for row in item)]
+                heading = _compose_structured_heading(parent, chunk_type, _detail_from_items(group, bullet=False))
+                derived.append(
+                    _new_structured_chunk(
+                        parent,
+                        chunk_type,
+                        heading,
+                        rows,
+                        ordinal_seed=f"{run_index}:{group_index}",
+                    )
+                )
+    return derived
 
 
 def _definition_sentence(text: str, start: int) -> str:

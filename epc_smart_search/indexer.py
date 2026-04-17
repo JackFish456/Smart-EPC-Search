@@ -7,10 +7,11 @@ from typing import Callable
 import fitz
 
 from epc_smart_search.chunking import ChunkRecord, build_document_id, parse_chunks
+from epc_smart_search.fact_extraction import extract_contract_facts
 from epc_smart_search.ocr_support import extract_pages
 from epc_smart_search.retrieval import HashingEmbedder
 from epc_smart_search.search_features import build_chunk_features
-from epc_smart_search.storage import ContractStore, pack_vector
+from epc_smart_search.storage import ContractFactRow, ContractStore, pack_vector
 
 
 def _sha256(path: Path) -> str:
@@ -37,6 +38,23 @@ def build_index(
     if progress_callback:
         progress_callback("Parsing contract structure...")
     chunks = parse_chunks(pages, document_id)
+    if progress_callback:
+        progress_callback("Extracting contract facts...")
+    facts = [
+        ContractFactRow(
+            document_id=fact.document_id,
+            system=fact.normalized_system,
+            system_normalized=fact.normalized_system,
+            attribute=fact.normalized_attribute,
+            attribute_normalized=fact.normalized_attribute,
+            value=fact.raw_value,
+            evidence_text=fact.evidence_text,
+            source_chunk_id=fact.source_chunk_id,
+            page_start=fact.page,
+            page_end=fact.page,
+        )
+        for fact in extract_contract_facts(chunks)
+    ]
 
     if progress_callback:
         progress_callback("Building local embeddings...")
@@ -62,6 +80,7 @@ def build_index(
         chunks=chunks,
         pages=pages,
         features=features,
+        facts=facts,
         embeddings=embeddings,
         model_name=embedder.model_name,
         dimension=embedder.dimension,
@@ -70,6 +89,7 @@ def build_index(
         "document_id": document_id,
         "page_count": page_count,
         "chunk_count": len(chunks),
+        "fact_count": len(facts),
     }
 
 

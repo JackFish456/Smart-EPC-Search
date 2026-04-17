@@ -7,17 +7,20 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from epc_smart_search.config import MAX_EMBEDDING_DIM, MAX_SEARCH_RESULTS, MAX_SEMANTIC_SCAN
+from epc_smart_search.name_normalization import normalize_attribute_name, normalize_system_name
 from epc_smart_search.query_planner import (
     ANSWER_FAMILY_GUARANTEE_OR_LIMIT,
+    EXACT_VALUE_ATTRIBUTE_LABELS,
     QueryPlan,
     REQUEST_SHAPE_BROAD_TOPIC,
     REQUEST_SHAPE_GROUPED_LIST,
+    RETRIEVAL_MODE_FACT_LOOKUP,
     build_like_fallback,
     build_match_queries,
     has_term_overlap,
     plan_query,
 )
-from epc_smart_search.storage import ContractStore, unpack_vector
+from epc_smart_search.storage import ContractFactRow, ContractStore, unpack_vector
 from epc_smart_search.system_vocabulary import SystemVocabulary, build_contract_system_vocabulary
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{1,}")
@@ -228,7 +231,30 @@ class HybridRetriever:
                 use_query_expansion=True,
             )
         query_vector = self.embedder.embed(query)
-        recall_sources, combined = self._collect_recall_candidates(document_id, query, query_vector, plan, active_profile)
+        recall_sources: dict[str, list[RankedChunk]] = {}
+        combined: dict[str, SearchCandidate] = {}
+        if plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP:
+            fact_sources, fact_candidates, fact_confident = self._collect_fact_lookup_candidates(
+                document_id,
+                query,
+                query_vector,
+                plan,
+            )
+            recall_sources.update(fact_sources)
+            combined.update(fact_candidates)
+            if not fact_confident:
+                fallback_sources, fallback_candidates = self._collect_recall_candidates(
+                    document_id,
+                    query,
+                    query_vector,
+                    plan,
+                    active_profile,
+                )
+                recall_sources.update(fallback_sources)
+                for candidate in fallback_candidates.values():
+                    self._merge_recall_candidate(combined, candidate)
+        else:
+            recall_sources, combined = self._collect_recall_candidates(document_id, query, query_vector, plan, active_profile)
         if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
             merged_limit = GROUPED_MERGED_RECALL_KEEP
         elif plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC:
@@ -371,6 +397,76 @@ class HybridRetriever:
         for source_name, rows in list(recall_sources.items()):
             recall_sources[source_name] = sorted(rows, key=lambda item: item.total_score, reverse=True)[:LEXICAL_RECALL_KEEP]
         return recall_sources, combined
+
+    def _collect_fact_lookup_candidates(
+        self,
+        document_id: str,
+        query: str,
+        query_vector: list[float],
+        plan: QueryPlan,
+    ) -> tuple[dict[str, list[RankedChunk]], dict[str, SearchCandidate], bool]:
+        combined: dict[str, SearchCandidate] = {}
+        recall_sources: dict[str, list[RankedChunk]] = {"fact_lookup": []}
+        best_match_score = 0.0
+        for fact in self._candidate_facts_for_plan(document_id, plan):
+            match_score = self._fact_match_score(plan, fact)
+            if match_score <= 0.0:
+                continue
+            row = self.store.fetch_chunk(fact.source_chunk_id)
+            if row is None:
+                continue
+            candidate = self._make_recall_candidate(
+                query,
+                plan,
+                row,
+                lexical_score=0.0,
+                semantic_score=self._semantic_for_row(query_vector, row),
+                bonus=min(2.4, match_score),
+                source_name="fact_lookup",
+            )
+            recall_sources["fact_lookup"].append(self._ranked_from_candidate(candidate))
+            self._merge_recall_candidate(combined, candidate)
+            best_match_score = max(best_match_score, match_score)
+        recall_sources["fact_lookup"] = sorted(
+            recall_sources["fact_lookup"],
+            key=lambda item: item.total_score,
+            reverse=True,
+        )[:LEXICAL_RECALL_KEEP]
+        return recall_sources, combined, best_match_score >= 2.0
+
+    def _candidate_facts_for_plan(self, document_id: str, plan: QueryPlan) -> list[ContractFactRow]:
+        if plan.attribute_label not in EXACT_VALUE_ATTRIBUTE_LABELS or not plan.system_phrase:
+            return []
+        return self.store.lookup_facts_by_system_attribute(document_id, plan.system_phrase, plan.attribute_label)
+
+    @staticmethod
+    def _fact_match_score(plan: QueryPlan, fact: ContractFactRow) -> float:
+        if not plan.system_phrase or not fact.attribute_normalized:
+            return 0.0
+        plan_system = normalize_system_name(plan.system_phrase)
+        fact_system = normalize_system_name(fact.system_normalized or fact.system)
+        if not fact_system or fact_system != plan_system:
+            return 0.0
+
+        plan_attribute = normalize_attribute_name(plan.attribute_label or "")
+        fact_attribute = normalize_attribute_name(fact.attribute_normalized or fact.attribute)
+        if plan_attribute and fact_attribute != plan_attribute:
+            return 0.0
+
+        score = 2.2
+        system_hits = sum(1 for term in plan.system_terms if term and f" {term} " in f" {fact_system} ")
+        score += 0.25 * system_hits
+        significant_hits = sum(1 for term in plan.system_significant_terms if term and f" {term} " in f" {fact_system} ")
+        score += 0.35 * significant_hits
+        if plan.content_query:
+            normalized_evidence = f"{fact.evidence_text} {fact.value}".lower()
+            if plan.content_query in normalized_evidence:
+                score += 0.3
+        if plan.attribute_label == "type" and re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b", fact.value):
+            score += 0.35
+        if plan.attribute_label in {"capacity", "size", "power", "pressure", "temperature", "flow"} and re.search(r"\d", fact.value):
+            score += 0.25
+        return score
 
     def _build_ranked_bundles(
         self,

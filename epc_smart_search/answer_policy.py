@@ -440,7 +440,8 @@ class AnswerPolicy:
         if not hits:
             return None
         lowered = " ".join(question.lower().split())
-        if not self.prefer_exact_answer(lowered):
+        plan = plan_query(question)
+        if not self.prefer_exact_answer(lowered, plan):
             return None
         excerpts = [f"Page {hit.page_num}: {self.trim_page_excerpt(hit.page_text, lowered)}" for hit in hits[:4]]
         if self.is_count_question(lowered):
@@ -448,6 +449,10 @@ class AnswerPolicy:
             if quantity is not None:
                 body = f"Answer: {quantity}\n\nDirect contract text:\n" + "\n\n".join(excerpts)
                 return AssistantAnswer(body, [], False)
+        attribute_value = self.extract_attribute_value(question, hits, plan=plan)
+        if attribute_value is not None:
+            body = f"Answer: {attribute_value}\n\nDirect contract text:\n" + "\n\n".join(excerpts)
+            return AssistantAnswer(body, [], False)
         return AssistantAnswer("Direct contract text:\n" + "\n\n".join(excerpts), [], False)
 
     @staticmethod
@@ -455,8 +460,11 @@ class AnswerPolicy:
         return question.startswith("how many ")
 
     @staticmethod
-    def prefer_exact_answer(question: str) -> bool:
-        return question.startswith(("how many ", "show me ", "find ", "quote ", "where does ", "which page "))
+    def prefer_exact_answer(question: str, plan: QueryPlan | None = None) -> bool:
+        if question.startswith(("how many ", "show me ", "find ", "quote ", "where does ", "which page ")):
+            return True
+        exact_kind = AnswerPolicy.exact_attribute_kind(question, plan=plan)
+        return exact_kind is not None and question.startswith(("what is ", "what are ", "what model ", "which model "))
 
     @staticmethod
     def reference_lookup_kind(question: str) -> str | None:
@@ -513,6 +521,259 @@ class AnswerPolicy:
             re.compile(rf"((?:one|two|three|four|five|six|seven|eight|nine|ten|\(?\d+\)?)[^.]*?{singular})", re.IGNORECASE),
             re.compile(rf"({phrase}[^.]*?\(?\d+\)?\s*x\s*\d+%)", re.IGNORECASE),
             re.compile(rf"({singular}[^.]*?\(?\d+\)?\s*x\s*\d+%)", re.IGNORECASE),
+        ]
+
+    @classmethod
+    def extract_attribute_value(
+        cls,
+        question: str,
+        hits: list[ExactPageHit],
+        *,
+        plan: QueryPlan | None = None,
+    ) -> str | None:
+        plan = plan or plan_query(question)
+        kind = cls.exact_attribute_kind(question, plan=plan)
+        if kind is None:
+            return None
+        fact_value = cls.extract_attribute_fact_value(question, hits, plan, kind)
+        if fact_value is not None:
+            return fact_value
+        return cls.extract_attribute_evidence_value(question, hits, plan, kind)
+
+    @classmethod
+    def exact_attribute_kind(cls, question: str, *, plan: QueryPlan | None = None) -> str | None:
+        normalized = " ".join(question.lower().split())
+        plan = plan or plan_query(question)
+        if re.search(r"\bquantity\b|\bnumber of\b", normalized):
+            return "quantity"
+        if plan.attribute_label == "configuration":
+            return "configuration"
+        if plan.attribute_label == "capacity":
+            return "capacity"
+        if plan.attribute_label == "type" or re.search(r"\bmodel\b", normalized):
+            return "model"
+        if plan.attribute_label == "size" and re.search(r"\brating\b", normalized):
+            return "rating"
+        return None
+
+    @classmethod
+    def extract_attribute_fact_value(
+        cls,
+        question: str,
+        hits: list[ExactPageHit],
+        plan: QueryPlan,
+        kind: str,
+    ) -> str | None:
+        subject_terms = cls.attribute_subject_terms(plan, kind)
+        if not subject_terms:
+            return None
+        for hit in hits:
+            for label, value in cls.extract_fact_row_entries(hit.page_text):
+                if not cls.matches_attribute_row_label(label, subject_terms):
+                    continue
+                compact_value = cls.extract_value_from_text(value, plan, kind)
+                if compact_value is not None:
+                    return compact_value
+        return None
+
+    @classmethod
+    def extract_attribute_evidence_value(
+        cls,
+        question: str,
+        hits: list[ExactPageHit],
+        plan: QueryPlan,
+        kind: str,
+    ) -> str | None:
+        subject_terms = cls.attribute_subject_terms(plan, kind)
+        item_phrase = cls.quantity_item_phrase(question) if kind == "quantity" else ""
+        candidates: list[tuple[float, str]] = []
+        for hit in hits:
+            compact = " ".join(hit.page_text.split())
+            for sentence in cls.split_sentences(compact):
+                lowered = sentence.lower()
+                if subject_terms and not cls.matches_attribute_sentence(lowered, subject_terms):
+                    continue
+                score = cls.score_attribute_sentence(sentence, plan) if plan.attribute_label else cls.score_sentence(sentence, plan)
+                if kind == "quantity" and item_phrase and re.search(rf"\b{re.escape(item_phrase)}\b", lowered):
+                    score += 1.5
+                candidates.append((score, sentence))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        for _, sentence in candidates:
+            compact_value = cls.extract_value_from_text(sentence, plan, kind, item_phrase=item_phrase)
+            if compact_value is not None:
+                return compact_value
+        return None
+
+    @staticmethod
+    def attribute_subject_terms(plan: QueryPlan, kind: str) -> tuple[str, ...]:
+        excluded = set(plan.attribute_terms) | {"quantity", "number", "model", "rating"}
+        terms: list[str] = []
+        for term in plan.system_terms + plan.concept_terms + plan.focus_terms:
+            cleaned = term.strip().lower()
+            if not cleaned or cleaned in excluded or cleaned in GENERIC_SYSTEM_TERMS:
+                continue
+            terms.append(cleaned)
+        return tuple(dict.fromkeys(terms))
+
+    @classmethod
+    def extract_fact_row_entries(cls, page_text: str) -> list[tuple[str, str]]:
+        lines = [" ".join(line.split()).strip() for line in str(page_text).splitlines() if line and line.strip()]
+        if not lines:
+            return []
+        entries: list[tuple[str, str]] = []
+        for line in lines:
+            if ":" not in line:
+                continue
+            label, value = line.split(":", 1)
+            label = label.strip()
+            value = value.strip()
+            if label and value:
+                entries.append((label, value))
+        if entries:
+            return entries
+        for index in range(len(lines) - 1):
+            label = lines[index]
+            value = lines[index + 1]
+            if cls.looks_like_fact_row_label(label) and cls.looks_like_fact_row_value(value):
+                entries.append((label, value))
+        return entries
+
+    @staticmethod
+    def looks_like_fact_row_label(text: str) -> bool:
+        lowered = text.lower()
+        if re.search(r"\d", text):
+            return False
+        if lowered in {"characteristic", "specification", "value", "values"}:
+            return False
+        return len(TOKEN_RE.findall(text)) <= 8
+
+    @staticmethod
+    def looks_like_fact_row_value(text: str) -> bool:
+        lowered = text.lower()
+        if re.search(r"\d", text):
+            return True
+        return bool(re.search(r"\b(duplex|simplex|duty|standby|lead|lag|indoor|outdoor|n/?a)\b", lowered))
+
+    @staticmethod
+    def matches_attribute_row_label(label: str, subject_terms: tuple[str, ...]) -> bool:
+        lowered = label.lower()
+        hits = sum(1 for term in subject_terms if term in lowered)
+        required = max(1, min(len(subject_terms), 2))
+        return hits >= required
+
+    @staticmethod
+    def matches_attribute_sentence(text: str, subject_terms: tuple[str, ...]) -> bool:
+        hits = sum(1 for term in subject_terms if term in text)
+        required = max(1, min(len(subject_terms), 2))
+        return hits >= required
+
+    @classmethod
+    def extract_value_from_text(
+        cls,
+        text: str,
+        plan: QueryPlan,
+        kind: str,
+        *,
+        item_phrase: str = "",
+    ) -> str | None:
+        compact = " ".join(text.split())
+        if not compact:
+            return None
+        if kind == "configuration":
+            value = cls.extract_first_pattern_match(compact, cls.configuration_value_patterns())
+            return cls.normalize_exact_value(value)
+        if kind == "capacity":
+            patterns = (
+                re.compile(r"\b(\d+(?:\.\d+)?\s*%\s*capacity)\b", re.IGNORECASE),
+                re.compile(r"\bcapacity\s+(?:of|is|shall be|=)?\s*(\d+(?:\.\d+)?\s*(?:gpm|lb/hr|scfm|cfm|acfm|mmscfd|mw|kw|hp|tph|tpd|bpd|mbh|mmbtu/hr|kg/hr|lbm/hr|ft3/min|m3/hr|gal/min|gpd|%))\b", re.IGNORECASE),
+                re.compile(r"\brated\s+at\s+(\d+(?:\.\d+)?\s*(?:gpm|lb/hr|scfm|cfm|acfm|mmscfd|mw|kw|hp|tph|tpd|bpd|mbh|mmbtu/hr|kg/hr|lbm/hr|ft3/min|m3/hr|gal/min|gpd|%))\b", re.IGNORECASE),
+            )
+            value = cls.extract_first_pattern_match(compact, patterns)
+            return cls.normalize_exact_value(value)
+        if kind == "model":
+            patterns = (
+                re.compile(r"\bmodel(?:\s+\w+){0,3}\s+(?:shall be|is|:)?\s*([A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*)\b"),
+                re.compile(r"\bselected\s+\w+\s+model\s+shall\s+be\s+([A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*)\b", re.IGNORECASE),
+                re.compile(r"\b([A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*)\b"),
+            )
+            value = cls.extract_first_pattern_match(compact, patterns)
+            return cls.normalize_exact_value(value)
+        if kind == "rating":
+            patterns = (
+                re.compile(r"\brating(?:\s+of|\s+is|:)?\s*(\d+(?:\.\d+)?\s*(?:kv|v|volt(?:s)?|a|amp(?:s)?|ka|kva|mva|mw|kw|hp|psi|psig|psia|inch(?:es)?|mm|ft|%))\b", re.IGNORECASE),
+                re.compile(r"\brated\s+at\s+(\d+(?:\.\d+)?\s*(?:kv|v|volt(?:s)?|a|amp(?:s)?|ka|kva|mva|mw|kw|hp|psi|psig|psia|inch(?:es)?|mm|ft|%))\b", re.IGNORECASE),
+            )
+            value = cls.extract_first_pattern_match(compact, patterns)
+            return cls.normalize_exact_value(value)
+        if kind == "quantity":
+            count_token = r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)(?:\s*\(\d+\))?|\(?\d+\)?)"
+            if item_phrase:
+                patterns = cls.quantity_value_patterns(item_phrase)
+                value = cls.extract_first_pattern_match(compact, patterns)
+                return cls.normalize_exact_value(value)
+            value = cls.extract_first_pattern_match(
+                compact,
+                (
+                    re.compile(
+                        rf"\b({count_token}(?:\s*[xX]\s*\d+%\s*(?:capacity)?|\s+\d+%\s+capacity|\s+full\s+capacity)?)\b",
+                        re.IGNORECASE,
+                    ),
+                ),
+            )
+            return cls.normalize_exact_value(value)
+        compact_value = cls.extract_compact_attribute_value(compact, plan)
+        return cls.normalize_exact_value(compact_value or None)
+
+    @staticmethod
+    def extract_first_pattern_match(text: str, patterns: Sequence[re.Pattern[str]]) -> str | None:
+        for pattern in patterns:
+            match = pattern.search(text)
+            if match:
+                return match.group(1) if match.lastindex else match.group(0)
+        return None
+
+    @staticmethod
+    def normalize_exact_value(value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = " ".join(value.split()).strip(" ,;:.")
+        if not cleaned:
+            return None
+        cleaned = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", " x ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def quantity_item_phrase(question: str) -> str:
+        normalized = " ".join(question.lower().split()).strip(" ?.")
+        match = re.search(r"\b(?:quantity|number)\s+of\s+(.+)$", normalized)
+        if match:
+            phrase = match.group(1).strip()
+            return re.sub(r"^(?:the|a|an)\s+", "", phrase)
+        return ""
+
+    @staticmethod
+    def quantity_value_patterns(item_phrase: str) -> list[re.Pattern[str]]:
+        phrase = re.escape(item_phrase)
+        singular = re.escape(item_phrase[:-1]) if item_phrase.endswith("s") and len(item_phrase) > 4 else phrase
+        count_token = r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)(?:\s*\(\d+\))?|\(?\d+\)?)"
+        return [
+            re.compile(
+                rf"\b({count_token}(?:\s*[xX]\s*\d+%\s*(?:capacity)?|\s+\d+%\s+capacity|\s+full\s+capacity)?)\s+[^.]*?{phrase}\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"\b({count_token}(?:\s*[xX]\s*\d+%\s*(?:capacity)?|\s+\d+%\s+capacity|\s+full\s+capacity)?)\s+[^.]*?{singular}\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"\b{phrase}[^.]*?\b({count_token}(?:\s*[xX]\s*\d+%\s*(?:capacity)?|\s+\d+%\s+capacity|\s+full\s+capacity)?)\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"\b{singular}[^.]*?\b({count_token}(?:\s*[xX]\s*\d+%\s*(?:capacity)?|\s+\d+%\s+capacity|\s+full\s+capacity)?)\b",
+                re.IGNORECASE,
+            ),
         ]
 
     @staticmethod

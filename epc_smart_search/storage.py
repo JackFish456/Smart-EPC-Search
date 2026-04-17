@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-import re
 import sqlite3
 from array import array
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.config import SEARCH_SCHEMA_VERSION
+from epc_smart_search.name_normalization import (
+    normalize_attribute_name,
+    normalize_lookup_text,
+    normalize_system_name,
+)
 from epc_smart_search.ocr_support import PageText
-from epc_smart_search.search_features import ChunkFeatures, normalize_text
-
-FACT_KEY_TOKEN_RE = re.compile(r"[a-z0-9]+")
+from epc_smart_search.search_features import ChunkFeatures
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -34,7 +36,7 @@ CREATE TABLE IF NOT EXISTS contract_chunks (
     chunk_rowid INTEGER PRIMARY KEY,
     chunk_id TEXT NOT NULL UNIQUE,
     document_id TEXT NOT NULL,
-    chunk_type TEXT NOT NULL CHECK (chunk_type IN ('article','section','subsection','exhibit','definition')),
+    chunk_type TEXT NOT NULL CHECK (chunk_type IN ('article','section','subsection','exhibit','definition','schedule_block','bullet_group','line_item_group')),
     section_number TEXT,
     heading TEXT NOT NULL DEFAULT '',
     full_text TEXT NOT NULL,
@@ -264,7 +266,7 @@ class ContractFactRow:
 
 
 def normalize_fact_key(value: str) -> str:
-    return " ".join(FACT_KEY_TOKEN_RE.findall(normalize_text(value)))
+    return normalize_lookup_text(value)
 
 
 class ContractStore:
@@ -413,9 +415,9 @@ class ContractStore:
         return {
             "document_id": fact.document_id,
             "system": fact.system.strip(),
-            "system_normalized": normalize_fact_key(fact.system_normalized or fact.system),
+            "system_normalized": normalize_system_name(fact.system_normalized or fact.system),
             "attribute": fact.attribute.strip(),
-            "attribute_normalized": normalize_fact_key(fact.attribute_normalized or fact.attribute),
+            "attribute_normalized": normalize_attribute_name(fact.attribute_normalized or fact.attribute),
             "value": fact.value.strip(),
             "evidence_text": fact.evidence_text.strip(),
             "source_chunk_id": fact.source_chunk_id,
@@ -488,6 +490,13 @@ class ContractStore:
             connection.commit()
         return inserted
 
+    def replace_contract_facts(self, document_id: str, facts: list[ContractFactRow]) -> int:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM contract_facts WHERE document_id = ?", (document_id,))
+            inserted = self._insert_contract_facts(connection, facts)
+            connection.commit()
+        return inserted
+
     def get_metadata(self, key: str) -> str | None:
         with self._connect() as connection:
             row = connection.execute("SELECT value FROM app_metadata WHERE key = ?", (key,)).fetchone()
@@ -524,6 +533,14 @@ class ContractStore:
                 (document_id,),
             ).fetchone()
         return int(row["chunk_count"]) if row else 0
+
+    def get_fact_count(self, document_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS fact_count FROM contract_facts WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+        return int(row["fact_count"]) if row else 0
 
     @staticmethod
     def _fact_from_row(row: sqlite3.Row) -> ContractFactRow:
@@ -568,7 +585,7 @@ class ContractStore:
                   AND attribute_normalized = ?
                 ORDER BY page_start, page_end, fact_rowid
                 """,
-                (document_id, normalize_fact_key(system), normalize_fact_key(attribute)),
+                (document_id, normalize_system_name(system), normalize_attribute_name(attribute)),
             ).fetchall()
         return [self._fact_from_row(row) for row in rows]
 
@@ -593,7 +610,32 @@ class ContractStore:
                   AND system_normalized = ?
                 ORDER BY attribute_normalized, page_start, page_end, fact_rowid
                 """,
-                (document_id, normalize_fact_key(system)),
+                (document_id, normalize_system_name(system)),
+            ).fetchall()
+        return [self._fact_from_row(row) for row in rows]
+
+    def lookup_facts_by_attribute(self, document_id: str, attribute: str) -> list[ContractFactRow]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    fact_rowid,
+                    document_id,
+                    system,
+                    system_normalized,
+                    attribute,
+                    attribute_normalized,
+                    value,
+                    evidence_text,
+                    source_chunk_id,
+                    page_start,
+                    page_end
+                FROM contract_facts
+                WHERE document_id = ?
+                  AND attribute_normalized = ?
+                ORDER BY page_start, page_end, fact_rowid
+                """,
+                (document_id, normalize_attribute_name(attribute)),
             ).fetchall()
         return [self._fact_from_row(row) for row in rows]
 

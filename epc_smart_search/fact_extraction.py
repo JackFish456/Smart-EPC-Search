@@ -40,10 +40,14 @@ LEADING_SYSTEM_STOPWORDS = {
     "all",
     "an",
     "each",
+    "existing",
+    "new",
+    "selected",
     "the",
     "these",
     "this",
     "those",
+    "vendor",
 }
 TRAILING_SYSTEM_STOPWORDS = {
     "be",

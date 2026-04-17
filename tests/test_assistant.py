@@ -271,6 +271,90 @@ def test_build_exact_answer_prefers_quantity_value_for_how_many_question() -> No
     assert "two (2) x 100%" in answer.text.lower()
 
 
+def test_build_exact_answer_returns_fact_row_configuration_value() -> None:
+    policy = AnswerPolicy(None, None)
+    hits = [
+        ExactPageHit(
+            page_num=2686,
+            snippet="Dew Point Heaters",
+            page_text=(
+                "Equipment\n"
+                "Configuration\n"
+                "Dew Point Heaters\n"
+                "4x50%\n"
+                "Fuel Gas Heaters\n"
+                "2x100%\n"
+            ),
+        )
+    ]
+
+    answer = policy.build_exact_answer("What is the configuration of the dew point heaters?", hits)
+
+    assert answer is not None
+    assert answer.text.startswith("Answer: 4 x 50%")
+    assert "Direct contract text:" in answer.text
+
+
+def test_build_exact_answer_returns_fact_row_capacity_value() -> None:
+    policy = AnswerPolicy(None, None)
+    hits = [
+        ExactPageHit(
+            page_num=261,
+            snippet="Closed Cooling Water Pumps",
+            page_text=(
+                "Closed Cooling Water Pumps: 100% capacity\n"
+                "Closed Cooling Water Pump Motors: 1200 HP\n"
+            ),
+        )
+    ]
+
+    answer = policy.build_exact_answer("What is the capacity of the closed cooling water pumps?", hits)
+
+    assert answer is not None
+    assert answer.text.startswith("Answer: 100% capacity")
+    assert "Direct contract text:" in answer.text
+
+
+def test_build_exact_answer_returns_quantity_value_for_quantity_question() -> None:
+    policy = AnswerPolicy(None, None)
+    hits = [
+        ExactPageHit(
+            page_num=290,
+            snippet="Demineralized water pumps",
+            page_text=(
+                "The Demineralized Water System includes two (2) x 100% demineralized water pumps. "
+                "These pumps deliver water to the storage tank."
+            ),
+        )
+    ]
+
+    answer = policy.build_exact_answer("What is the quantity of the demineralized water pumps?", hits)
+
+    assert answer is not None
+    assert answer.text.startswith("Answer: two (2) x 100%")
+    assert "Direct contract text:" in answer.text
+
+
+def test_build_exact_answer_falls_back_to_direct_text_when_exact_value_not_found() -> None:
+    policy = AnswerPolicy(None, None)
+    hits = [
+        ExactPageHit(
+            page_num=41,
+            snippet="Dew point configuration",
+            page_text=(
+                "The fuel gas dew point configuration shall use a duplex analyzer arrangement with automatic switchover. "
+                "Commissioning checks shall verify the analyzer alarms."
+            ),
+        )
+    ]
+
+    answer = policy.build_exact_answer("What is the configuration of the dew point heaters?", hits)
+
+    assert answer is not None
+    assert answer.text.startswith("Direct contract text:\n")
+    assert "Answer:" not in answer.text
+
+
 def test_build_extractive_answer_rejects_system_overview_for_how_many_question_without_quantity() -> None:
     ranked = [
         RankedChunk(
