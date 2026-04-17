@@ -5,11 +5,14 @@ import re
 from dataclasses import dataclass
 from typing import Sequence
 
+from epc_smart_search.name_normalization import build_system_aliases, normalize_attribute_name, normalize_system_name
 from epc_smart_search.query_planner import (
     ANSWER_FAMILY_GUARANTEE_OR_LIMIT,
     QueryPlan,
     REQUEST_SHAPE_BROAD_TOPIC,
+    REQUEST_SHAPE_DIRECT_TEXT,
     REQUEST_SHAPE_GROUPED_LIST,
+    REQUEST_SHAPE_REFERENCE_LOOKUP,
     RETRIEVAL_MODE_FACT_LOOKUP,
     has_term_overlap,
     plan_query,
@@ -24,6 +27,27 @@ class AssistantAnswer:
     text: str
     citations: list[Citation]
     refused: bool
+
+
+@dataclass(slots=True)
+class FactAnswerCandidate:
+    fact: object
+    chunk_row: object | None
+    normalized_system: str
+    normalized_attribute: str
+    normalized_value: str
+    has_specific_support: bool
+
+
+@dataclass(slots=True)
+class FactAnswerAssessment:
+    confidence: float
+    direct_answer_allowed: bool
+    reason: str
+    unique_system_count: int
+    unique_attribute_count: int
+    unique_value_count: int
+    candidate: FactAnswerCandidate | None
 
 
 SUMMARY_MAX_NEW_TOKENS = 224
@@ -93,21 +117,22 @@ class AnswerPolicy:
         previous_answer: str | None = None,
     ) -> AssistantAnswer:
         effective_question = self.resolve_question(question, history)
-        plan = self._plan_query(effective_question)
-        fact_answer = None if deep_think or expand_answer else self.build_fact_answer(effective_question, plan=plan)
+        grounded_question = self.normalize_grounded_question(effective_question)
+        plan = self._plan_query(grounded_question)
+        fact_answer = None if deep_think or expand_answer else self.build_fact_answer(grounded_question, plan=plan)
         if fact_answer is not None:
             return fact_answer
-        exact_hits = self.retriever.find_exact_page_hits(effective_question)
-        exact_answer = None if expand_answer else self.build_exact_answer(effective_question, exact_hits)
+        exact_hits = self.retriever.find_exact_page_hits(grounded_question)
+        exact_answer = None if expand_answer else self.build_exact_answer(grounded_question, exact_hits)
         if exact_answer is not None and not deep_think:
             return exact_answer
 
         broad_topic_request = plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
         summary_request = broad_topic_request or self.prefers_generated_answer(question)
-        trace = self._retrieve_trace(effective_question, gemma_client, deep_think=deep_think)
+        trace = self._retrieve_trace(grounded_question, gemma_client, deep_think=deep_think)
         if broad_topic_request and trace is not None:
             ranked = list(trace.merged_ranked)
-            citations = self.citations_from_ranked(ranked, effective_question)
+            citations = self.citations_from_ranked(ranked, grounded_question)
         elif trace is not None and trace.selected_bundle is not None:
             ranked = list(trace.selected_bundle.ranked_chunks)
             citations = list(trace.selected_bundle.citations)
@@ -117,12 +142,12 @@ class AnswerPolicy:
                     key=lambda chunk: self.score_requirement_candidate(chunk, plan),
                     reverse=True,
                 )
-                citations = self.citations_from_ranked(ranked, effective_question)
+                citations = self.citations_from_ranked(ranked, grounded_question)
         else:
             ranked = (
-                self.retriever.retrieve(effective_question, profile="deep")
+                self.retriever.retrieve(grounded_question, profile="deep")
                 if deep_think
-                else self.retriever.retrieve(effective_question)
+                else self.retriever.retrieve(grounded_question)
             )
             citations = self.retriever.expand_with_context(ranked) if ranked else []
         citations = self.limit_citations(citations) if citations else []
@@ -133,57 +158,56 @@ class AnswerPolicy:
         strong_ranked_evidence = self.has_strong_ranked_evidence(plan, ranked)
         evidence_is_weak = not citations or not strong_ranked_evidence
         refusal_citations = citations if not evidence_is_weak else []
-        reference_answer = self.build_reference_answer(effective_question, ranked, citations)
-        grouped_answer = self.build_grouped_answer(effective_question, ranked, citations)
-        page_attribute_answer = self.build_page_attribute_answer(effective_question, ranked, citations)
-        compact_answer = self.build_compact_answer(effective_question, ranked, citations)
-        extractive_answer = self.build_extractive_answer(effective_question, ranked, citations)
-        broad_topic_answer = self.build_broad_topic_answer(effective_question, ranked, citations) if broad_topic_request else None
-        grounded_page_attribute_answer = None if evidence_is_weak else page_attribute_answer
-        grounded_compact_answer = None if evidence_is_weak else compact_answer
-        grounded_extractive_answer = None if evidence_is_weak else extractive_answer
+        grounded_answer = self.select_grounded_answer(
+            grounded_question,
+            ranked,
+            citations,
+            evidence_is_weak=evidence_is_weak,
+        )
+        broad_topic_answer = self.build_broad_topic_answer(grounded_question, ranked, citations) if broad_topic_request else None
         grounded_broad_topic_answer = None if evidence_is_weak else broad_topic_answer
 
-        if reference_answer is not None and not summary_request and not deep_think and not expand_answer:
-            return reference_answer
-        if grouped_answer is not None and not summary_request and not deep_think and not expand_answer:
-            return grouped_answer
-        if grounded_page_attribute_answer is not None and not summary_request and not deep_think and not expand_answer:
-            return grounded_page_attribute_answer
-        if grounded_compact_answer is not None and not summary_request and not deep_think and not expand_answer:
-            return grounded_compact_answer
-        if grounded_extractive_answer is not None and not summary_request and not deep_think and not expand_answer:
-            return grounded_extractive_answer
+        if (
+            grounded_answer is not None
+            and not deep_think
+            and not expand_answer
+            and self.should_return_grounded_answer_before_generation(
+                plan,
+                broad_topic_request=broad_topic_request,
+                summary_request=summary_request,
+            )
+        ):
+            return grounded_answer
 
         if deep_think:
-            prompt_context = self.build_deep_prompt_context(effective_question, ranked, exact_hits)
-            if not prompt_context and grounded_extractive_answer is not None:
-                return grounded_extractive_answer
+            prompt_context = self.build_deep_prompt_context(grounded_question, ranked, exact_hits)
+            if not prompt_context and grounded_answer is not None:
+                return grounded_answer
             if evidence_is_weak and not exact_hits:
-                if grounded_extractive_answer is not None:
-                    return grounded_extractive_answer
+                if grounded_answer is not None:
+                    return grounded_answer
                 return AssistantAnswer("I can't verify that from the contract.", refusal_citations, True)
         elif expand_answer:
-            prompt_context = self.build_expand_prompt_context(effective_question, ranked, previous_answer)
+            prompt_context = self.build_expand_prompt_context(grounded_question, ranked, previous_answer)
             if not prompt_context:
-                if grounded_extractive_answer is not None:
-                    return grounded_extractive_answer
+                if grounded_answer is not None:
+                    return grounded_answer
                 return AssistantAnswer("I can't verify that from the contract.", refusal_citations, True)
         else:
             prompt_context = (
-                self.build_summary_prompt_context(effective_question, ranked)
+                self.build_summary_prompt_context(grounded_question, ranked)
                 if summary_request
-                else self._build_standard_prompt_context(effective_question, ranked, citations, trace)
+                else self._build_standard_prompt_context(grounded_question, ranked, citations, trace)
             )
             if summary_request and not prompt_context:
                 if grounded_broad_topic_answer is not None:
                     return grounded_broad_topic_answer
-                if grounded_extractive_answer is not None:
-                    return grounded_extractive_answer
+                if grounded_answer is not None:
+                    return grounded_answer
                 return AssistantAnswer("I can't verify that from the contract.", refusal_citations, True)
             if not summary_request and not prompt_context:
-                if grounded_extractive_answer is not None:
-                    return grounded_extractive_answer
+                if grounded_answer is not None:
+                    return grounded_answer
                 return AssistantAnswer("I can't verify that from the contract.", refusal_citations, True)
 
         gemma_kwargs: dict[str, object] = {
@@ -199,8 +223,8 @@ class AnswerPolicy:
         except Exception:
             if grounded_broad_topic_answer is not None:
                 return grounded_broad_topic_answer
-            if grounded_extractive_answer is not None:
-                return grounded_extractive_answer
+            if grounded_answer is not None:
+                return grounded_answer
             answer_text = "I can't verify that from the contract."
 
         answer_text = answer_text.strip() or "I can't verify that from the contract."
@@ -208,8 +232,8 @@ class AnswerPolicy:
         if (summary_request or deep_think or expand_answer) and (refused or not answer_text):
             if grounded_broad_topic_answer is not None:
                 return grounded_broad_topic_answer
-            if grounded_extractive_answer is not None:
-                return grounded_extractive_answer
+            if grounded_answer is not None:
+                return grounded_answer
         return AssistantAnswer(answer_text, refusal_citations if refused and evidence_is_weak else citations, refused)
 
     def _plan_query(self, question: str) -> QueryPlan:
@@ -301,20 +325,16 @@ class AnswerPolicy:
         document_id = resolve_document_id()
         if not document_id:
             return None
-        rows = self.store.lookup_facts_by_system_attribute(document_id, plan.system_phrase, plan.attribute_label)
-        if not rows:
-            for alias in plan.system_aliases:
-                if not alias:
-                    continue
-                rows = self.store.lookup_facts_by_system_attribute(document_id, alias, plan.attribute_label)
-                if rows:
-                    break
+        rows = self.lookup_fact_answer_rows(document_id, plan)
         if not rows:
             return None
-        fact = rows[0]
-        chunk_row = self.store.fetch_chunk(fact.source_chunk_id)
-        section_number = chunk_row["section_number"] if chunk_row is not None else None
-        heading = " ".join(str(chunk_row["heading"]).split()) if chunk_row is not None else "Contract evidence"
+        assessment = self.assess_fact_answer(plan, rows)
+        if not assessment.direct_answer_allowed or assessment.candidate is None:
+            return None
+        fact = assessment.candidate.fact
+        chunk_row = assessment.candidate.chunk_row
+        section_number = str(self.fact_chunk_value(chunk_row, "section_number", "") or "") or None
+        heading = " ".join(str(self.fact_chunk_value(chunk_row, "heading", "Contract evidence")).split())
         citation = Citation(
             chunk_id=fact.source_chunk_id,
             section_number=section_number,
@@ -331,6 +351,150 @@ class AnswerPolicy:
             [citation],
             False,
         )
+
+    def lookup_fact_answer_rows(self, document_id: str, plan: QueryPlan) -> list[object]:
+        rows: list[object] = []
+        seen: set[tuple[object | None, str, int, int, str]] = set()
+        systems = (plan.system_phrase, *plan.system_aliases)
+        for system_name in systems:
+            if not system_name:
+                continue
+            for row in self.store.lookup_facts_by_system_attribute(document_id, system_name, plan.attribute_label):
+                key = (
+                    getattr(row, "fact_rowid", None),
+                    str(getattr(row, "source_chunk_id", "")),
+                    int(getattr(row, "page_start", 0) or 0),
+                    int(getattr(row, "page_end", 0) or 0),
+                    self.normalize_exact_value(str(getattr(row, "value", ""))) or "",
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
+        return rows
+
+    def assess_fact_answer(self, plan: QueryPlan, rows: Sequence[object]) -> FactAnswerAssessment:
+        plan_systems = {
+            normalize_system_name(alias)
+            for alias in (plan.system_phrase, *plan.system_aliases, *build_system_aliases(plan.system_phrase))
+            if alias
+        }
+        plan_systems.discard("")
+        plan_attribute = normalize_attribute_name(plan.attribute_label or "")
+        chunk_cache: dict[str, object | None] = {}
+        candidates: list[FactAnswerCandidate] = []
+        matched_systems: set[str] = set()
+        matched_attributes: set[str] = set()
+        matched_values: set[str] = set()
+
+        for row in rows:
+            normalized_system = normalize_system_name(str(getattr(row, "system_normalized", "") or getattr(row, "system", "")))
+            normalized_attribute = normalize_attribute_name(
+                str(getattr(row, "attribute_normalized", "") or getattr(row, "attribute", ""))
+            )
+            normalized_value = self.normalize_exact_value(str(getattr(row, "value", "")))
+            if normalized_system in plan_systems:
+                matched_systems.add(normalized_system)
+            if not plan_attribute or normalized_attribute == plan_attribute:
+                matched_attributes.add(normalized_attribute)
+            if normalized_value:
+                matched_values.add(normalized_value)
+            if normalized_system not in plan_systems or (plan_attribute and normalized_attribute != plan_attribute) or not normalized_value:
+                continue
+            chunk_id = str(getattr(row, "source_chunk_id", ""))
+            if chunk_id not in chunk_cache:
+                chunk_cache[chunk_id] = self.store.fetch_chunk(chunk_id)
+            chunk_row = chunk_cache[chunk_id]
+            candidates.append(
+                FactAnswerCandidate(
+                    fact=row,
+                    chunk_row=chunk_row,
+                    normalized_system=normalized_system,
+                    normalized_attribute=normalized_attribute,
+                    normalized_value=normalized_value,
+                    has_specific_support=self.fact_candidate_has_specific_support(plan, row, chunk_row, normalized_value),
+                )
+            )
+
+        strong_candidates = [candidate for candidate in candidates if candidate.has_specific_support]
+        unique_systems = {candidate.normalized_system for candidate in candidates}
+        unique_attributes = {candidate.normalized_attribute for candidate in candidates}
+        unique_values = {candidate.normalized_value for candidate in strong_candidates} or {
+            candidate.normalized_value for candidate in candidates
+        }
+        confidence = 0.0
+        if candidates:
+            confidence += 0.4
+        if len(unique_systems) == 1 and unique_systems:
+            confidence += 0.2
+        if len(unique_attributes) == 1 and unique_attributes:
+            confidence += 0.2
+        if len(unique_values) == 1 and unique_values:
+            confidence += 0.1
+        if strong_candidates:
+            confidence += 0.1
+        confidence = max(0.0, min(1.0, confidence))
+
+        if not candidates:
+            return FactAnswerAssessment(
+                confidence=confidence,
+                direct_answer_allowed=False,
+                reason="weak_system_match",
+                unique_system_count=len(matched_systems),
+                unique_attribute_count=len(matched_attributes),
+                unique_value_count=len(matched_values),
+                candidate=None,
+            )
+        if len(unique_systems) != 1:
+            return FactAnswerAssessment(confidence, False, "ambiguous_system_match", len(unique_systems), len(unique_attributes), len(unique_values), None)
+        if len(unique_attributes) != 1:
+            return FactAnswerAssessment(confidence, False, "ambiguous_attribute_match", len(unique_systems), len(unique_attributes), len(unique_values), None)
+        if len(unique_values) != 1:
+            return FactAnswerAssessment(confidence, False, "conflicting_values", len(unique_systems), len(unique_attributes), len(unique_values), None)
+        if not strong_candidates:
+            return FactAnswerAssessment(confidence, False, "generic_only_support", len(unique_systems), len(unique_attributes), len(unique_values), None)
+
+        selected = max(
+            strong_candidates,
+            key=lambda candidate: (
+                len(str(getattr(candidate.fact, "evidence_text", ""))),
+                len(str(self.fact_chunk_value(candidate.chunk_row, "full_text", ""))) if candidate.chunk_row is not None else 0,
+            ),
+        )
+        return FactAnswerAssessment(confidence, True, "direct_exact_fact", len(unique_systems), len(unique_attributes), len(unique_values), selected)
+
+    def fact_candidate_has_specific_support(
+        self,
+        plan: QueryPlan,
+        fact: object,
+        chunk_row: object | None,
+        normalized_value: str,
+    ) -> bool:
+        evidence_text = str(getattr(fact, "evidence_text", "") or "")
+        heading = str(self.fact_chunk_value(chunk_row, "heading", "") or "")
+        body = str(self.fact_chunk_value(chunk_row, "full_text", "") or "")
+        support_text = " ".join(part for part in [evidence_text, heading, body] if part).strip()
+        if not support_text:
+            return False
+        support_lower = " ".join(support_text.lower().split())
+        if plan.attribute_label and not self.matches_attribute(plan, support_lower):
+            return False
+        significant_terms = plan.system_significant_terms or tuple(
+            term for term in plan.system_terms if term and term not in GENERIC_SYSTEM_TERMS
+        )
+        if significant_terms and not all(term in support_lower for term in significant_terms):
+            return False
+        return normalized_value.lower() in support_lower
+
+    @staticmethod
+    def fact_chunk_value(chunk_row: object | None, key: str, default: object = "") -> object:
+        if chunk_row is None:
+            return default
+        try:
+            value = chunk_row[key]  # type: ignore[index]
+        except Exception:
+            value = getattr(chunk_row, key, default)
+        return default if value is None else value
 
     @classmethod
     def should_use_merged_ranked_for_requirements(cls, plan: QueryPlan, trace) -> bool:
@@ -432,6 +596,15 @@ class AnswerPolicy:
         stem = question.rstrip(" ?.!")
         return f"{stem} regarding {anchor}"
 
+    @staticmethod
+    def normalize_grounded_question(question: str) -> str:
+        normalized = " ".join(question.split()).strip()
+        if not normalized:
+            return question
+        cleaned = re.sub(r"^(?:can you\s+)?(?:please\s+)?(?:summari[sz]e|explain)\s+", "", normalized, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+in plain english$", "", cleaned, flags=re.IGNORECASE)
+        return cleaned or normalized
+
     @classmethod
     def find_follow_up_anchor(cls, history: Sequence[dict[str, str]]) -> str:
         for turn in reversed(history):
@@ -495,17 +668,59 @@ class AnswerPolicy:
         plan = plan_query(question)
         if not self.prefer_exact_answer(lowered, plan):
             return None
+        citations = self.citations_from_exact_hits(question, hits)
         excerpts = [f"Page {hit.page_num}: {self.trim_page_excerpt(hit.page_text, lowered)}" for hit in hits[:4]]
         if self.is_count_question(lowered):
             quantity = self.extract_count_value(lowered, hits)
             if quantity is not None:
                 body = f"Answer: {quantity}\n\nDirect contract text:\n" + "\n\n".join(excerpts)
-                return AssistantAnswer(body, [], False)
+                return AssistantAnswer(body, citations, False)
         attribute_value = self.extract_attribute_value(question, hits, plan=plan)
         if attribute_value is not None:
             body = f"Answer: {attribute_value}\n\nDirect contract text:\n" + "\n\n".join(excerpts)
-            return AssistantAnswer(body, [], False)
-        return AssistantAnswer("Direct contract text:\n" + "\n\n".join(excerpts), [], False)
+            return AssistantAnswer(body, citations, False)
+        return AssistantAnswer("Direct contract text:\n" + "\n\n".join(excerpts), citations, False)
+
+    def select_grounded_answer(
+        self,
+        question: str,
+        ranked: list[RankedChunk],
+        citations: list[Citation],
+        *,
+        evidence_is_weak: bool,
+    ) -> AssistantAnswer | None:
+        reference_answer = self.build_reference_answer(question, ranked, citations)
+        if reference_answer is not None:
+            return reference_answer
+        grouped_answer = self.build_grouped_answer(question, ranked, citations)
+        if grouped_answer is not None:
+            return grouped_answer
+        if evidence_is_weak:
+            return None
+        page_attribute_answer = self.build_page_attribute_answer(question, ranked, citations)
+        if page_attribute_answer is not None:
+            return page_attribute_answer
+        compact_answer = self.build_compact_answer(question, ranked, citations)
+        if compact_answer is not None:
+            return compact_answer
+        return self.build_extractive_answer(question, ranked, citations)
+
+    @staticmethod
+    def should_return_grounded_answer_before_generation(
+        plan: QueryPlan,
+        *,
+        broad_topic_request: bool,
+        summary_request: bool,
+    ) -> bool:
+        if broad_topic_request:
+            return False
+        if not summary_request:
+            return True
+        if plan.request_shape in {REQUEST_SHAPE_GROUPED_LIST, REQUEST_SHAPE_REFERENCE_LOOKUP, REQUEST_SHAPE_DIRECT_TEXT}:
+            return True
+        if plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP:
+            return True
+        return bool(plan.count_question or plan.direct_text_question or plan.attribute_label is not None)
 
     @staticmethod
     def is_count_question(question: str) -> bool:
@@ -794,6 +1009,32 @@ class AnswerPolicy:
         cleaned = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", " x ", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned)
         return cleaned.strip()
+
+    @classmethod
+    def citations_from_exact_hits(cls, question: str, hits: list[ExactPageHit], *, limit: int = 4) -> list[Citation]:
+        lowered = " ".join(question.lower().split())
+        citations: list[Citation] = []
+        seen_pages: set[int] = set()
+        for hit in hits:
+            if hit.page_num in seen_pages:
+                continue
+            seen_pages.add(hit.page_num)
+            heading = " ".join(str(hit.snippet).split()) or f"Page {hit.page_num}"
+            excerpt = cls.trim_page_excerpt(hit.page_text, lowered, limit=SUMMARY_EXCERPT_LIMIT).strip().strip('"')
+            citations.append(
+                Citation(
+                    chunk_id=f"exact_page_{hit.page_num}",
+                    section_number=None,
+                    heading=heading,
+                    attachment=None,
+                    page_start=hit.page_num,
+                    page_end=hit.page_num,
+                    quote=excerpt,
+                )
+            )
+            if len(citations) >= limit:
+                break
+        return citations
 
     @staticmethod
     def quantity_item_phrase(question: str) -> str:

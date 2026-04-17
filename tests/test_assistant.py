@@ -3,6 +3,7 @@ from epc_smart_search.assistant import DEEP_MAX_NEW_TOKENS
 from epc_smart_search.assistant import SUMMARY_ENABLE_THINKING
 from epc_smart_search.assistant import SUMMARY_MAX_NEW_TOKENS
 from epc_smart_search.answer_policy import AnswerPolicy
+from epc_smart_search.behavior_eval import DisabledGemma
 from epc_smart_search.query_planner import plan_query
 from epc_smart_search.retrieval import Citation, ExactPageHit
 from epc_smart_search.retrieval import EvidenceBundle, RankedChunk, RetrievalTrace
@@ -294,6 +295,8 @@ def test_build_exact_answer_returns_fact_row_configuration_value() -> None:
     assert answer is not None
     assert answer.text.startswith("Answer: 4 x 50%")
     assert "Direct contract text:" in answer.text
+    assert answer.citations[0].page_start == 2686
+    assert answer.citations[0].heading == "Dew Point Heaters"
 
 
 def test_build_exact_answer_returns_fact_row_capacity_value() -> None:
@@ -314,6 +317,7 @@ def test_build_exact_answer_returns_fact_row_capacity_value() -> None:
     assert answer is not None
     assert answer.text.startswith("Answer: 100% capacity")
     assert "Direct contract text:" in answer.text
+    assert answer.citations[0].page_start == 261
 
 
 def test_answer_policy_returns_store_backed_fact_answer_before_page_search() -> None:
@@ -361,6 +365,271 @@ def test_answer_policy_returns_store_backed_fact_answer_before_page_search() -> 
     assert "Section 7.4.2 - Dew Point Heaters" in answer.text
     assert 'Evidence: "Dew point heaters shall be furnished in a 4 x 50% configuration."' in answer.text
     assert answer.citations[0].chunk_id == "chunk_fact"
+
+
+def test_fact_answer_policy_returns_direct_answer_for_single_supported_fact() -> None:
+    class FakeStore:
+        def lookup_facts_by_system_attribute(self, document_id: str, system: str, attribute: str):
+            if document_id != "doc1" or "closed cooling water pump" not in system or attribute != "capacity":
+                return []
+            return [
+                ContractFactRow(
+                    document_id="doc1",
+                    system="closed cooling water pump",
+                    system_normalized="closed cooling water pump",
+                    attribute="capacity",
+                    attribute_normalized="capacity",
+                    value="100% capacity",
+                    evidence_text="Each closed cooling water pump shall be rated for 100% capacity.",
+                    source_chunk_id="chunk_capacity",
+                    page_start=261,
+                    page_end=261,
+                    fact_rowid=11,
+                )
+            ]
+
+        def fetch_chunk(self, chunk_id: str):
+            if chunk_id != "chunk_capacity":
+                return None
+            return {
+                "section_number": "5.18",
+                "heading": "Closed Cooling Water Pumps",
+                "full_text": "Each closed cooling water pump shall be rated for 100% capacity.",
+            }
+
+    class FakeRetriever:
+        def resolve_document_id(self) -> str:
+            return "doc1"
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called for a strong exact fact answer.")
+
+    policy = AnswerPolicy(FakeStore(), FakeRetriever())
+
+    answer = policy.answer("What is the capacity of the closed cooling water pumps?", None, FakeGemma())
+
+    assert answer.refused is False
+    assert answer.text.startswith('"100% capacity"')
+    assert "Section 5.18 - Closed Cooling Water Pumps" in answer.text
+
+
+def test_fact_answer_policy_refuses_when_fact_values_conflict() -> None:
+    class FakeStore:
+        def lookup_facts_by_system_attribute(self, document_id: str, system: str, attribute: str):
+            if document_id != "doc1" or "dew point heater" not in system or attribute != "configuration":
+                return []
+            return [
+                ContractFactRow(
+                    document_id="doc1",
+                    system="dew point heater",
+                    system_normalized="dew point heater",
+                    attribute="configuration",
+                    attribute_normalized="configuration",
+                    value="4 x 50%",
+                    evidence_text="Dew point heaters shall be furnished in a 4 x 50% configuration.",
+                    source_chunk_id="chunk_a",
+                    page_start=41,
+                    page_end=41,
+                    fact_rowid=21,
+                ),
+                ContractFactRow(
+                    document_id="doc1",
+                    system="dew point heater",
+                    system_normalized="dew point heater",
+                    attribute="configuration",
+                    attribute_normalized="configuration",
+                    value="2 x 100%",
+                    evidence_text="Dew point heaters shall be furnished in a 2 x 100% configuration.",
+                    source_chunk_id="chunk_b",
+                    page_start=42,
+                    page_end=42,
+                    fact_rowid=22,
+                ),
+            ]
+
+        def fetch_chunk(self, chunk_id: str):
+            rows = {
+                "chunk_a": {
+                    "section_number": "7.4.2",
+                    "heading": "Dew Point Heaters",
+                    "full_text": "Dew point heaters shall be furnished in a 4 x 50% configuration.",
+                },
+                "chunk_b": {
+                    "section_number": "7.4.3",
+                    "heading": "Dew Point Heaters",
+                    "full_text": "Dew point heaters shall be furnished in a 2 x 100% configuration.",
+                },
+            }
+            return rows.get(chunk_id)
+
+    class FakeRetriever:
+        def resolve_document_id(self) -> str:
+            return "doc1"
+
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str):
+            return []
+
+        def expand_with_context(self, incoming_ranked):
+            return []
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called when conflicting facts remain unresolved.")
+
+    policy = AnswerPolicy(FakeStore(), FakeRetriever())
+
+    answer = policy.answer("What is the configuration of the dew point heaters?", None, FakeGemma())
+
+    assert answer.refused is True
+    assert answer.text == "I can't verify that from the contract."
+
+
+def test_fact_answer_policy_falls_back_when_store_match_is_weak() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="fire_water_pump",
+            section_number="8.4.2",
+            heading="Fire Water Pump",
+            full_text="Each fire water pump shall be rated at 350 HP for the project fire water service.",
+            page_start=412,
+            page_end=412,
+            ordinal_in_document=1,
+            total_score=1.2,
+            lexical_score=0.7,
+            semantic_score=0.0,
+        )
+    ]
+    citations = [Citation("fire_water_pump", "8.4.2", "Fire Water Pump", None, 412, 412, "quote")]
+
+    class FakeStore:
+        def lookup_facts_by_system_attribute(self, document_id: str, system: str, attribute: str):
+            if document_id != "doc1" or "fire water pump" not in system or attribute != "power":
+                return []
+            return [
+                ContractFactRow(
+                    document_id="doc1",
+                    system="closed cooling water pump",
+                    system_normalized="closed cooling water pump",
+                    attribute="power",
+                    attribute_normalized="power",
+                    value="1200 HP",
+                    evidence_text="Each closed cooling water pump shall be rated at 1200 HP.",
+                    source_chunk_id="wrong_fact",
+                    page_start=359,
+                    page_end=359,
+                    fact_rowid=31,
+                )
+            ]
+
+        def fetch_chunk(self, chunk_id: str):
+            if chunk_id != "wrong_fact":
+                return None
+            return {
+                "section_number": "6.9",
+                "heading": "Closed Cooling Water Pump",
+                "full_text": "Each closed cooling water pump shall be rated at 1200 HP.",
+            }
+
+    class FakeRetriever:
+        def resolve_document_id(self) -> str:
+            return "doc1"
+
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called when ranked fallback is strong enough.")
+
+    policy = AnswerPolicy(FakeStore(), FakeRetriever())
+
+    answer = policy.answer("what is the fire water pump horse power", None, FakeGemma())
+
+    assert answer.refused is False
+    assert "350 HP" in answer.text
+    assert "1200 HP" not in answer.text
+
+
+def test_fact_answer_policy_refuses_when_no_grounded_evidence_exists() -> None:
+    class FakeStore:
+        def lookup_facts_by_system_attribute(self, document_id: str, system: str, attribute: str):
+            return []
+
+    class FakeRetriever:
+        def resolve_document_id(self) -> str:
+            return "doc1"
+
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str):
+            return []
+
+        def expand_with_context(self, incoming_ranked):
+            return []
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called when there is no grounded evidence.")
+
+    policy = AnswerPolicy(FakeStore(), FakeRetriever())
+
+    answer = policy.answer("What is the dew point configuration?", None, FakeGemma())
+
+    assert answer.refused is True
+    assert answer.text == "I can't verify that from the contract."
+
+
+def test_exact_fact_answer_works_with_ai_disabled() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.23",
+            heading="Dew Point Heater",
+            full_text=(
+                "The dew point heater controls are configured as 4x50% electric heaters "
+                "to achieve the minimum desired gas fuel temperature at the heater outlet."
+            ),
+            page_start=2686,
+            page_end=2688,
+            ordinal_in_document=1,
+            total_score=4.2,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+    citations = [Citation("chunk1", "5.23", "Dew Point Heater", None, 2686, 2688, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = DisabledGemma()
+    assistant.answer_policy = AnswerPolicy(None, assistant.retriever)
+
+    answer = assistant.ask("What is the dew point heater configuration?")
+
+    assert answer.refused is False
+    assert '"4x50%"' in answer.text or '"4 x 50%"' in answer.text
+    assert answer.citations == citations
 
 
 def test_build_exact_answer_returns_quantity_value_for_quantity_question() -> None:
@@ -1132,6 +1401,112 @@ def test_broad_topic_summary_falls_back_to_contract_only_bullets_when_gemma_refu
     assert "- Air Permit Compliance:" in answer.text
     assert "environmental testing" in answer.text.lower()
     assert "permit limits" in answer.text.lower()
+
+
+def test_broad_topic_summary_still_works_with_ai_disabled() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="permit_clause",
+            section_number="8.5",
+            heading="Air Permit Compliance",
+            full_text=(
+                "Contractor shall obtain air permits, perform required emissions testing, and demonstrate ongoing "
+                "compliance with air permit conditions."
+            ),
+            page_start=15,
+            page_end=15,
+            ordinal_in_document=1,
+            total_score=3.2,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        ),
+        RankedChunk(
+            chunk_id="testing_clause",
+            section_number="8.6",
+            heading="Environmental Testing",
+            full_text=(
+                "Contractor shall perform environmental testing, maintain records, and provide supporting calculations "
+                "demonstrating compliance with permit limits."
+            ),
+            page_start=16,
+            page_end=16,
+            ordinal_in_document=2,
+            total_score=2.9,
+            lexical_score=0.9,
+            semantic_score=0.0,
+        ),
+    ]
+    citations = [
+        Citation("permit_clause", "8.5", "Air Permit Compliance", None, 15, 15, "quote"),
+        Citation("testing_clause", "8.6", "Environmental Testing", None, 16, 16, "quote"),
+    ]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = DisabledGemma()
+    assistant.answer_policy = AnswerPolicy(None, assistant.retriever)
+
+    answer = assistant.ask("give me information about air permits")
+
+    assert answer.refused is False
+    assert answer.text.startswith("Here are the strongest contract-supported points about air permits:")
+    assert len(answer.citations) == 2
+
+
+def test_summary_style_fact_question_does_not_let_gemma_overwrite_grounded_value() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.23",
+            heading="Dew Point Heater",
+            full_text=(
+                "The dew point heater controls are configured as 4x50% electric heaters "
+                "to achieve the minimum desired gas fuel temperature at the heater outlet."
+            ),
+            page_start=2686,
+            page_end=2688,
+            ordinal_in_document=1,
+            total_score=4.2,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+    citations = [Citation("chunk1", "5.23", "Dew Point Heater", None, 2686, 2688, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called when a grounded fact answer already exists.")
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+    assistant.answer_policy = AnswerPolicy(None, assistant.retriever)
+
+    answer = assistant.ask("Explain the dew point heater configuration.")
+
+    assert answer.refused is False
+    assert '"4x50%"' in answer.text or '"4 x 50%"' in answer.text
+    assert answer.citations == citations
 
 
 def test_broad_topic_summary_prompt_context_skips_acronym_sections() -> None:
