@@ -68,17 +68,31 @@ The launcher now runs a preflight check before starting the UI. The app seeds th
 
 ## Rebuild contract data
 
-Customer builds are read-only. To rebuild the contract data, use the internal CLI and write to a fresh output file. The source PDF must be supplied explicitly via `--pdf` or `EPC_CONTRACT_PDF`, and it must live outside the repo workspace:
+Customer builds are read-only. Run a full clean reindex whenever the retrieval architecture changes in a way that can invalidate derived data, including schema updates, chunking changes, fact extraction changes, normalization changes, retrieval routing changes, or embedding-input changes.
+
+Use the internal CLI and keep the source PDF outside the workspace. For a repeatable clean rebuild that also refreshes the live runtime database, run:
 
 ```powershell
-python -m epc_smart_search.rebuild_contract --pdf C:\secure\contracts\Clean Contract.pdf --out C:\secure\builds\contract_store.prebuilt.new.db
+python -m epc_smart_search.rebuild_contract --pdf C:\secure\contracts\Clean Contract.pdf --out C:\secure\builds\contract_store.prebuilt.new.db --clean-target --install-live-db
 ```
 
-The rebuild utility:
+The clean rebuild flow:
 
-- Uses the same chunking, feature, and embedding pipeline as the app
-- Validates the rebuilt SQLite database before reporting success
-- Refuses to overwrite the live app database or an existing output file
+- Deletes the target SQLite file plus its `-journal`, `-wal`, and `-shm` sidecars before rebuilding when `--clean-target` is used
+- Replaces the live runtime DB at `%LOCALAPPDATA%\EPC Smart Search\contract_store.db` or the active fallback app-data location when `--install-live-db` is used
+- Recreates schema, pages, chunks, structured facts, search features, and embeddings from the current code
+- Validates that the rebuilt DB has non-zero pages, chunks, facts, and embeddings, and that the expected fact check is present
+- Runs live-pipeline smoke queries for:
+  - `What is the configuration of the dew point heaters?`
+  - `Summarize the closed cooling water system`
+
+Expected validation output includes:
+
+- `Validation [output]` with row counts for pages, chunks, features, facts, and embeddings
+- `Validation [live]` when `--install-live-db` is used
+- `Smoke Query [exact]` showing `Retrieval Mode: fact_lookup`
+- `Smoke Query [summary]` showing `Retrieval Mode: topic_summary`
+- `Run Next Time` with the exact command to repeat
 
 Release flow (contract-bearing `.db` files are never committed to the public repo):
 

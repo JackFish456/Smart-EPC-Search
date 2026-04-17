@@ -244,14 +244,64 @@ def test_rebuild_cli_creates_and_validates_a_fresh_database(monkeypatch) -> None
     out_path = temp_root / f"contract_store_{uuid.uuid4().hex[:8]}.db"
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
     pdf_path.write_bytes(b"%PDF-1.4\n")
-    memory_store = _seed_store(_memory_db_uri("cli"))
 
-    def fake_build_index(*, pdf_path, db_path, version_label="v1", progress_callback=None):
-        Path(db_path).write_bytes(b"stub")
-        return {"document_id": "doc1", "page_count": 1, "chunk_count": 1}
+    output_validation = rebuild_contract_module.RebuildValidationSummary(
+        database_path=out_path,
+        document_id="doc1",
+        document_count=1,
+        page_count=1,
+        chunk_count=1,
+        feature_count=1,
+        fact_count=1,
+        embedding_count=1,
+        schema_version="1",
+        expected_system="dew point heaters",
+        expected_attribute="configuration",
+        expected_values=("4 x 50%",),
+    )
+    smoke_results = (
+        rebuild_contract_module.SmokeQuerySummary(
+            label="exact",
+            question="What is the configuration of the dew point heaters?",
+            retrieval_mode="fact_lookup",
+            used_expected_path=True,
+            selected_bundle_id="dew-point",
+            answer_text='"4 x 50%"',
+        ),
+        rebuild_contract_module.SmokeQuerySummary(
+            label="summary",
+            question="Summarize the closed cooling water system",
+            retrieval_mode="topic_summary",
+            used_expected_path=True,
+            selected_bundle_id="ccw-summary",
+            answer_text="Closed cooling water summary.",
+        ),
+    )
 
-    monkeypatch.setattr(rebuild_contract_module, "build_index", fake_build_index)
-    monkeypatch.setattr(rebuild_contract_module, "ContractStore", lambda path: memory_store)
+    def fake_run_clean_reindex(
+        pdf_path,
+        out_path,
+        *,
+        version_label="v1",
+        clean_target=False,
+        install_live_db_flag=False,
+        expected_system="dew point heaters",
+        expected_attribute="configuration",
+        exact_query="",
+        summary_query="",
+    ):
+        out_path.write_bytes(b"SQLite format 3\x00")
+        return {
+            "result": {"document_id": "doc1", "page_count": 1, "chunk_count": 1, "fact_count": 1},
+            "document_id": "doc1",
+            "output_validation": output_validation,
+            "live_validation": None,
+            "smoke_db_path": out_path,
+            "removed_artifacts": (),
+            "smoke_queries": smoke_results,
+        }
+
+    monkeypatch.setattr(rebuild_contract_module, "run_clean_reindex", fake_run_clean_reindex)
 
     exit_code = rebuild_contract_module.main(["--pdf", str(pdf_path), "--out", str(out_path)])
 
