@@ -23,6 +23,7 @@ REQUEST_SHAPE_REFERENCE_LOOKUP = "reference_lookup"
 REQUEST_SHAPE_DEFINITION = "definition"
 REQUEST_SHAPE_RESPONSIBILITY = "responsibility"
 REQUEST_SHAPE_DIRECT_TEXT = "direct_text"
+REQUEST_SHAPE_BROAD_TOPIC = "broad_topic"
 
 ANSWER_FAMILY_GUARANTEE_OR_LIMIT = "guarantee_or_limit"
 
@@ -69,6 +70,11 @@ class QueryPlan:
 
 
 QUERY_PREFIXES = (
+    "give me information about ",
+    "information about ",
+    "give me details about ",
+    "details about ",
+    "overview of ",
     "what does the contract say about ",
     "what does it say about ",
     "does the contract mention ",
@@ -86,16 +92,20 @@ STOPWORDS = {
     "a",
     "an",
     "about",
+    "any",
     "all",
     "and",
     "are",
     "by",
     "contract",
     "does",
+    "details",
     "exact",
     "for",
     "from",
+    "give",
     "how",
+    "information",
     "in",
     "is",
     "it",
@@ -117,6 +127,7 @@ STOPWORDS = {
     "that",
     "the",
     "this",
+    "overview",
     "your",
     "to",
     "what",
@@ -205,6 +216,20 @@ def plan_query(query: str, system_vocabulary: SystemVocabulary | None = None) ->
     attribute_label, attribute_terms = _detect_attribute(normalized, content_query)
     answer_family = _detect_answer_family(normalized, content_query, focus_terms)
     aggregate_requested = _detect_aggregate_request(normalized, attribute_label, answer_family, focus_terms)
+    extracted_system_phrase = _extract_system_phrase(content_query, attribute_terms, attribute_label)
+    matched_system = system_vocabulary.match(content_query, extracted_system_phrase) if system_vocabulary and extracted_system_phrase else None
+    broad_topic_requested = _detect_broad_topic_request(
+        normalized,
+        content_query,
+        extracted_system_phrase,
+        matched_system.canonical_phrase if matched_system is not None else "",
+        attribute_label,
+        count_question,
+        direct_text_question,
+        aggregate_requested,
+        answer_family,
+        focus_terms,
+    )
 
     intent = "general_topic"
     if section_number:
@@ -238,12 +263,13 @@ def plan_query(query: str, system_vocabulary: SystemVocabulary | None = None) ->
         direct_text_question,
         aggregate_requested,
         answer_family,
+        broad_topic_requested,
     )
     concept_terms = _detect_concept_terms(content_query, scope_terms, attribute_terms, focus_terms, request_shape)
 
-    bind_system_phrase = request_shape != REQUEST_SHAPE_GROUPED_LIST
-    extracted_system_phrase = _extract_system_phrase(content_query, attribute_terms, attribute_label) if bind_system_phrase else ""
-    matched_system = system_vocabulary.match(content_query, extracted_system_phrase) if system_vocabulary and extracted_system_phrase else None
+    bind_system_phrase = request_shape not in {REQUEST_SHAPE_GROUPED_LIST, REQUEST_SHAPE_BROAD_TOPIC}
+    extracted_system_phrase = extracted_system_phrase if bind_system_phrase else ""
+    matched_system = matched_system if bind_system_phrase else None
     system_phrase = matched_system.canonical_phrase if matched_system is not None else extracted_system_phrase
     system_terms = matched_system.terms if matched_system is not None else _focus_terms(system_phrase)
     system_aliases = (
@@ -422,11 +448,14 @@ def _determine_request_shape(
     direct_text_question: bool,
     aggregate_requested: bool,
     answer_family: str | None,
+    broad_topic_requested: bool,
 ) -> str:
     if section_number:
         return REQUEST_SHAPE_REFERENCE_LOOKUP
     if aggregate_requested and answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT:
         return REQUEST_SHAPE_GROUPED_LIST
+    if broad_topic_requested:
+        return REQUEST_SHAPE_BROAD_TOPIC
     if count_question or direct_text_question:
         return REQUEST_SHAPE_DIRECT_TEXT
     if intent == "definition":
@@ -453,6 +482,46 @@ def _detect_concept_terms(
     if request_shape == REQUEST_SHAPE_GROUPED_LIST:
         return _dedupe(tuple(token for token in content_tokens if token not in attribute_tokens))
     return _dedupe(tuple(token for token in focus_terms if token not in attribute_tokens and token not in scope_tokens))
+
+
+def _detect_broad_topic_request(
+    normalized_query: str,
+    content_query: str,
+    extracted_system_phrase: str,
+    matched_system_phrase: str,
+    attribute_label: str | None,
+    count_question: bool,
+    direct_text_question: bool,
+    aggregate_requested: bool,
+    answer_family: str | None,
+    focus_terms: tuple[str, ...],
+) -> bool:
+    if count_question or direct_text_question or attribute_label is not None:
+        return False
+    if aggregate_requested and answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT:
+        return False
+    normalized = f" {normalized_query} "
+    broad_prefixes = (
+        "give me information about ",
+        "information about ",
+        "give me details about ",
+        "details about ",
+        "overview of ",
+        "what do we have about ",
+    )
+    if normalized_query.startswith(broad_prefixes):
+        return True
+    if normalized_query.startswith(("do we have any ", "do we have ")) and len(focus_terms) >= 2:
+        return True
+    broad_markers = {"requirements", "requirement", "permits", "permit", "permitting", "environmental", "compliance"}
+    if not any(marker in focus_terms for marker in broad_markers):
+        return False
+    canonical_system = matched_system_phrase or extracted_system_phrase
+    if canonical_system and len(TOKEN_RE.findall(canonical_system)) >= 3:
+        return False
+    if " environmental requirements " in normalized or " air permits " in normalized or " permit requirements " in normalized:
+        return True
+    return any(marker in focus_terms for marker in broad_markers)
 
 
 def _extract_system_phrase(content_query: str, attribute_terms: tuple[str, ...], attribute_label: str | None) -> str:

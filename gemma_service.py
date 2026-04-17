@@ -58,7 +58,9 @@ def create_app() -> Flask:
         if response_style == "detailed_summary":
             system_prompt = (
                 f"{STRICT_SYSTEM_PROMPT} "
-                "For summary or explanation requests, keep the answer short, grounded, and specific to the user's exact ask."
+                "For summary or explanation requests, keep the answer short, grounded, and specific to the user's exact ask. "
+                "When the excerpts include requirements, permit conditions, compliance obligations, testing procedures, guarantees, or limits, lead with those. "
+                "Treat glossary, acronym, or definition material as supporting context only."
             )
             prompt = (
                 "Contract excerpts:\n"
@@ -67,6 +69,9 @@ def create_app() -> Flask:
                 f"{question}\n\n"
                 "Write a short contract-grounded answer in plain English. "
                 "Start with one direct answer sentence. "
+                "Then summarize only the strongest supported points from the excerpts. "
+                "Prefer requirements, compliance obligations, testing procedures, guarantees, and limits when they appear. "
+                "Use glossary or acronym material only as secondary support. "
                 "Then list the most relevant section and page if the excerpts provide them. "
                 "Do not broaden beyond what the user asked, and do not add generic background. "
                 "Do not mention analysis, reasoning steps, or chain-of-thought. "

@@ -8,6 +8,7 @@ from typing import Sequence
 from epc_smart_search.query_planner import (
     ANSWER_FAMILY_GUARANTEE_OR_LIMIT,
     QueryPlan,
+    REQUEST_SHAPE_BROAD_TOPIC,
     REQUEST_SHAPE_GROUPED_LIST,
     has_term_overlap,
     plan_query,
@@ -89,15 +90,19 @@ class AnswerPolicy:
         previous_answer: str | None = None,
     ) -> AssistantAnswer:
         effective_question = self.resolve_question(question, history)
-        plan = plan_query(effective_question)
+        plan = self._plan_query(effective_question)
         exact_hits = self.retriever.find_exact_page_hits(effective_question)
         exact_answer = None if expand_answer else self.build_exact_answer(effective_question, exact_hits)
         if exact_answer is not None and not deep_think:
             return exact_answer
 
-        summary_request = self.prefers_generated_answer(question)
+        broad_topic_request = plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
+        summary_request = broad_topic_request or self.prefers_generated_answer(question)
         trace = self._retrieve_trace(effective_question, gemma_client, deep_think=deep_think)
-        if trace is not None and trace.selected_bundle is not None:
+        if broad_topic_request and trace is not None:
+            ranked = list(trace.merged_ranked)
+            citations = self.citations_from_ranked(ranked, effective_question)
+        elif trace is not None and trace.selected_bundle is not None:
             ranked = list(trace.selected_bundle.ranked_chunks)
             citations = list(trace.selected_bundle.citations)
         else:
@@ -119,8 +124,10 @@ class AnswerPolicy:
         grouped_answer = self.build_grouped_answer(effective_question, ranked, citations)
         compact_answer = self.build_compact_answer(effective_question, ranked, citations)
         extractive_answer = self.build_extractive_answer(effective_question, ranked, citations)
+        broad_topic_answer = self.build_broad_topic_answer(effective_question, ranked, citations) if broad_topic_request else None
         grounded_compact_answer = None if evidence_is_weak else compact_answer
         grounded_extractive_answer = None if evidence_is_weak else extractive_answer
+        grounded_broad_topic_answer = None if evidence_is_weak else broad_topic_answer
 
         if reference_answer is not None and not summary_request and not deep_think and not expand_answer:
             return reference_answer
@@ -152,6 +159,8 @@ class AnswerPolicy:
                 else self._build_standard_prompt_context(effective_question, ranked, citations, trace)
             )
             if summary_request and not prompt_context:
+                if grounded_broad_topic_answer is not None:
+                    return grounded_broad_topic_answer
                 if grounded_extractive_answer is not None:
                     return grounded_extractive_answer
                 return AssistantAnswer("I can't verify that from the contract.", refusal_citations, True)
@@ -171,6 +180,8 @@ class AnswerPolicy:
         try:
             answer_text = gemma_client.ask(question, prompt_context, **gemma_kwargs)
         except Exception:
+            if grounded_broad_topic_answer is not None:
+                return grounded_broad_topic_answer
             if grounded_extractive_answer is not None:
                 return grounded_extractive_answer
             answer_text = "I can't verify that from the contract."
@@ -178,9 +189,17 @@ class AnswerPolicy:
         answer_text = answer_text.strip() or "I can't verify that from the contract."
         refused = answer_text == "I can't verify that from the contract."
         if (summary_request or deep_think or expand_answer) and (refused or not answer_text):
+            if grounded_broad_topic_answer is not None:
+                return grounded_broad_topic_answer
             if grounded_extractive_answer is not None:
                 return grounded_extractive_answer
         return AssistantAnswer(answer_text, refusal_citations if refused and evidence_is_weak else citations, refused)
+
+    def _plan_query(self, question: str) -> QueryPlan:
+        planner = getattr(self.retriever, "plan_query", None)
+        if callable(planner):
+            return planner(question)
+        return plan_query(question)
 
     def _retrieve_trace(self, effective_question: str, gemma_client, *, deep_think: bool) -> object | None:
         retrieve_trace = getattr(self.retriever, "retrieve_trace", None)
@@ -204,6 +223,39 @@ class AnswerPolicy:
         if callable(build_evidence):
             return build_evidence(effective_question, ranked, citations)
         return ""
+
+    @classmethod
+    def citations_from_ranked(cls, ranked: list[RankedChunk], question: str, *, limit: int = 5) -> list[Citation]:
+        plan = plan_query(question)
+        citations: list[Citation] = []
+        seen: set[tuple[str | None, int, int]] = set()
+        for chunk in ranked:
+            key = (chunk.section_number, chunk.page_start, chunk.page_end)
+            if key in seen:
+                continue
+            excerpt = cls.extract_ranked_excerpt(
+                chunk.full_text,
+                plan,
+                limit=SUMMARY_EXCERPT_LIMIT,
+                surrounding_sentences=1,
+            )
+            if not excerpt or not cls.is_useful_summary_block(chunk, excerpt, plan):
+                continue
+            seen.add(key)
+            citations.append(
+                Citation(
+                    chunk_id=chunk.chunk_id,
+                    section_number=chunk.section_number,
+                    heading=" ".join(chunk.heading.split()),
+                    attachment=None,
+                    page_start=chunk.page_start,
+                    page_end=chunk.page_end,
+                    quote=excerpt.strip().strip('"'),
+                )
+            )
+            if len(citations) >= limit:
+                break
+        return citations
 
     @classmethod
     def resolve_question(cls, question: str, history: Sequence[dict[str, str]] | None = None) -> str:
@@ -443,6 +495,51 @@ class AnswerPolicy:
         if not blocks:
             return None
         return AssistantAnswer("\n\n".join(blocks), citations, False)
+
+    @classmethod
+    def build_broad_topic_answer(
+        cls,
+        question: str,
+        ranked: list[RankedChunk],
+        citations: list[Citation],
+        *,
+        max_sections: int = 4,
+    ) -> AssistantAnswer | None:
+        if not ranked:
+            return None
+        plan = plan_query(question)
+        if plan.request_shape != REQUEST_SHAPE_BROAD_TOPIC:
+            return None
+        blocks: list[str] = []
+        seen_keys: set[tuple[str | None, int, int]] = set()
+        for chunk in ranked:
+            key = (chunk.section_number, chunk.page_start, chunk.page_end)
+            if key in seen_keys:
+                continue
+            excerpt = cls.extract_ranked_excerpt(
+                chunk.full_text,
+                plan,
+                limit=SUMMARY_EXCERPT_LIMIT,
+                surrounding_sentences=1,
+            )
+            if not excerpt or not cls.is_useful_summary_block(chunk, excerpt, plan):
+                continue
+            seen_keys.add(key)
+            heading = " ".join(chunk.heading.split())
+            cleaned_excerpt = excerpt.strip().strip('"').strip()
+            if heading and heading.lower() not in cleaned_excerpt.lower():
+                blocks.append(f"- {heading}: {cleaned_excerpt}")
+            else:
+                blocks.append(f"- {cleaned_excerpt}")
+            if len(blocks) >= max_sections:
+                break
+        if not blocks:
+            return None
+        return AssistantAnswer(
+            f"Here are the strongest contract-supported points about {plan.content_query}:\n" + "\n".join(blocks),
+            citations,
+            False,
+        )
 
     @staticmethod
     def default_extractive_sections(plan: QueryPlan) -> int:
@@ -1006,7 +1103,25 @@ class AnswerPolicy:
 
     @classmethod
     def has_strong_ranked_evidence(cls, plan: QueryPlan, ranked: list[RankedChunk]) -> bool:
+        if plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC:
+            return cls.has_strong_broad_topic_evidence(plan, ranked)
         return any(cls.is_strong_question_match(plan, chunk) for chunk in ranked[:3])
+
+    @classmethod
+    def has_strong_broad_topic_evidence(cls, plan: QueryPlan, ranked: list[RankedChunk]) -> bool:
+        useful_blocks = 0
+        for chunk in ranked[:5]:
+            excerpt = cls.extract_ranked_excerpt(
+                chunk.full_text,
+                plan,
+                limit=SUMMARY_EXCERPT_LIMIT,
+                surrounding_sentences=1,
+            )
+            if excerpt and cls.is_useful_summary_block(chunk, excerpt, plan):
+                useful_blocks += 1
+            if useful_blocks >= 1:
+                return True
+        return False
 
     @classmethod
     def is_strong_question_match(cls, plan: QueryPlan, chunk: RankedChunk) -> bool:
@@ -1231,7 +1346,54 @@ class AnswerPolicy:
             return False
         if cleaned_excerpt.lower().startswith("section ") and "agreement" in cleaned_excerpt.lower() and len(cleaned_excerpt) < 110:
             return False
+        if plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC:
+            if cls.is_broad_topic_noise_heading(cleaned_heading):
+                return False
+            if cls.is_broad_topic_definition_only(cleaned_excerpt):
+                return False
+            if not cls.has_broad_topic_substantive_signal(cleaned_heading, cleaned_excerpt, plan):
+                return False
         return cls.is_useful_extractive_block(chunk.heading, excerpt, plan)
+
+    @staticmethod
+    def is_broad_topic_noise_heading(cleaned_heading: str) -> bool:
+        return bool(
+            re.search(r"\b(common acronyms|acronyms|abbreviations?|glossary)\b", cleaned_heading)
+            or re.fullmatch(r"(section\s+)?(appendix|attachment|exhibit)\s+[a-z0-9.\-]+", cleaned_heading.strip())
+        )
+
+    @staticmethod
+    def is_broad_topic_definition_only(cleaned_excerpt: str) -> bool:
+        lowered = cleaned_excerpt.lower()
+        if not re.search(
+            r"\b(defined as|definition|definitions|means|meaning set forth|interpretation)\b",
+            lowered,
+        ):
+            return False
+        return not re.search(
+            r"\b(shall|must|required|responsible|obligated|provide|perform|submit|deliver|maintain|comply|permit|permits|compliance|testing|test|demonstrate|monitor|guarantee|guarantees|limit|limits|emissions?)\b",
+            lowered,
+        )
+
+    @staticmethod
+    def has_broad_topic_substantive_signal(cleaned_heading: str, cleaned_excerpt: str, plan: QueryPlan) -> bool:
+        combined = f"{cleaned_heading} {cleaned_excerpt.lower()}"
+        if re.search(
+            r"\b(shall|must|required|responsible|obligated|provide|perform|submit|deliver|maintain|comply|obtain|monitor|demonstrate)\b",
+            combined,
+        ):
+            return True
+        if re.search(
+            r"\b(permit|permits|permitting|compliance|testing|test|environmental|emissions?|guarantees?|limits?)\b",
+            combined,
+        ) and (re.search(r"\d", cleaned_excerpt) or len(cleaned_excerpt) >= 110):
+            return True
+        concept_terms = tuple(term for term in plan.concept_terms if term)
+        if concept_terms:
+            concept_hits = sum(1 for term in concept_terms if term in combined)
+            if concept_hits >= max(1, min(len(concept_terms), 2)) and len(cleaned_excerpt) >= 120:
+                return True
+        return False
 
     @staticmethod
     def has_attribute_guidance_marker(text: str) -> bool:

@@ -1,6 +1,6 @@
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.ocr_support import PageText
-from epc_smart_search.query_planner import build_like_fallback, plan_query
+from epc_smart_search.query_planner import REQUEST_SHAPE_BROAD_TOPIC, build_like_fallback, plan_query
 from epc_smart_search.retrieval import HashingEmbedder, HybridRetriever
 from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractStore, pack_vector
@@ -217,6 +217,21 @@ def test_query_plan_tracks_appendix_scope_for_grouped_guarantee_question() -> No
     assert plan.request_shape == "grouped_list"
     assert plan.scope_terms == ("appendix e", "appendix")
     assert plan.concept_terms == ("emission", "guarantees")
+
+
+def test_query_plan_marks_environmental_requirements_as_broad_topic() -> None:
+    plan = plan_query("do we have any environmental requirements?")
+
+    assert plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
+    assert "environmental" in plan.focus_terms
+    assert "requirements" in plan.focus_terms
+
+
+def test_query_plan_marks_air_permits_prompt_as_broad_topic() -> None:
+    plan = plan_query("give me information about air permits")
+
+    assert plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
+    assert plan.content_query == "air permits"
 
 
 def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> None:
@@ -669,6 +684,68 @@ def test_retrieve_trace_can_use_gemma_to_break_close_bundle_ties() -> None:
     assert fake_gemma.calls[0]["response_style"] == "candidate_select"
     assert "Candidate ID: candidate_a" in fake_gemma.calls[0]["context"]
     assert "Candidate ID: candidate_b" in fake_gemma.calls[0]["context"]
+
+
+def test_broad_topic_environmental_requirements_prefers_requirement_clause_over_appendix_header() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "appendix_header",
+                "AA",
+                "APPENDIX AA",
+                "Appendix AA contains administrative materials and reference exhibits for the project.",
+                9,
+                chunk_type="exhibit",
+            ),
+            _chunk(
+                "definition_only",
+                "1.2",
+                "Applicable Legal Requirements",
+                '"Applicable Legal Requirements" means all laws, Environmental Laws, permits, approvals, and similar legal requirements.',
+                10,
+                chunk_type="definition",
+            ),
+            _chunk(
+                "env_requirements",
+                "7.4",
+                "Environmental Requirements",
+                "Contractor shall obtain required environmental permits, maintain compliance with permit conditions, and submit testing results that demonstrate emissions compliance.",
+                11,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("do we have any environmental requirements?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "env_requirements"
+
+
+def test_broad_topic_air_permits_prefers_operational_clause_over_acronyms() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "acronyms",
+                "A.1",
+                "Common Acronyms in Air Permits",
+                "APD = Air Permits. AMOC = alternate means of control. acfm = actual cubic feet per minute.",
+                14,
+                chunk_type="definition",
+            ),
+            _chunk(
+                "permit_clause",
+                "8.5",
+                "Air Permit Compliance",
+                "Contractor shall obtain air permits, perform required emissions testing, and demonstrate ongoing compliance with air permit conditions.",
+                15,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("give me information about air permits")
+
+    assert ranked
+    assert ranked[0].chunk_id == "permit_clause"
 
 
 def test_deep_profile_prefers_specific_clause_over_generic_match() -> None:

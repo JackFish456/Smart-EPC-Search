@@ -10,6 +10,7 @@ from epc_smart_search.config import MAX_EMBEDDING_DIM, MAX_SEARCH_RESULTS, MAX_S
 from epc_smart_search.query_planner import (
     ANSWER_FAMILY_GUARANTEE_OR_LIMIT,
     QueryPlan,
+    REQUEST_SHAPE_BROAD_TOPIC,
     REQUEST_SHAPE_GROUPED_LIST,
     build_like_fallback,
     build_match_queries,
@@ -123,6 +124,7 @@ SEMANTIC_RECALL_KEEP = 20
 LEXICAL_RECALL_KEEP = 20
 MERGED_RECALL_KEEP = 24
 GROUPED_MERGED_RECALL_KEEP = 40
+BROAD_TOPIC_MERGED_RECALL_KEEP = 40
 DEFAULT_FINAL_RANKED_KEEP = 8
 DEEP_FINAL_RANKED_KEEP = 10
 GEMMA_DISAMBIGUATION_TOP_K = 3
@@ -216,9 +218,23 @@ class HybridRetriever:
                 semantic_limit=max(active_profile.semantic_limit, MAX_SEMANTIC_SCAN),
                 use_query_expansion=active_profile.use_query_expansion,
             )
+        elif plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC:
+            active_profile = RetrievalProfile(
+                name=active_profile.name,
+                result_limit=max(active_profile.result_limit, DEFAULT_FINAL_RANKED_KEEP),
+                fts_limit=max(active_profile.fts_limit, 40),
+                keyword_limit=max(active_profile.keyword_limit, 24),
+                semantic_limit=max(active_profile.semantic_limit, MAX_SEMANTIC_SCAN),
+                use_query_expansion=True,
+            )
         query_vector = self.embedder.embed(query)
         recall_sources, combined = self._collect_recall_candidates(document_id, query, query_vector, plan, active_profile)
-        merged_limit = GROUPED_MERGED_RECALL_KEEP if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST else MERGED_RECALL_KEEP
+        if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
+            merged_limit = GROUPED_MERGED_RECALL_KEEP
+        elif plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC:
+            merged_limit = BROAD_TOPIC_MERGED_RECALL_KEEP
+        else:
+            merged_limit = MERGED_RECALL_KEEP
         merged = sorted(combined.values(), key=lambda item: item.total_score, reverse=True)[:merged_limit]
         bundles = self._build_ranked_bundles(document_id, query_vector, plan, merged, active_profile)
         selected_bundle = bundles[0] if bundles else None
@@ -845,6 +861,16 @@ class HybridRetriever:
             term for term in plan.expansion_terms if term in {"guarantee", "guarantees", "shall not exceed", "nox", "co", "ppmvd", "emissions"}
         )
         guarantee_family_block = self._fts_term_block(guarantee_family_terms[:6])
+        broad_topic_terms = tuple(
+            term
+            for term in (
+                plan.concept_terms
+                + plan.focus_terms
+                + ("requirements", "required", "shall", "must", "permit", "permits", "compliance", "test", "testing", "demonstrate")
+            )
+            if term
+        )
+        broad_topic_block = self._fts_term_block(self._dedupe_queries(list(broad_topic_terms))[:8])
 
         if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST and concept_block:
             heading_concept_phrase = " ".join(plan.concept_terms[:4])
@@ -896,8 +922,42 @@ class HybridRetriever:
                             "grouped_scope_guarantee_family",
                             self._fts_and([guarantee_family_block, scope_block]),
                             1.9,
-                        )
                     )
+                )
+
+        if plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC and concept_block:
+            heading_concept_phrase = " ".join(plan.concept_terms[:4] or plan.focus_terms[:4])
+            if heading_concept_phrase:
+                passes.append(
+                    SearchPass(
+                        "broad_topic_heading_concept",
+                        self._fts_column_block(("heading", "parent_heading"), heading_concept_phrase),
+                        1.25,
+                    )
+                )
+            passes.append(
+                SearchPass(
+                    "broad_topic_concept",
+                    concept_block,
+                    0.95,
+                )
+            )
+            if broad_topic_block:
+                passes.append(
+                    SearchPass(
+                        "broad_topic_requirement_signal",
+                        self._fts_and([concept_block, broad_topic_block]),
+                        1.45,
+                    )
+                )
+            if scope_block:
+                passes.append(
+                    SearchPass(
+                        "broad_topic_scope_concept",
+                        self._fts_and([concept_block, scope_block]),
+                        1.55,
+                    )
+                )
 
         if plan.system_phrase and attribute_block:
             passes.append(
@@ -1208,12 +1268,23 @@ class HybridRetriever:
                 score -= 1.2
             if plan.scope_terms and not scope_match:
                 score -= 0.45
+        if plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC:
+            score += self._broad_topic_support_score(heading, parent_heading, full_text, clause_type)
+            score -= self._broad_topic_noise_penalty(heading, parent_heading, full_text, clause_type)
+            if not concept_match:
+                score -= 0.45
+            if plan.scope_terms and not scope_match:
+                score -= 0.6
         if search_pass_name in {"exact_system_attribute", "heading_system_attribute"} and not (exact_system_match and attribute_match):
             score -= 1.25
         if search_pass_name in {"grouped_heading_concept", "grouped_concept"} and not concept_match:
             score -= 0.9
         if search_pass_name in {"grouped_scope_concept", "grouped_heading_scope"} and not (concept_match and (scope_match or not plan.scope_terms)):
             score -= 1.1
+        if search_pass_name in {"broad_topic_heading_concept", "broad_topic_concept"} and not concept_match:
+            score -= 0.85
+        if search_pass_name in {"broad_topic_scope_concept", "broad_topic_requirement_signal"} and not (concept_match and (scope_match or not plan.scope_terms)):
+            score -= 0.95
         if search_pass_name == "exact_system_heading" and not exact_system_match:
             score -= 0.75
         if plan.intent == "definition" and clause_type == "definition":
@@ -1454,6 +1525,51 @@ class HybridRetriever:
         if re.search(r"\b\d+(?:\.\d+)?\s*(?:ppmvd|ppmv|lb/hr|mg/nm3|%)\b", normalized):
             score += 0.95
         return score
+
+    @staticmethod
+    def _broad_topic_support_score(heading: str, parent_heading: str, full_text: str, clause_type: str) -> float:
+        normalized = " ".join([heading, parent_heading, full_text]).lower()
+        score = 0.0
+        score += 0.2 * sum(
+            1
+            for pattern in (
+                r"\bshall\b",
+                r"\bmust\b",
+                r"\brequired\b",
+                r"\bpermit\b",
+                r"\bpermits\b",
+                r"\bcompliance\b",
+                r"\btesting\b",
+                r"\btest\b",
+                r"\bdemonstrate\b",
+                r"\benvironmental\b",
+                r"\bemissions?\b",
+                r"\bguarantees?\b",
+                r"\blimits?\b",
+            )
+            if re.search(pattern, normalized)
+        )
+        if clause_type == "exhibit":
+            score += 0.1
+        return min(score, 1.6)
+
+    @classmethod
+    def _broad_topic_noise_penalty(cls, heading: str, parent_heading: str, full_text: str, clause_type: str) -> float:
+        normalized_heading = " ".join([heading, parent_heading]).lower()
+        normalized_text = " ".join(full_text.split()).lower()
+        penalty = 0.0
+        if re.search(r"\b(common acronyms|acronyms|abbreviations?)\b", normalized_heading):
+            penalty += 1.45
+        if re.search(r"\b(defined as|definition|definitions?)\b", normalized_text) and not re.search(
+            r"\b(shall|must|required|permit|compliance|testing|guarantee|limit)\b",
+            normalized_text,
+        ):
+            penalty += 0.8
+        if clause_type == "exhibit" and cls._is_low_content_body(full_text, ""):
+            penalty += 0.9
+        if re.fullmatch(r"(appendix|attachment|exhibit)\s+[a-z0-9.\-]+", normalized_heading.strip()):
+            penalty += 0.75
+        return penalty
 
     @staticmethod
     def _term_hit_count(text: str, terms: tuple[str, ...]) -> int:

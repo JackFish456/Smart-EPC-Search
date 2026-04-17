@@ -844,6 +844,110 @@ def test_summary_request_does_not_change_following_normal_request_behavior() -> 
     assert assistant.gemma.calls[0]["response_style"] == "detailed_summary"
 
 
+def test_broad_topic_summary_falls_back_to_contract_only_bullets_when_gemma_refuses() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="permit_clause",
+            section_number="8.5",
+            heading="Air Permit Compliance",
+            full_text=(
+                "Contractor shall obtain air permits, perform required emissions testing, and demonstrate ongoing compliance with air permit conditions. "
+                "Testing reports shall be submitted after each required compliance event."
+            ),
+            page_start=15,
+            page_end=15,
+            ordinal_in_document=1,
+            total_score=3.2,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        ),
+        RankedChunk(
+            chunk_id="testing_clause",
+            section_number="8.6",
+            heading="Environmental Testing",
+            full_text=(
+                "Contractor shall perform environmental testing, maintain records, and provide supporting calculations demonstrating compliance with permit limits."
+            ),
+            page_start=16,
+            page_end=16,
+            ordinal_in_document=2,
+            total_score=2.9,
+            lexical_score=0.9,
+            semantic_score=0.0,
+        ),
+    ]
+    citations = [
+        Citation("permit_clause", "8.5", "Air Permit Compliance", None, 15, 15, "quote"),
+        Citation("testing_clause", "8.6", "Environmental Testing", None, 16, 16, "quote"),
+    ]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            return ranked
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    class FakeGemma:
+        def ask(self, question: str, context: str, *, enable_thinking=None, max_new_tokens=None, response_style=None):
+            return "I can't verify that from the contract."
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+    assistant.answer_policy = AnswerPolicy(None, assistant.retriever)
+
+    answer = assistant.ask("give me information about air permits")
+
+    assert answer.refused is False
+    assert answer.text.startswith("Here are the strongest contract-supported points about air permits:")
+    assert "- Air Permit Compliance:" in answer.text
+    assert "environmental testing" in answer.text.lower()
+    assert "permit limits" in answer.text.lower()
+
+
+def test_broad_topic_summary_prompt_context_skips_acronym_sections() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="acronyms",
+            section_number="A.1",
+            heading="Common Acronyms in Air Permits",
+            full_text=(
+                "APD = Air Permits. AMOC = alternate means of control. acfm = actual cubic feet per minute. "
+                "These acronyms are used throughout the appendix."
+            ),
+            page_start=14,
+            page_end=14,
+            ordinal_in_document=1,
+            total_score=4.1,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        ),
+        RankedChunk(
+            chunk_id="permit_clause",
+            section_number="8.5",
+            heading="Air Permit Compliance",
+            full_text=(
+                "Contractor shall obtain air permits, perform required emissions testing, and demonstrate ongoing compliance with air permit conditions."
+            ),
+            page_start=15,
+            page_end=15,
+            ordinal_in_document=2,
+            total_score=3.8,
+            lexical_score=0.9,
+            semantic_score=0.0,
+        ),
+    ]
+
+    context = ContractAssistant._build_summary_prompt_context("give me information about air permits", ranked)
+
+    assert "Heading: Air Permit Compliance" in context
+    assert "Heading: Common Acronyms in Air Permits" not in context
+
+
 def test_deep_think_routes_non_summary_questions_through_gemma() -> None:
     ranked = [
         RankedChunk(
