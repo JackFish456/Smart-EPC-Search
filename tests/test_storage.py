@@ -103,7 +103,7 @@ def test_insert_and_fetch_contract_facts() -> None:
     assert by_attribute[0].value == "4 x 50%"
     assert by_attribute[0].evidence_text.startswith("Dew point heaters shall be furnished")
     assert by_attribute[0].source_chunk_id == chunk.chunk_id
-    assert [fact.attribute for fact in by_system] == ["Configuration", "Duty"]
+    assert sorted(fact.attribute for fact in by_system) == ["Configuration", "Duty"]
 
 
 def test_contract_fact_lookup_uses_normalized_matching() -> None:

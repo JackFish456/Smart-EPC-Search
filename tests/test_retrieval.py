@@ -1092,8 +1092,8 @@ def _seed_retriever(chunks: list[ChunkRecord], *, facts: list[ContractFactRow] |
                 value=fact.raw_value,
                 evidence_text=fact.evidence_text,
                 source_chunk_id=fact.source_chunk_id,
-                page_start=fact.page,
-                page_end=fact.page,
+                page_start=fact.page_start,
+                page_end=fact.page_end,
             )
             for fact in extract_contract_facts(chunks)
         ]

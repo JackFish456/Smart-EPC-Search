@@ -96,7 +96,7 @@ ATTRIBUTE_ALIASES: dict[str, tuple[str, ...]] = {
     "capacity": ("capacity", "capacities"),
     "quantity": ("quantity", "quantities", "number"),
     "rating": ("rating", "ratings", "rated", "power", "horsepower", "horse power", "hp", "kw", "mw"),
-    "model": ("model", "models", "type", "selected"),
+    "model": ("model", "models", "type"),
     "size": ("size", "sizes", "diameter", "dimension", "dimensions", "rating", "ratings"),
     "pressure": ("pressure", "pressures", "psig", "psia", "psi", "bar", "kpa"),
     "temperature": ("temperature", "temperatures", "degf", "degc", "°f", "°c"),
@@ -108,6 +108,13 @@ PRESSURE_VALUE_RE = re.compile(r"\b\d+(?:\.\d+)?\s*(?:psig|psia|psi|bar|kpa)\b",
 TEMPERATURE_VALUE_RE = re.compile(r"\b-?\d+(?:\.\d+)?\s*(?:degf|degc|°f|°c|f|c)\b", re.IGNORECASE)
 FLOW_VALUE_RE = re.compile(r"\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:gpm|gal/min|gpd|scfm|cfm|acfm|mmscfd|lb/hr|lbm/hr|kg/hr|m3/hr|ft3/min)\b", re.IGNORECASE)
 MODEL_VALUE_RE = re.compile(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b")
+SYSTEM_CAPTURE_PATTERN = (
+    r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?"
+    r"(?:analyzer|analyzers|boiler|boilers|blower|blowers|compressor|compressors|cooler|coolers|"
+    r"fan|fans|filter|filters|generator|generators|heater|heaters|line|lines|motor|motors|"
+    r"package|packages|panel|panels|pump|pumps|skid|skids|system|systems|tank|tanks|train|trains|"
+    r"turbine|turbines|unit|units|valve|valves|vessel|vessels))"
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -136,14 +143,13 @@ class _CandidateFact:
 
 def extract_contract_facts(chunks: list[ChunkRecord]) -> list[ContractFactRecord]:
     facts: list[ContractFactRecord] = []
-    seen: set[tuple[str, str, str, str, int, str]] = set()
+    seen: set[tuple[str, str, str, int, str]] = set()
     for chunk in chunks:
         for candidate in extract_chunk_facts(chunk):
             key = (
                 candidate.normalized_system,
                 candidate.normalized_attribute,
                 candidate.raw_value,
-                candidate.evidence_text,
                 chunk.page_start,
                 chunk.chunk_id,
             )
@@ -185,14 +191,13 @@ def extract_chunk_facts(chunk: ChunkRecord) -> list[ContractFactRecord]:
 def _extract_chunk_fact_candidates(chunk: ChunkRecord) -> list[_CandidateFact]:
     heading_system = _normalize_system(chunk.heading)
     candidates: list[_CandidateFact] = []
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for evidence in _iter_evidence_units(chunk.full_text):
         for candidate in _extract_from_row(evidence, heading_system):
             key = (
                 candidate.normalized_system,
                 candidate.normalized_attribute,
                 candidate.raw_value,
-                candidate.evidence_text,
             )
             if key not in seen:
                 seen.add(key)
@@ -204,7 +209,6 @@ def _extract_chunk_fact_candidates(chunk: ChunkRecord) -> list[_CandidateFact]:
                 candidate.normalized_system,
                 candidate.normalized_attribute,
                 candidate.raw_value,
-                candidate.evidence_text,
             )
             if key not in seen:
                 seen.add(key)
@@ -305,7 +309,7 @@ def _extract_from_patterns(evidence: str, heading_system: str) -> list[_Candidat
     for pattern, attribute in (
         (
             re.compile(
-                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\b(?:in|with)\s+(?:an?\s+)?"
+                SYSTEM_CAPTURE_PATTERN + r"\b.*?\b(?:in|with)\s+(?:an?\s+)?"
                 r"(?P<value>\d+\s*[xX]\s*\d+(?:\.\d+)?\s*%)\s+(?:configuration|arrangement)\b",
                 re.IGNORECASE,
             ),
@@ -313,15 +317,15 @@ def _extract_from_patterns(evidence: str, heading_system: str) -> list[_Candidat
         ),
         (
             re.compile(
-                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\brated\s+(?:at|for)\s+"
-                r"(?P<value>[^.;\n]{1,60})",
+                SYSTEM_CAPTURE_PATTERN + r"\b.*?\brated\s+(?:at|for)\s+"
+                r"(?P<value>\d+(?:\.\d+)?\s*(?:HP|KW|MW)\b)",
                 re.IGNORECASE,
             ),
             "rating",
         ),
         (
             re.compile(
-                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\bcapacity\b(?:\s+(?:of|is|shall\s+be)\b|\s*[:=\-])?\s*"
+                SYSTEM_CAPTURE_PATTERN + r"\b.*?\bcapacity\b(?:\s+(?:of|is|shall\s+be)\b|\s*[:=\-])?\s*"
                 r"(?P<value>[^.;\n]{1,60})",
                 re.IGNORECASE,
             ),
@@ -329,7 +333,7 @@ def _extract_from_patterns(evidence: str, heading_system: str) -> list[_Candidat
         ),
         (
             re.compile(
-                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\bfor\s+"
+                SYSTEM_CAPTURE_PATTERN + r"\b.*?\bfor\s+"
                 r"(?P<value>[^.;\n]{1,60}?)\s+service\b",
                 re.IGNORECASE,
             ),
@@ -337,7 +341,7 @@ def _extract_from_patterns(evidence: str, heading_system: str) -> list[_Candidat
         ),
         (
             re.compile(
-                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\bmodel\b(?:\s+(?:shall\s+be|is|=)\b|\s*[:=\-])?\s*"
+                SYSTEM_CAPTURE_PATTERN + r"\b.*?\bmodel\b(?:\s+(?:shall\s+be|is|=)\b|\s*[:=\-])?\s*"
                 r"(?P<value>[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*)",
                 re.IGNORECASE,
             ),
@@ -345,7 +349,7 @@ def _extract_from_patterns(evidence: str, heading_system: str) -> list[_Candidat
         ),
         (
             re.compile(
-                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\bpressure\b(?:\s+(?:of|is|shall\s+be)\b|\s*[:=\-])?\s*"
+                SYSTEM_CAPTURE_PATTERN + r"\b.*?\bpressure\b(?:\s+(?:of|is|shall\s+be)\b|\s*[:=\-])?\s*"
                 r"(?P<value>[^.;\n]{1,60})",
                 re.IGNORECASE,
             ),
@@ -353,7 +357,7 @@ def _extract_from_patterns(evidence: str, heading_system: str) -> list[_Candidat
         ),
         (
             re.compile(
-                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\btemperature\b(?:\s+(?:of|is|shall\s+be)\b|\s*[:=\-])?\s*"
+                SYSTEM_CAPTURE_PATTERN + r"\b.*?\btemperature\b(?:\s+(?:of|is|shall\s+be)\b|\s*[:=\-])?\s*"
                 r"(?P<value>[^.;\n]{1,60})",
                 re.IGNORECASE,
             ),
@@ -361,7 +365,7 @@ def _extract_from_patterns(evidence: str, heading_system: str) -> list[_Candidat
         ),
         (
             re.compile(
-                r"(?P<system>[A-Za-z][A-Za-z0-9/&(),\- ]{2,90}?)\b.*?\bflow(?:\s+rate)?\b(?:\s+(?:of|is|shall\s+be)\b|\s*[:=\-])?\s*"
+                SYSTEM_CAPTURE_PATTERN + r"\b.*?\bflow(?:\s+rate)?\b(?:\s+(?:of|is|shall\s+be)\b|\s*[:=\-])?\s*"
                 r"(?P<value>[^.;\n]{1,60})",
                 re.IGNORECASE,
             ),
@@ -372,7 +376,7 @@ def _extract_from_patterns(evidence: str, heading_system: str) -> list[_Candidat
         if not match:
             continue
         candidate = _make_candidate(
-            _normalize_system(match.group("system")) or heading_system,
+            _normalize_system(match.group("system")),
             attribute,
             _clean_value(match.group("value")),
             evidence,
@@ -387,6 +391,10 @@ def _make_candidate(system: str, attribute: str, value: str, evidence: str) -> _
     normalized_system = _normalize_system(system)
     normalized_attribute = _normalize_attribute(attribute)
     cleaned_value = _clean_value(value)
+    if normalized_attribute == "rating":
+        power_match = POWER_VALUE_RE.search(cleaned_value)
+        if power_match:
+            cleaned_value = power_match.group(0)
     if not normalized_system or not normalized_attribute or not cleaned_value:
         return None
     return _CandidateFact(

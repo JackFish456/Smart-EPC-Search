@@ -195,6 +195,9 @@ def normalize_system_name(text: str) -> str:
         singular_tail = _singularize_system_tail(tokens[-1])
         if singular_tail != tokens[-1]:
             normalized = " ".join([*tokens[:-1], singular_tail])
+            canonical = _SYSTEM_ALIAS_TO_CANONICAL.get(normalized)
+            if canonical:
+                return canonical
 
     return _SYSTEM_ALIAS_TO_CANONICAL.get(normalized, normalized)
 
@@ -254,7 +257,9 @@ def _singularize_system_tail(token: str) -> str:
     if len(token) <= 3 or not token.endswith("s") or token.endswith("ss"):
         return token
     singular = token[:-1]
-    return singular if singular in SINGULARIZABLE_SYSTEM_HEADS else token
+    if singular in SINGULARIZABLE_SYSTEM_HEADS:
+        return singular
+    return token
 
 
 def _pluralize_system_tail(token: str) -> str:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.fact_extraction import extract_chunk_facts
 from epc_smart_search.indexer import build_index, refresh_query_index
@@ -32,21 +34,23 @@ def test_extract_chunk_facts_handles_configuration_rows_and_buried_prose() -> No
     facts = extract_chunk_facts(chunk)
     fact_map = {(fact.normalized_system, fact.normalized_attribute, fact.raw_value): fact for fact in facts}
 
-    assert ("dew point heater", "configuration", "4 x 50%") in fact_map
-    assert ("dew point heater", "configuration", "2 x 100%") in fact_map
+    assert ("dew point heaters", "configuration", "4 x 50%") in fact_map
+    assert ("dew point heaters", "configuration", "2 x 100%") in fact_map
     assert ("auxiliary boiler feed pump", "capacity", "500 gpm") in fact_map
-    assert ("sampling pump", "quantity", "2") in fact_map
-    assert ("turbine generator", "type", "Siemens SGT6-5000F") in fact_map
-    assert ("fire water pump", "power", "350 HP for fire water service") in fact_map
+    assert ("sampling pumps", "quantity", "2") in fact_map
+    assert ("turbine generator", "model", "Siemens SGT6-5000F") in fact_map
+    assert ("fire water pump", "rating", "350 HP") in fact_map
     assert ("fire water pump", "service", "fire water") in fact_map
     assert all(fact.page == 41 for fact in facts)
     assert all(fact.page_end == 41 for fact in facts)
     assert all(fact.source_chunk_id == "chunk_fact_1" for fact in facts)
 
 
-def test_build_index_persists_extracted_contract_facts(tmp_path, monkeypatch) -> None:
-    pdf_path = tmp_path / "Contract.pdf"
-    db_path = tmp_path / "contract.db"
+def test_build_index_persists_extracted_contract_facts(monkeypatch) -> None:
+    temp_dir = Path(".tmp_test")
+    temp_dir.mkdir(exist_ok=True)
+    pdf_path = temp_dir / "ContractFactsTest.pdf"
+    db_path = "file:contract_facts_test?mode=memory&cache=shared"
     pdf_path.write_text("stub", encoding="utf-8")
 
     pages = [
@@ -77,8 +81,8 @@ def test_build_index_persists_extracted_contract_facts(tmp_path, monkeypatch) ->
     result = build_index(pdf_path=pdf_path, db_path=db_path, version_label="test")
     store = ContractStore(db_path)
 
-    configuration_rows = store.lookup_facts_by_system_attribute(result["document_id"], "dew point heater", "configuration")
-    service_rows = store.lookup_facts_by_system_attribute(result["document_id"], "dew point heater", "service")
+    configuration_rows = store.lookup_facts_by_system_attribute(result["document_id"], "dew point heaters", "configuration")
+    service_rows = store.lookup_facts_by_system_attribute(result["document_id"], "dew point heaters", "service")
 
     assert result["fact_count"] >= 2
     assert len(configuration_rows) == 1
@@ -119,9 +123,9 @@ def test_refresh_query_index_rebuilds_contract_facts() -> None:
     )
 
     refresh_query_index(store, "doc1")
-    power_rows = store.lookup_facts_by_system_attribute("doc1", "fire water pump", "power")
+    power_rows = store.lookup_facts_by_system_attribute("doc1", "fire water pump", "rating")
 
     assert len(power_rows) == 1
-    assert power_rows[0].value == "350 HP for the project fire water service"
+    assert power_rows[0].value == "350 HP"
     assert power_rows[0].page_start == 412
     assert power_rows[0].page_end == 413

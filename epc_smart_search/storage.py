@@ -417,9 +417,9 @@ class ContractStore:
         return {
             "document_id": fact.document_id,
             "system": fact.system.strip(),
-            "system_normalized": normalize_lookup_text(fact.system_normalized or fact.system),
+            "system_normalized": normalize_system_name(fact.system_normalized or fact.system),
             "attribute": fact.attribute.strip(),
-            "attribute_normalized": normalize_lookup_text(fact.attribute_normalized or fact.attribute),
+            "attribute_normalized": normalize_attribute_name(fact.attribute_normalized or fact.attribute),
             "value": fact.value.strip(),
             "evidence_text": fact.evidence_text.strip(),
             "source_chunk_id": fact.source_chunk_id,
