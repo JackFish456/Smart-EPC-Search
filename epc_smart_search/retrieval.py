@@ -14,6 +14,7 @@ from epc_smart_search.query_planner import (
     plan_query,
 )
 from epc_smart_search.storage import ContractStore, unpack_vector
+from epc_smart_search.system_vocabulary import SystemVocabulary, build_contract_system_vocabulary
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{1,}")
 
@@ -141,6 +142,8 @@ class HybridRetriever:
     def __init__(self, store: ContractStore, embedder: HashingEmbedder) -> None:
         self.store = store
         self.embedder = embedder
+        self._system_vocabulary_document_id: str | None = None
+        self._system_vocabulary_cache = SystemVocabulary(())
 
     def resolve_document_id(self) -> str | None:
         document = self.store.get_document()
@@ -156,7 +159,7 @@ class HybridRetriever:
         document_id = self.resolve_document_id()
         if not document_id:
             return []
-        plan = plan_query(query)
+        plan = self.plan_query(query)
         active_profile = self._resolve_profile(profile, limit)
         semantic_query = plan.content_query or query
         combined: dict[str, SearchCandidate] = {}
@@ -328,12 +331,26 @@ class HybridRetriever:
             use_query_expansion=selected.use_query_expansion,
         )
 
+    def plan_query(self, query: str) -> QueryPlan:
+        return plan_query(query, system_vocabulary=self.system_vocabulary())
+
+    def system_vocabulary(self) -> SystemVocabulary:
+        document_id = self.resolve_document_id()
+        if not document_id:
+            return SystemVocabulary(())
+        if document_id == self._system_vocabulary_document_id:
+            return self._system_vocabulary_cache
+        rows = self.store.fetch_document_chunks(document_id)
+        self._system_vocabulary_cache = build_contract_system_vocabulary(rows)
+        self._system_vocabulary_document_id = document_id
+        return self._system_vocabulary_cache
+
     def _match_queries_for_profile(self, plan: QueryPlan, profile: RetrievalProfile) -> list[str]:
         queries = list(build_match_queries(plan))
         if not profile.use_query_expansion:
             return queries
         for variant in self._query_variants(plan):
-            queries.extend(build_match_queries(plan_query(variant)))
+            queries.extend(build_match_queries(self.plan_query(variant)))
         return self._dedupe_queries(queries)
 
     def _search_passes_for_profile(self, plan: QueryPlan, profile: RetrievalProfile) -> list[SearchPass]:
@@ -409,7 +426,7 @@ class HybridRetriever:
         if not profile.use_query_expansion:
             return [query for query in queries if query]
         for variant in self._query_variants(plan):
-            queries.append(build_like_fallback(plan_query(variant)))
+            queries.append(build_like_fallback(self.plan_query(variant)))
         return self._dedupe_queries(queries)
 
     def _query_variants(self, plan: QueryPlan) -> list[str]:
@@ -694,7 +711,13 @@ class HybridRetriever:
             hit_count = HybridRetriever._term_hit_count(combined_text, plan.system_terms)
             if hit_count:
                 score += 0.22 * hit_count
-            exact_match = exact_match or hit_count >= max(1, min(len(plan.system_terms), 2))
+            significant_hits = HybridRetriever._term_hit_count(combined_text, plan.system_significant_terms)
+            if significant_hits:
+                score += 0.34 * significant_hits
+            if plan.system_significant_terms:
+                exact_match = exact_match or significant_hits >= len(plan.system_significant_terms)
+            else:
+                exact_match = exact_match or hit_count >= max(1, min(len(plan.system_terms), 2))
         return score, exact_match
 
     @staticmethod

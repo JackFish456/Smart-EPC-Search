@@ -641,6 +641,8 @@ class AnswerPolicy:
         elif label in {"configuration", "type", "size", "capacity", "pressure", "temperature", "flow"}:
             if best_index + 1 < len(sentences) and cls.score_attribute_sentence(sentences[best_index + 1], plan) >= 1.0:
                 selected_indices.add(best_index + 1)
+        elif not label and len(sentences[best_index].strip()) < 50:
+            selected_indices.update(cls.expand_related_sentences(sentences, best_index, plan, limit=2))
         excerpt = " ".join(sentences[index] for index in sorted(selected_indices)).strip()
         if len(excerpt) > limit:
             excerpt = excerpt[: limit - 3].rstrip() + "..."
@@ -676,9 +678,30 @@ class AnswerPolicy:
                         else:
                             selected.append(neighbor)
         excerpt = " ".join(selected).strip()
+        compact_value = cls.extract_compact_attribute_value(excerpt, plan)
+        if compact_value:
+            return cls.quote_excerpt(compact_value)
         if len(excerpt) > limit:
             excerpt = excerpt[: limit - 3].rstrip() + "..."
         return cls.quote_excerpt(excerpt)
+
+    @classmethod
+    def extract_compact_attribute_value(cls, text: str, plan: QueryPlan) -> str:
+        label = plan.attribute_label or ""
+        if label != "configuration":
+            return ""
+        for pattern in cls.configuration_value_patterns():
+            match = pattern.search(text)
+            if match:
+                return " ".join(match.group(0).split())
+        return ""
+
+    @staticmethod
+    def configuration_value_patterns() -> tuple[re.Pattern[str], ...]:
+        return (
+            re.compile(r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten)\s+\(?\d+\)?\s*[xX]\s*\d+%", re.IGNORECASE),
+            re.compile(r"\b\(?\d+\)?\s*[xX]\s*\d+%", re.IGNORECASE),
+        )
 
     @classmethod
     def score_sentence(cls, sentence: str, plan: QueryPlan) -> float:

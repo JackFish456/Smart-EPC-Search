@@ -8,6 +8,12 @@ from epc_smart_search.chunking import ChunkRecord
 WORD_RE = re.compile(r"[a-z0-9][a-z0-9/&\-]{1,}")
 SPACE_RE = re.compile(r"\s+")
 DATE_LIKE_RE = re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{2}$")
+COMMON_NORMALIZATIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bguarentees\b", re.IGNORECASE), "guarantees"),
+    (re.compile(r"\bguarentee\b", re.IGNORECASE), "guarantee"),
+    (re.compile(r"\bguarenteed\b", re.IGNORECASE), "guaranteed"),
+    (re.compile(r"\bguarenteeing\b", re.IGNORECASE), "guaranteeing"),
+)
 
 ACTOR_LEXICON: dict[str, tuple[str, ...]] = {
     "owner": ("owner", "company", "purchaser", "buyer", "nrg"),
@@ -66,7 +72,10 @@ class ChunkFeatures:
 
 
 def normalize_text(text: str) -> str:
-    lowered = SPACE_RE.sub(" ", text.replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"').lower())
+    normalized = text.replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"').lower()
+    for pattern, replacement in COMMON_NORMALIZATIONS:
+        normalized = pattern.sub(replacement, normalized)
+    lowered = SPACE_RE.sub(" ", normalized)
     return lowered.strip()
 
 

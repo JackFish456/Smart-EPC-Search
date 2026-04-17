@@ -198,6 +198,15 @@ def test_query_plan_extracts_system_and_attribute_for_configuration_question() -
     assert "configuration" in plan.attribute_terms
 
 
+def test_query_plan_normalizes_emission_guarantees_typo_and_keeps_general_intent() -> None:
+    plan = plan_query("what are my emission guarentees")
+
+    assert plan.intent == "general_topic"
+    assert plan.content_query == "my emission guarantees"
+    assert plan.focus_terms == ("emission", "guarantees")
+    assert plan.system_terms == ("emission", "guarantees")
+
+
 def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> None:
     retriever = _seed_retriever(
         [
@@ -326,6 +335,84 @@ def test_hierarchical_search_prefers_exact_power_clause_over_random_pump_schedul
 
     assert ranked
     assert ranked[0].chunk_id == "fire_water_pump"
+
+
+def test_contract_vocabulary_prefers_exact_multiword_system_over_related_sibling() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "cooling_water_pump",
+                "8.4.1",
+                "Cooling Water Pump",
+                "Each cooling water pump shall be rated at 425 HP for circulating cooling water service.",
+                401,
+            ),
+            _chunk(
+                "fire_water_pump",
+                "8.4.2",
+                "Fire Water Pump",
+                "Each fire water pump shall be rated at 350 HP for the project fire water service.",
+                412,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what is the fire water pumps horse power")
+
+    assert ranked
+    assert ranked[0].chunk_id == "fire_water_pump"
+
+
+def test_contract_vocabulary_uses_heading_alias_without_promoting_wrong_related_match() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "combustion_controls",
+                "9.2",
+                "Combustion Turbine Controls",
+                "Combustion turbine controls shall coordinate startup sequencing and alarms.",
+                55,
+            ),
+            _chunk(
+                "fuel_gas_system",
+                "9.3",
+                "Fuel Gas System (FGS)",
+                "FGS shall include coalescing filters and a gas heater upstream of the turbine skids.",
+                56,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What does the contract say about the fuel gas system?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "fuel_gas_system"
+
+
+def test_contract_vocabulary_does_not_match_partial_water_pump_modifier_as_exact_system() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "fire_water_pump",
+                "8.4.2",
+                "Fire Water Pump",
+                "Each fire water pump shall be rated at 350 HP for the project fire water service.",
+                412,
+            ),
+            _chunk(
+                "cooling_water_pump",
+                "8.4.3",
+                "Cooling Water Pump",
+                "Each cooling water pump shall be rated at 425 HP for the circulating cooling water service.",
+                413,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what is the cooling water pump horse power")
+
+    assert ranked
+    assert ranked[0].chunk_id == "cooling_water_pump"
 
 
 def test_hierarchical_search_prefers_exact_function_clause() -> None:

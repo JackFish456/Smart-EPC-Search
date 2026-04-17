@@ -379,6 +379,51 @@ def test_ask_returns_compact_answer_for_strong_power_match() -> None:
     assert answer.text.count("Section ") == 1
 
 
+def test_ask_returns_appendix_emission_guarantees_for_plural_question() -> None:
+    correct = RankedChunk(
+        chunk_id="appendix_e",
+        section_number="E",
+        heading="APPENDIX E - Emission Guarantees",
+        full_text=(
+            "Emission Guarantees. Seller guarantees NOx emissions shall not exceed 2.0 ppmvd at 15% oxygen. "
+            "CO emissions shall not exceed 4.0 ppmvd at 15% oxygen."
+        ),
+        page_start=2686,
+        page_end=2688,
+        ordinal_in_document=1,
+        total_score=1.1,
+        lexical_score=0.7,
+        semantic_score=0.0,
+    )
+    citations = [Citation("appendix_e", "E", "APPENDIX E - Emission Guarantees", "Appendix E", 2686, 2688, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            return [correct]
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called for grounded appendix guarantees.")
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+    assistant.answer_policy = AnswerPolicy(None, assistant.retriever)
+
+    answer = assistant.ask("what are my emission guarentees")
+
+    assert answer.refused is False
+    assert "APPENDIX E - Emission Guarantees" in answer.text
+    assert "NOx emissions shall not exceed 2.0 ppmvd" in answer.text
+    assert "CO emissions shall not exceed 4.0 ppmvd" in answer.text
+
+
 def test_prefers_generated_answer_only_for_summary_style_prompts() -> None:
     assert not ContractAssistant._prefers_generated_answer("What does the contract say about fuel gas supply?")
     assert ContractAssistant._prefers_generated_answer("Summarize the fuel gas supply requirements in plain English.")
@@ -525,6 +570,38 @@ def test_build_compact_answer_returns_exact_model_line_for_type_question() -> No
     assert '"The selected turbine model shall be Siemens SGT6-5000F for the project."' in answer.text
     assert "Section 9.2 - Selected Turbine Generator" in answer.text
     assert "Pages: 19" in answer.text
+
+
+def test_build_compact_answer_returns_numeric_configuration_value_when_present() -> None:
+    ranked = [
+        RankedChunk(
+            chunk_id="chunk1",
+            section_number="5.23",
+            heading="Dew Point Heater",
+            full_text=(
+                "The dew point heater controls are configured as 4x50% electric heaters "
+                "to achieve the minimum desired gas fuel temperature at the heater outlet "
+                "based on a required temperature differential."
+            ),
+            page_start=2686,
+            page_end=2688,
+            ordinal_in_document=1,
+            total_score=4.2,
+            lexical_score=1.0,
+            semantic_score=0.0,
+        )
+    ]
+
+    answer = AnswerPolicy.build_compact_answer(
+        "dew point heater configuration",
+        ranked,
+        [],
+    )
+
+    assert answer is not None
+    assert answer.text.startswith('"4x50%"')
+    assert "Section 5.23 - Dew Point Heater" in answer.text
+    assert "Pages: 2686-2688" in answer.text
 
 
 def test_build_compact_answer_returns_exact_function_line_for_how_it_works_question() -> None:

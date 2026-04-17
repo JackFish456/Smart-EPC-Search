@@ -10,6 +10,7 @@ from epc_smart_search.search_features import (
     expand_query_phrases,
     normalize_text,
 )
+from epc_smart_search.system_vocabulary import SystemVocabulary, system_significant_terms
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{1,}")
 SECTION_QUERY_RE = re.compile(r"\b(?:section|sec\.?)\s*(\d+(?:\.\d+){0,5})\b", re.IGNORECASE)
@@ -35,6 +36,7 @@ class QueryPlan:
     system_aliases: tuple[str, ...] = ()
     attribute_label: str | None = None
     attribute_terms: tuple[str, ...] = ()
+    system_significant_terms: tuple[str, ...] = ()
 
     @property
     def all_terms(self) -> tuple[str, ...]:
@@ -165,7 +167,7 @@ GENERIC_SYSTEM_HEADS = {
 }
 
 
-def plan_query(query: str) -> QueryPlan:
+def plan_query(query: str, system_vocabulary: SystemVocabulary | None = None) -> QueryPlan:
     normalized = normalize_text(query)
     content_query = _extract_content_query(normalized)
     section_number = _extract_section_number(query)
@@ -179,9 +181,16 @@ def plan_query(query: str) -> QueryPlan:
     expansion_terms = tuple(expand_query_phrases(normalized))
     focus_terms = _focus_terms(content_query)
     attribute_label, attribute_terms = _detect_attribute(normalized, content_query)
-    system_phrase = _extract_system_phrase(content_query, attribute_terms, attribute_label)
-    system_terms = _focus_terms(system_phrase)
-    system_aliases = _system_aliases(system_phrase, system_terms)
+    extracted_system_phrase = _extract_system_phrase(content_query, attribute_terms, attribute_label)
+    matched_system = system_vocabulary.match(content_query, extracted_system_phrase) if system_vocabulary else None
+    system_phrase = matched_system.canonical_phrase if matched_system is not None else extracted_system_phrase
+    system_terms = matched_system.terms if matched_system is not None else _focus_terms(system_phrase)
+    system_aliases = (
+        _dedupe(((extracted_system_phrase,) if extracted_system_phrase else ()) + matched_system.aliases)
+        if matched_system is not None
+        else _system_aliases(system_phrase, system_terms)
+    )
+    system_significant = system_significant_terms(system_terms)
 
     intent = "general_topic"
     if section_number:
@@ -190,7 +199,12 @@ def plan_query(query: str) -> QueryPlan:
         intent = "direct_text"
     elif attribute_label == "definition" or (
         attribute_label is None
-        and (normalized.startswith(("what is ", "what are ", "define ", "meaning of ")) or " definition" in normalized)
+        and (
+            normalized.startswith(("what is ", "define ", "meaning of "))
+            or " definition" in normalized
+            or " defined as " in normalized
+            or " means " in normalized
+        )
     ):
         intent = "definition"
     elif "responsible for" in normalized or normalized.startswith("who "):
@@ -222,6 +236,7 @@ def plan_query(query: str) -> QueryPlan:
         system_aliases=system_aliases,
         attribute_label=attribute_label,
         attribute_terms=attribute_terms,
+        system_significant_terms=system_significant,
     )
 
 
@@ -344,12 +359,6 @@ def _system_aliases(system_phrase: str, system_terms: tuple[str, ...]) -> tuple[
     singularized = _singularize_phrase(system_phrase)
     if singularized != system_phrase:
         aliases.append(singularized)
-    if len(system_terms) >= 2:
-        aliases.append(" ".join(system_terms[-2:]))
-    if len(system_terms) >= 2 and system_terms[-1] in GENERIC_SYSTEM_HEADS:
-        aliases.append(" ".join(system_terms[:-1]))
-    if len(system_terms) == 1:
-        aliases.append(system_terms[0])
     return _dedupe(tuple(alias for alias in aliases if alias and alias != system_phrase))
 
 
