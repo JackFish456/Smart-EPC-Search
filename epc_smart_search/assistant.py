@@ -40,6 +40,7 @@ class IndexValidationResult:
     document_id: str | None
     chunk_count: int = 0
     feature_count: int = 0
+    fact_count: int = 0
 
 
 INTERNAL_REBUILD_ERROR = "Contract rebuild is available only through the internal rebuild tool."
@@ -57,7 +58,13 @@ def validate_contract_store(store: ContractStore) -> IndexValidationResult:
         return IndexValidationResult(False, "Bundled contract data does not contain searchable chunks.", document_id)
     feature_count = store.get_feature_count(document_id)
     if feature_count <= 0:
-        return IndexValidationResult(False, "Bundled contract data is missing search features.", document_id, chunk_count=chunk_count)
+        return IndexValidationResult(
+            False,
+            "Bundled contract data is missing search features.",
+            document_id,
+            chunk_count=chunk_count,
+            feature_count=feature_count,
+        )
     if feature_count != chunk_count:
         return IndexValidationResult(
             False,
@@ -66,7 +73,24 @@ def validate_contract_store(store: ContractStore) -> IndexValidationResult:
             chunk_count=chunk_count,
             feature_count=feature_count,
         )
-    return IndexValidationResult(True, None, document_id, chunk_count=chunk_count, feature_count=feature_count)
+    fact_count = store.get_fact_count(document_id)
+    if fact_count <= 0:
+        return IndexValidationResult(
+            False,
+            "Bundled contract data is missing structured contract facts.",
+            document_id,
+            chunk_count=chunk_count,
+            feature_count=feature_count,
+            fact_count=fact_count,
+        )
+    return IndexValidationResult(
+        True,
+        None,
+        document_id,
+        chunk_count=chunk_count,
+        feature_count=feature_count,
+        fact_count=fact_count,
+    )
 
 
 class GemmaServiceClient:

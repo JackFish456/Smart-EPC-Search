@@ -97,12 +97,16 @@ def test_run_smoke_queries_requires_fact_and_summary_routes(monkeypatch) -> None
     exact_trace = SimpleNamespace(
         plan=SimpleNamespace(retrieval_mode="fact_lookup"),
         fact_lookup_attempted=True,
+        fact_rows_returned=1,
+        fallback_reason=None,
         fact_hit=object(),
         selected_bundle=SimpleNamespace(bundle_id="dew-point"),
     )
     summary_trace = SimpleNamespace(
         plan=SimpleNamespace(retrieval_mode="topic_summary"),
         fact_lookup_attempted=False,
+        fact_rows_returned=0,
+        fallback_reason="topic_summary_mode",
         fact_hit=None,
         selected_bundle=SimpleNamespace(bundle_id="ccw-summary"),
     )
@@ -135,6 +139,95 @@ def test_run_smoke_queries_requires_fact_and_summary_routes(monkeypatch) -> None
     )
 
     assert exact_summary.retrieval_mode == "fact_lookup"
+    assert exact_summary.fact_lookup_attempted is True
+    assert exact_summary.fact_rows_returned == 1
+    assert exact_summary.fallback_reason is None
     assert exact_summary.used_expected_path is True
     assert broad_summary.retrieval_mode == "topic_summary"
+    assert broad_summary.fact_lookup_attempted is False
+    assert broad_summary.fact_rows_returned == 0
     assert broad_summary.used_expected_path is True
+
+
+def test_rebuild_entrypoint_populates_expected_contract_facts(monkeypatch) -> None:
+    temp_root = Path(tempfile.gettempdir()) / "epc_smart_search_tests" / f"rebuild_entrypoint_{uuid.uuid4().hex[:8]}"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    pdf_path = temp_root / "Contract.pdf"
+    out_path = temp_root / "rebuilt_contract.db"
+    pdf_path.write_text("stub", encoding="utf-8")
+
+    pages = [
+        PageText(
+            page_num=12,
+            text=(
+                "1.1\n"
+                "Dew Point Heaters\n"
+                "Dew Point Heaters: 4 x 50%\n"
+                "Configuration: 4 x 50%\n"
+            ),
+            ocr_used=False,
+        ),
+        PageText(
+            page_num=13,
+            text=(
+                "1.2\n"
+                "Closed Cooling Water Pumps\n"
+                "Closed Cooling Water Pumps: 2 x 100%\n"
+                "Configuration: 2 x 100%\n"
+            ),
+            ocr_used=False,
+        ),
+    ]
+
+    class _FakeDoc:
+        page_count = 2
+
+        def __enter__(self) -> _FakeDoc:
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr("epc_smart_search.indexer.extract_pages", lambda _path: pages)
+    monkeypatch.setattr("epc_smart_search.indexer.fitz.open", lambda _path: _FakeDoc())
+    monkeypatch.setattr(
+        rebuild_contract_module,
+        "run_smoke_queries",
+        lambda *args, **kwargs: (
+            rebuild_contract_module.SmokeQuerySummary(
+                label="exact",
+                question="What is the configuration of the dew point heaters?",
+                retrieval_mode="fact_lookup",
+                fact_lookup_attempted=True,
+                fact_rows_returned=1,
+                fallback_reason=None,
+                used_expected_path=True,
+                selected_bundle_id="dew-point",
+                answer_text="4 x 50%",
+            ),
+            rebuild_contract_module.SmokeQuerySummary(
+                label="summary",
+                question="Summarize the closed cooling water system",
+                retrieval_mode="topic_summary",
+                fact_lookup_attempted=False,
+                fact_rows_returned=0,
+                fallback_reason="topic_summary_mode",
+                used_expected_path=True,
+                selected_bundle_id="ccw",
+                answer_text="summary",
+            ),
+        ),
+    )
+
+    exit_code = rebuild_contract_module.main(["--pdf", str(pdf_path), "--out", str(out_path)])
+
+    assert exit_code == 0
+    store = ContractStore(out_path)
+    document = store.get_document()
+    assert document is not None
+    document_id = str(document["document_id"])
+    assert store.get_fact_count(document_id) > 0
+    dew_rows = store.lookup_facts_by_system_attribute(document_id, "dew point heaters", "configuration")
+    ccw_rows = store.lookup_facts_by_system_attribute(document_id, "closed cooling water pumps", "configuration")
+    assert [row.value for row in dew_rows] == ["4 x 50%"]
+    assert [row.value for row in ccw_rows] == ["2 x 100%"]

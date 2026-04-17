@@ -14,6 +14,24 @@ from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractFactRow, ContractStore, pack_vector
 
 
+def _build_fact_rows(chunks: list[ChunkRecord]) -> list[ContractFactRow]:
+    return [
+        ContractFactRow(
+            document_id=fact.document_id,
+            system=fact.normalized_system,
+            system_normalized=fact.normalized_system,
+            attribute=fact.normalized_attribute,
+            attribute_normalized=fact.normalized_attribute,
+            value=fact.raw_value,
+            evidence_text=fact.evidence_text,
+            source_chunk_id=fact.source_chunk_id,
+            page_start=fact.page_start,
+            page_end=fact.page_end,
+        )
+        for fact in extract_contract_facts(chunks)
+    ]
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -40,21 +58,12 @@ def build_index(
     chunks = parse_chunks(pages, document_id)
     if progress_callback:
         progress_callback("Extracting contract facts...")
-    facts = [
-        ContractFactRow(
-            document_id=fact.document_id,
-            system=fact.normalized_system,
-            system_normalized=fact.normalized_system,
-            attribute=fact.normalized_attribute,
-            attribute_normalized=fact.normalized_attribute,
-            value=fact.raw_value,
-            evidence_text=fact.evidence_text,
-            source_chunk_id=fact.source_chunk_id,
-            page_start=fact.page_start,
-            page_end=fact.page_end,
+    facts = _build_fact_rows(chunks)
+    if chunks and not facts:
+        raise RuntimeError(
+            "Fact extraction produced zero rows after chunking succeeded. "
+            f"chunks={len(chunks)} document_id={document_id}"
         )
-        for fact in extract_contract_facts(chunks)
-    ]
 
     if progress_callback:
         progress_callback("Building local embeddings...")
@@ -70,7 +79,7 @@ def build_index(
     with fitz.open(str(path)) as doc:
         page_count = doc.page_count
     store = ContractStore(db_path)
-    store.replace_document(
+    write_stats = store.replace_document(
         document_id=document_id,
         display_name=path.name,
         version_label=version_label,
@@ -85,11 +94,24 @@ def build_index(
         model_name=embedder.model_name,
         dimension=embedder.dimension,
     )
+    if chunks and write_stats.fact_rows_inserted <= 0:
+        raise RuntimeError(
+            "Structured facts were extracted but none were inserted into the active SQLite database. "
+            f"db_path={store.db_path} chunks={len(chunks)} fact_candidates={len(facts)}"
+        )
     return {
         "document_id": document_id,
+        "db_path": store.db_path,
         "page_count": page_count,
         "chunk_count": len(chunks),
+        "feature_count": len(features),
         "fact_count": len(facts),
+        "fact_extraction_chunk_count": len(chunks),
+        "fact_candidate_count": len(facts),
+        "fact_rows_inserted": write_stats.fact_rows_inserted,
+        "chunk_rows_inserted": write_stats.chunk_rows_inserted,
+        "feature_rows_inserted": write_stats.feature_rows_inserted,
+        "embedding_rows_inserted": write_stats.embedding_rows_inserted,
     }
 
 
@@ -118,21 +140,17 @@ def refresh_query_index(
         for row in rows
     ]
     features = build_chunk_features(chunks)
-    facts = [
-        ContractFactRow(
-            document_id=fact.document_id,
-            system=fact.normalized_system,
-            system_normalized=fact.normalized_system,
-            attribute=fact.normalized_attribute,
-            attribute_normalized=fact.normalized_attribute,
-            value=fact.raw_value,
-            evidence_text=fact.evidence_text,
-            source_chunk_id=fact.source_chunk_id,
-            page_start=fact.page_start,
-            page_end=fact.page_end,
+    facts = _build_fact_rows(chunks)
+    if chunks and not facts:
+        raise RuntimeError(
+            "Fact extraction produced zero rows while rebuilding the query index. "
+            f"chunks={len(chunks)} document_id={document_id}"
         )
-        for fact in extract_contract_facts(chunks)
-    ]
     store.replace_search_features(document_id, features)
-    store.replace_contract_facts(document_id, facts)
+    inserted = store.replace_contract_facts(document_id, facts)
+    if chunks and inserted <= 0:
+        raise RuntimeError(
+            "Structured facts were extracted but none were inserted while refreshing the query index. "
+            f"db_path={store.db_path} chunks={len(chunks)} fact_candidates={len(facts)}"
+        )
     return len(features)

@@ -6,8 +6,34 @@ from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.fact_extraction import extract_chunk_facts
 from epc_smart_search.indexer import build_index, refresh_query_index
 from epc_smart_search.ocr_support import PageText
+from epc_smart_search.retrieval import HashingEmbedder, HybridRetriever
 from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractStore
+
+
+def _sample_fact_pages() -> list[PageText]:
+    return [
+        PageText(
+            page_num=12,
+            text=(
+                "1.1\n"
+                "Dew Point Heaters\n"
+                "Dew Point Heaters: 4 x 50%\n"
+                "Configuration: 4 x 50%\n"
+            ),
+            ocr_used=False,
+        ),
+        PageText(
+            page_num=13,
+            text=(
+                "1.2\n"
+                "Closed Cooling Water Pumps\n"
+                "Closed Cooling Water Pumps: 2 x 100%\n"
+                "Configuration: 2 x 100%\n"
+            ),
+            ocr_used=False,
+        ),
+    ]
 
 
 def test_extract_chunk_facts_handles_configuration_rows_and_buried_prose() -> None:
@@ -54,16 +80,16 @@ def test_build_index_persists_extracted_contract_facts(monkeypatch) -> None:
     pdf_path.write_text("stub", encoding="utf-8")
 
     pages = [
+        *_sample_fact_pages(),
         PageText(
-            page_num=12,
+            page_num=14,
             text=(
-                "1.1\n"
+                "1.3\n"
                 "Dew Point Heaters\n"
-                "Configuration: 4 x 50%\n"
                 "Service: Fuel gas dew point control\n"
             ),
             ocr_used=False,
-        )
+        ),
     ]
 
     class _FakeDoc:
@@ -85,11 +111,14 @@ def test_build_index_persists_extracted_contract_facts(monkeypatch) -> None:
     service_rows = store.lookup_facts_by_system_attribute(result["document_id"], "dew point heaters", "service")
 
     assert result["fact_count"] >= 2
+    assert result["fact_extraction_chunk_count"] == result["chunk_count"]
+    assert result["fact_candidate_count"] == result["fact_count"]
+    assert result["fact_rows_inserted"] > 0
     assert len(configuration_rows) == 1
     assert configuration_rows[0].value == "4 x 50%"
     assert len(service_rows) == 1
     assert service_rows[0].value == "Fuel gas dew point control"
-    assert service_rows[0].page_start == 12
+    assert service_rows[0].page_start == 14
 
 
 def test_refresh_query_index_rebuilds_contract_facts() -> None:
@@ -129,3 +158,75 @@ def test_refresh_query_index_rebuilds_contract_facts() -> None:
     assert power_rows[0].value == "350 HP"
     assert power_rows[0].page_start == 412
     assert power_rows[0].page_end == 413
+
+
+def test_build_index_fails_loudly_when_chunking_succeeds_without_facts(monkeypatch) -> None:
+    temp_dir = Path(".tmp_test")
+    temp_dir.mkdir(exist_ok=True)
+    pdf_path = temp_dir / "ContractFactsMissing.pdf"
+    db_path = "file:contract_facts_missing?mode=memory&cache=shared"
+    pdf_path.write_text("stub", encoding="utf-8")
+
+    pages = [
+        PageText(
+            page_num=1,
+            text=(
+                "1.1\n"
+                "General\n"
+                "Contractor shall perform the work in accordance with the contract documents.\n"
+            ),
+            ocr_used=False,
+        )
+    ]
+
+    class _FakeDoc:
+        page_count = 1
+
+        def __enter__(self) -> _FakeDoc:
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr("epc_smart_search.indexer.extract_pages", lambda _path: pages)
+    monkeypatch.setattr("epc_smart_search.indexer.fitz.open", lambda _path: _FakeDoc())
+
+    try:
+        build_index(pdf_path=pdf_path, db_path=db_path, version_label="test")
+    except RuntimeError as exc:
+        assert "Fact extraction produced zero rows" in str(exc)
+    else:
+        raise AssertionError("Expected build_index() to fail when chunking succeeds without facts")
+
+
+def test_runtime_trace_returns_fact_rows_for_sample_rebuild(monkeypatch) -> None:
+    temp_dir = Path(".tmp_test")
+    temp_dir.mkdir(exist_ok=True)
+    pdf_path = temp_dir / "ContractFactsTrace.pdf"
+    db_path = "file:contract_facts_trace?mode=memory&cache=shared"
+    pdf_path.write_text("stub", encoding="utf-8")
+
+    class _FakeDoc:
+        page_count = 2
+
+        def __enter__(self) -> _FakeDoc:
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    monkeypatch.setattr("epc_smart_search.indexer.extract_pages", lambda _path: _sample_fact_pages())
+    monkeypatch.setattr("epc_smart_search.indexer.fitz.open", lambda _path: _FakeDoc())
+
+    result = build_index(pdf_path=pdf_path, db_path=db_path, version_label="trace")
+    store = ContractStore(db_path)
+    retriever = HybridRetriever(store, HashingEmbedder())
+
+    trace = retriever.retrieve_trace("What is the configuration of the dew point heaters?")
+
+    assert result["fact_rows_inserted"] > 0
+    assert trace.fact_lookup_attempted is True
+    assert trace.fact_rows_returned > 0
+    assert trace.fallback_reason != "fact_lookup_miss"
+    assert trace.fact_hit is not None
+    assert trace.fact_hit.value == "4 x 50%"

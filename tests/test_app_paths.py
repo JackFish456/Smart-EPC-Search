@@ -185,8 +185,12 @@ def test_resolve_gemma_launch_spec_falls_back_to_lite_when_no_cuda_is_available(
     monkeypatch.setattr(app_paths, "resolve_gemma_test_python", lambda: fake_python)
     monkeypatch.setattr(
         app_paths,
-        "detect_ai_hardware_capability",
-        lambda torch_module=None: HardwareCapability("no_cuda", None, "No supported CUDA/NVIDIA GPU is available for AI mode."),
+        "probe_external_python_runtime",
+        lambda helper_python: app_paths.ExternalPythonRuntimeProbe(
+            capability=HardwareCapability("no_cuda", None, "No supported CUDA/NVIDIA GPU is available for AI mode."),
+            default_model_dir=None,
+            model_error="Model path does not exist.",
+        ),
     )
     monkeypatch.setattr(app_paths, "BUNDLED_MODEL_DIR_MIN", _test_dir("unused_min"))
     monkeypatch.setattr(app_paths, "BUNDLED_MODEL_DIR_HIGH", _test_dir("unused_high"))
@@ -207,8 +211,12 @@ def test_resolve_gemma_launch_spec_rejects_missing_model_override(monkeypatch) -
     monkeypatch.setattr(app_paths, "resolve_gemma_test_python", lambda: fake_python)
     monkeypatch.setattr(
         app_paths,
-        "detect_ai_hardware_capability",
-        lambda torch_module=None: HardwareCapability("cuda_8gb_plus", 8.0, "8 GB CUDA GPU detected."),
+        "probe_external_python_runtime",
+        lambda helper_python: app_paths.ExternalPythonRuntimeProbe(
+            capability=HardwareCapability("cuda_8gb_plus", 8.0, "8 GB CUDA GPU detected."),
+            default_model_dir=fake_python.parent,
+            model_error=None,
+        ),
     )
 
     resolved = app_paths.resolve_gemma_launch_spec()
@@ -217,6 +225,35 @@ def test_resolve_gemma_launch_spec_rejects_missing_model_override(monkeypatch) -
     assert resolved.mode == "external_python"
     assert resolved.tier == "lite"
     assert "not found" in (resolved.reason or "").lower()
+
+
+def test_resolve_gemma_launch_spec_uses_helper_probe_for_external_python(monkeypatch) -> None:
+    fake_python = _test_dir("gemma_helper_external") / "python.exe"
+    fake_python.write_text("", encoding="utf-8")
+    default_model_dir = _test_dir("gemma_helper_model")
+    (default_model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.delenv(app_paths.AI_DISABLE_ENV_VAR, raising=False)
+    monkeypatch.delenv(app_paths.MODEL_DIR_OVERRIDE_ENV_VAR, raising=False)
+    monkeypatch.setattr(app_paths, "is_frozen_app", lambda: False)
+    monkeypatch.setattr(app_paths, "resolve_gemma_test_python", lambda: fake_python)
+    monkeypatch.setattr(
+        app_paths,
+        "probe_external_python_runtime",
+        lambda helper_python: app_paths.ExternalPythonRuntimeProbe(
+            capability=HardwareCapability("cuda_8gb_plus", 8.0, "8 GB CUDA GPU detected."),
+            default_model_dir=default_model_dir,
+            model_error=None,
+        ),
+    )
+
+    resolved = app_paths.resolve_gemma_launch_spec()
+
+    assert resolved.available is True
+    assert resolved.mode == "external_python"
+    assert resolved.tier == "ai_high"
+    assert resolved.service_path == fake_python
+    assert resolved.selected_model_dir == default_model_dir
 
 
 def test_resolve_gemma_launch_spec_valid_manual_override_bypasses_auto_selection(monkeypatch) -> None:

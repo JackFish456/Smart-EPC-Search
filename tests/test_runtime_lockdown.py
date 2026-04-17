@@ -19,6 +19,7 @@ from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.config import GREETING
 from epc_smart_search.ocr_support import PageText
 from epc_smart_search.search_features import build_chunk_features
+from epc_smart_search.storage import ContractFactRow
 from epc_smart_search.storage import ContractStore
 from epc_smart_search.ui.avatar_window import AvatarWindow
 from epc_smart_search.ui.chat_dialog import CONTRACT_DATA_UNAVAILABLE_MESSAGE
@@ -35,6 +36,7 @@ def test_validate_contract_store_accepts_seeded_db_without_pdf_dependency() -> N
     assert status.error is None
     assert status.chunk_count == 1
     assert status.feature_count == 1
+    assert status.fact_count == 1
 
 
 def test_validate_contract_store_rejects_wrong_schema_version() -> None:
@@ -59,6 +61,15 @@ def test_validate_contract_store_rejects_missing_features() -> None:
 
     assert status.ready is False
     assert "missing search features" in (status.error or "").lower()
+
+
+def test_validate_contract_store_rejects_missing_facts() -> None:
+    store = _seed_store(_memory_db_uri("no_facts"), with_facts=False)
+
+    status = validate_contract_store(store)
+
+    assert status.ready is False
+    assert "structured contract facts" in (status.error or "").lower()
 
 
 def test_contract_assistant_build_index_is_internal_only() -> None:
@@ -264,6 +275,9 @@ def test_rebuild_cli_creates_and_validates_a_fresh_database(monkeypatch) -> None
             label="exact",
             question="What is the configuration of the dew point heaters?",
             retrieval_mode="fact_lookup",
+            fact_lookup_attempted=True,
+            fact_rows_returned=1,
+            fallback_reason=None,
             used_expected_path=True,
             selected_bundle_id="dew-point",
             answer_text='"4 x 50%"',
@@ -272,6 +286,9 @@ def test_rebuild_cli_creates_and_validates_a_fresh_database(monkeypatch) -> None
             label="summary",
             question="Summarize the closed cooling water system",
             retrieval_mode="topic_summary",
+            fact_lookup_attempted=False,
+            fact_rows_returned=0,
+            fallback_reason="topic_summary_mode",
             used_expected_path=True,
             selected_bundle_id="ccw-summary",
             answer_text="Closed cooling water summary.",
@@ -309,21 +326,39 @@ def test_rebuild_cli_creates_and_validates_a_fresh_database(monkeypatch) -> None
     assert out_path.exists()
 
 
-def _seed_store(db_path: str | Path, *, with_features: bool = True) -> ContractStore:
+def _seed_store(db_path: str | Path, *, with_features: bool = True, with_facts: bool = True) -> ContractStore:
     store = ContractStore(db_path)
     chunk = ChunkRecord(
         chunk_id="chunk1",
         document_id="doc1",
         chunk_type="section",
         section_number="1",
-        heading="General",
-        full_text="Contractor shall perform the work.",
+        heading="Dew Point Heaters",
+        full_text="Configuration: 4 x 50%",
         page_start=1,
         page_end=1,
         parent_chunk_id=None,
         ordinal_in_document=1,
     )
     features = build_chunk_features([chunk]) if with_features else []
+    facts = (
+        [
+            ContractFactRow(
+                document_id="doc1",
+                system="Dew Point Heaters",
+                system_normalized="dew point heater",
+                attribute="Configuration",
+                attribute_normalized="configuration",
+                value="4 x 50%",
+                evidence_text=chunk.full_text,
+                source_chunk_id=chunk.chunk_id,
+                page_start=1,
+                page_end=1,
+            )
+        ]
+        if with_facts
+        else []
+    )
     store.replace_document(
         document_id="doc1",
         display_name="Contract.pdf",
@@ -334,6 +369,7 @@ def _seed_store(db_path: str | Path, *, with_features: bool = True) -> ContractS
         chunks=[chunk],
         pages=[PageText(page_num=1, text=chunk.full_text, ocr_used=False)],
         features=features,
+        facts=facts,
         embeddings={"chunk1": b"\x00\x00\x00\x00"},
         model_name="test",
         dimension=1,

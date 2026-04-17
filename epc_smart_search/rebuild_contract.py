@@ -43,6 +43,9 @@ class SmokeQuerySummary:
     label: str
     question: str
     retrieval_mode: str
+    fact_lookup_attempted: bool
+    fact_rows_returned: int
+    fallback_reason: str | None
     used_expected_path: bool
     selected_bundle_id: str | None
     answer_text: str
@@ -216,12 +219,18 @@ def run_smoke_queries(
             used_expected_path = (
                 trace.plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
                 and trace.fact_lookup_attempted
+                and trace.fact_rows_returned > 0
                 and trace.fact_hit is not None
+                and trace.fallback_reason not in {"fact_lookup_miss", "no_fact_rows"}
             )
             if not used_expected_path:
                 raise RuntimeError(
-                    "Exact smoke query did not route through fact lookup. "
-                    f"Observed retrieval mode: {trace.plan.retrieval_mode}"
+                    "Exact smoke query did not return a grounded fact hit. "
+                    "Observed "
+                    f"retrieval_mode={trace.plan.retrieval_mode}, "
+                    f"fact_lookup_attempted={trace.fact_lookup_attempted}, "
+                    f"fact_rows_returned={trace.fact_rows_returned}, "
+                    f"fallback_reason={trace.fallback_reason}"
                 )
         else:
             used_expected_path = (
@@ -241,6 +250,9 @@ def run_smoke_queries(
                 label=label,
                 question=question,
                 retrieval_mode=trace.plan.retrieval_mode,
+                fact_lookup_attempted=trace.fact_lookup_attempted,
+                fact_rows_returned=trace.fact_rows_returned,
+                fallback_reason=trace.fallback_reason,
                 used_expected_path=used_expected_path,
                 selected_bundle_id=selected_bundle_id,
                 answer_text=answer.text,
@@ -381,6 +393,9 @@ def _print_smoke_summary(summary: SmokeQuerySummary) -> None:
     print(f"Smoke Query [{summary.label}]")
     print(f"  Question: {summary.question}")
     print(f"  Retrieval Mode: {summary.retrieval_mode}")
+    print(f"  Fact Lookup Attempted: {'yes' if summary.fact_lookup_attempted else 'no'}")
+    print(f"  Fact Rows Returned: {summary.fact_rows_returned}")
+    print(f"  Fallback Reason: {summary.fallback_reason or 'none'}")
     print(f"  Expected Path Used: {'yes' if summary.used_expected_path else 'no'}")
     print(f"  Selected Bundle: {summary.selected_bundle_id or 'n/a'}")
     print(f"  Answer: {summary.answer_text}")
@@ -422,6 +437,19 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Pages: {result.get('page_count', '?')}")
     print(f"Chunks: {result.get('chunk_count', '?')}")
     print(f"Facts: {result.get('fact_count', '?')}")
+    print(
+        "Fact Extraction: "
+        f"chunks_processed={result.get('fact_extraction_chunk_count', '?')}, "
+        f"fact_candidates={result.get('fact_candidate_count', '?')}, "
+        f"fact_rows_inserted={result.get('fact_rows_inserted', '?')}"
+    )
+    print(
+        "SQLite Writes: "
+        f"db_path={result.get('db_path', '?')}, "
+        f"chunk_rows_inserted={result.get('chunk_rows_inserted', '?')}, "
+        f"feature_rows_inserted={result.get('feature_rows_inserted', '?')}, "
+        f"embedding_rows_inserted={result.get('embedding_rows_inserted', '?')}"
+    )
     _print_validation_summary("Validation [output]", output_validation)
     if live_validation is not None:
         _print_validation_summary("Validation [live]", live_validation)

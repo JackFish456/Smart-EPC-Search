@@ -267,6 +267,16 @@ class ContractFactRow:
     attribute_normalized: str = ""
 
 
+@dataclass(slots=True, frozen=True)
+class ReplaceDocumentStats:
+    database_path: str
+    chunk_rows_inserted: int
+    page_rows_inserted: int
+    feature_rows_inserted: int
+    fact_rows_inserted: int
+    embedding_rows_inserted: int
+
+
 def normalize_fact_key(value: str) -> str:
     return normalize_lookup_text(value)
 
@@ -331,7 +341,7 @@ class ContractStore:
         embeddings: dict[str, bytes],
         model_name: str,
         dimension: int,
-    ) -> None:
+    ) -> ReplaceDocumentStats:
         with self._connect() as connection:
             connection.execute(
                 "DELETE FROM chunk_embeddings WHERE chunk_id IN (SELECT chunk_id FROM contract_chunks WHERE document_id = ?)",
@@ -354,7 +364,8 @@ class ContractStore:
                 """,
                 (document_id, display_name, version_label, file_path, sha256, page_count),
             )
-            connection.executemany(
+            chunk_rows_inserted = self._executemany_rowcount(
+                connection,
                 """
                 INSERT INTO contract_chunks (
                     chunk_id, document_id, chunk_type, section_number, heading,
@@ -366,7 +377,8 @@ class ContractStore:
                 """,
                 [asdict(chunk) for chunk in chunks],
             )
-            connection.executemany(
+            page_rows_inserted = self._executemany_rowcount(
+                connection,
                 """
                 INSERT INTO contract_pages (document_id, page_num, page_text, ocr_used)
                 VALUES (?, ?, ?, ?)
@@ -376,9 +388,10 @@ class ContractStore:
                     for page in pages
                 ],
             )
-            self._insert_features(connection, features)
-            self._insert_contract_facts(connection, facts or [])
-            connection.executemany(
+            feature_rows_inserted = self._insert_features(connection, features)
+            fact_rows_inserted = self._insert_contract_facts(connection, facts or [])
+            embedding_rows_inserted = self._executemany_rowcount(
+                connection,
                 """
                 INSERT INTO chunk_embeddings (chunk_id, model_name, vector_blob, dimension)
                 VALUES (?, ?, ?, ?)
@@ -394,10 +407,31 @@ class ContractStore:
                 (str(SEARCH_SCHEMA_VERSION),),
             )
             connection.commit()
+        return ReplaceDocumentStats(
+            database_path=self.db_path,
+            chunk_rows_inserted=chunk_rows_inserted,
+            page_rows_inserted=page_rows_inserted,
+            feature_rows_inserted=feature_rows_inserted,
+            fact_rows_inserted=fact_rows_inserted,
+            embedding_rows_inserted=embedding_rows_inserted,
+        )
 
     @staticmethod
-    def _insert_features(connection: sqlite3.Connection, features: list[ChunkFeatures]) -> None:
-        connection.executemany(
+    def _executemany_rowcount(
+        connection: sqlite3.Connection,
+        sql: str,
+        params: list[dict[str, object]] | list[tuple[object, ...]],
+    ) -> int:
+        if not params:
+            return 0
+        before = connection.total_changes
+        connection.executemany(sql, params)
+        return connection.total_changes - before
+
+    @classmethod
+    def _insert_features(cls, connection: sqlite3.Connection, features: list[ChunkFeatures]) -> int:
+        return cls._executemany_rowcount(
+            connection,
             """
             INSERT INTO chunk_search_features (
                 chunk_id, document_id, section_number, heading, parent_heading,
