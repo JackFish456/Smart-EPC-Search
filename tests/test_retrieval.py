@@ -1,6 +1,6 @@
 from epc_smart_search.chunking import ChunkRecord
 from epc_smart_search.ocr_support import PageText
-from epc_smart_search.query_planner import build_like_fallback, plan_query
+from epc_smart_search.query_planner import REQUEST_SHAPE_BROAD_TOPIC, build_like_fallback, plan_query
 from epc_smart_search.retrieval import HashingEmbedder, HybridRetriever
 from epc_smart_search.search_features import build_chunk_features
 from epc_smart_search.storage import ContractStore, pack_vector
@@ -189,6 +189,51 @@ def test_contract_say_about_queries_strip_boilerplate_for_focus_terms() -> None:
     assert build_like_fallback(plan) == "electric motors"
 
 
+def test_query_plan_extracts_system_and_attribute_for_configuration_question() -> None:
+    plan = plan_query("What is the dew point configuration?")
+
+    assert plan.system_phrase == "dew point"
+    assert plan.system_terms == ("dew", "point")
+    assert plan.attribute_label == "configuration"
+    assert "configuration" in plan.attribute_terms
+
+
+def test_query_plan_normalizes_emission_guarantees_typo_and_keeps_general_intent() -> None:
+    plan = plan_query("what are my emission guarentees")
+
+    assert plan.intent == "general_topic"
+    assert plan.request_shape == "grouped_list"
+    assert plan.answer_family == "guarantee_or_limit"
+    assert plan.aggregate_requested is True
+    assert plan.content_query == "my emission guarantees"
+    assert plan.focus_terms == ("emission", "guarantees")
+    assert plan.concept_terms == ("emission", "guarantees")
+    assert plan.system_terms == ()
+
+
+def test_query_plan_tracks_appendix_scope_for_grouped_guarantee_question() -> None:
+    plan = plan_query("show me all emission guarantees in Appendix E")
+
+    assert plan.request_shape == "grouped_list"
+    assert plan.scope_terms == ("appendix e", "appendix")
+    assert plan.concept_terms == ("emission", "guarantees")
+
+
+def test_query_plan_marks_environmental_requirements_as_broad_topic() -> None:
+    plan = plan_query("do we have any environmental requirements?")
+
+    assert plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
+    assert "environmental" in plan.focus_terms
+    assert "requirements" in plan.focus_terms
+
+
+def test_query_plan_marks_air_permits_prompt_as_broad_topic() -> None:
+    plan = plan_query("give me information about air permits")
+
+    assert plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
+    assert plan.content_query == "air permits"
+
+
 def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> None:
     retriever = _seed_retriever(
         [
@@ -213,6 +258,494 @@ def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> 
 
     assert ranked
     assert ranked[0].chunk_id == "motors"
+
+
+def test_hierarchical_search_prefers_exact_system_and_configuration_clause() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_dew",
+                "3.1",
+                "Dew Point",
+                "Dew point testing shall be completed during commissioning.",
+                10,
+            ),
+            _chunk(
+                "config_clause",
+                "7.4.2",
+                "Fuel Gas Dew Point Configuration",
+                "The fuel gas dew point configuration shall use a duplex analyzer arrangement with automatic switchover.",
+                41,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What is the dew point configuration?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "config_clause"
+
+
+def test_hierarchical_search_prefers_exact_model_clause_over_generic_equipment_text() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_turbine",
+                "9.1",
+                "Steam Turbine",
+                "Turbine components shall comply with the applicable standards for rotating equipment.",
+                18,
+            ),
+            _chunk(
+                "selected_turbine",
+                "9.2",
+                "Selected Turbine Generator",
+                "The selected turbine model shall be Siemens SGT6-5000F for the project.",
+                19,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What is the turbine we are using?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "selected_turbine"
+
+
+def test_hierarchical_search_prefers_exact_design_conditions_clause() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_design",
+                "12.1",
+                "General Design Philosophy",
+                "Design reviews and operating conditions shall be coordinated with the project team.",
+                27,
+            ),
+            _chunk(
+                "compressor_conditions",
+                "12.4.1",
+                "Compressor Design Conditions",
+                "The compressor design conditions shall be 1250 psig discharge pressure and 105 degF inlet temperature.",
+                28,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What are the compressor design conditions?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "compressor_conditions"
+
+
+def test_hierarchical_search_prefers_exact_power_clause_over_random_pump_schedule() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "random_schedule",
+                "6.9",
+                "KV - 480 V",
+                "02-CCW-PMP-01A TRAIN 2 CLOSED COOLING WATER PUMP MOTOR 1A 1200 01-BFW-PMP-01A TRAIN 1 BOILER FEEDWATER PUMP MOTOR 1A 4750 HP.",
+                359,
+            ),
+            _chunk(
+                "fire_water_pump",
+                "8.4.2",
+                "Fire Water Pump",
+                "Each fire water pump shall be rated at 350 HP for the project fire water service.",
+                412,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what is the fire water pump horse power")
+
+    assert ranked
+    assert ranked[0].chunk_id == "fire_water_pump"
+
+
+def test_contract_vocabulary_prefers_exact_multiword_system_over_related_sibling() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "cooling_water_pump",
+                "8.4.1",
+                "Cooling Water Pump",
+                "Each cooling water pump shall be rated at 425 HP for circulating cooling water service.",
+                401,
+            ),
+            _chunk(
+                "fire_water_pump",
+                "8.4.2",
+                "Fire Water Pump",
+                "Each fire water pump shall be rated at 350 HP for the project fire water service.",
+                412,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what is the fire water pumps horse power")
+
+    assert ranked
+    assert ranked[0].chunk_id == "fire_water_pump"
+
+
+def test_contract_vocabulary_uses_heading_alias_without_promoting_wrong_related_match() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "combustion_controls",
+                "9.2",
+                "Combustion Turbine Controls",
+                "Combustion turbine controls shall coordinate startup sequencing and alarms.",
+                55,
+            ),
+            _chunk(
+                "fuel_gas_system",
+                "9.3",
+                "Fuel Gas System (FGS)",
+                "FGS shall include coalescing filters and a gas heater upstream of the turbine skids.",
+                56,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("What does the contract say about the fuel gas system?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "fuel_gas_system"
+
+
+def test_contract_vocabulary_does_not_match_partial_water_pump_modifier_as_exact_system() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "fire_water_pump",
+                "8.4.2",
+                "Fire Water Pump",
+                "Each fire water pump shall be rated at 350 HP for the project fire water service.",
+                412,
+            ),
+            _chunk(
+                "cooling_water_pump",
+                "8.4.3",
+                "Cooling Water Pump",
+                "Each cooling water pump shall be rated at 425 HP for the circulating cooling water service.",
+                413,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what is the cooling water pump horse power")
+
+    assert ranked
+    assert ranked[0].chunk_id == "cooling_water_pump"
+
+
+def test_hierarchical_search_prefers_exact_function_clause() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "install_clause",
+                "5.1",
+                "Fuel Gas System Installation",
+                "Contractor shall install the fuel gas system in accordance with the project drawings.",
+                20,
+            ),
+            _chunk(
+                "function_clause",
+                "5.2",
+                "Fuel Gas System Description",
+                "The fuel gas system receives natural gas from the pipeline, conditions the gas, and distributes it to the combustion turbines.",
+                21,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("How does the fuel gas system work?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "function_clause"
+
+
+def test_grouped_question_prefers_appendix_guarantees_over_generic_emissions_clause() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_emissions",
+                "7.5.3",
+                "Air Permit Test Result",
+                "The submission must include all emissions values and supporting calculations.",
+                83,
+            ),
+            _chunk(
+                "appendix_e",
+                "E",
+                "APPENDIX E - Emission Guarantees",
+                "Emission Guarantees. Seller guarantees NOx emissions shall not exceed 2.0 ppmvd at 15% oxygen.",
+                2686,
+                chunk_type="exhibit",
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what are my emission guarantees")
+
+    assert ranked
+    assert ranked[0].chunk_id == "appendix_e"
+
+
+def test_grouped_question_prefers_performance_guarantee_wording_for_emissions() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_environmental",
+                "13.2.7",
+                "Environmental",
+                "For emissions guarantees, refer to the Performance Guarantees tab of this proposal.",
+                1965,
+            ),
+            _chunk(
+                "performance_guarantees",
+                "H",
+                "EXHIBIT H - PERFORMANCE GUARANTEES",
+                "Seller guarantees as a Minimum Performance Guarantee that NOx emissions shall not exceed 2.0 ppmvd and CO emissions shall not exceed 4.0 ppmvd.",
+                3031,
+                chunk_type="exhibit",
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what are my emission guarantees")
+
+    assert ranked
+    assert ranked[0].chunk_id == "performance_guarantees"
+
+
+def test_grouped_question_returns_related_appendix_results_as_bundle_candidates() -> None:
+    appendix = _chunk(
+        "appendix_e",
+        "E",
+        "APPENDIX E - Emission Guarantees",
+        "Emission Guarantees.",
+        2686,
+        chunk_type="exhibit",
+    )
+    sibling = _chunk(
+        "appendix_e_limits",
+        "E.1",
+        "Guarantee Limits",
+        "Seller guarantees NOx emissions shall not exceed 2.0 ppmvd at 15% oxygen. CO emissions shall not exceed 4.0 ppmvd at 15% oxygen.",
+        2687,
+        parent_chunk_id="appendix_e",
+    )
+    retriever = _seed_retriever([appendix, sibling])
+
+    ranked = retriever.retrieve("show me all emission guarantees in appendix e")
+
+    assert ranked
+    assert {ranked[0].chunk_id, ranked[1].chunk_id} == {"appendix_e", "appendix_e_limits"}
+
+
+def test_appendix_anchor_bundle_reaches_nearby_guarantee_sections_without_parent_links() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "appendix_e",
+                "E",
+                "APPENDIX E - Facility Guarantees",
+                "Facility Guarantees.",
+                100,
+                chunk_type="exhibit",
+            ),
+            _chunk(
+                "appendix_e_emissions",
+                "1.9",
+                "Auxiliary Boiler Emissions Guarantees",
+                "NOx shall not exceed 0.036 lb/mmbtu HHV and CO shall not exceed 50 ppmvd corrected to 3% O2.",
+                102,
+            ),
+            _chunk(
+                "generic_environmental",
+                "13.2.7",
+                "Environmental",
+                "For emissions guarantees, refer to the performance guarantees tab of this proposal.",
+                300,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what are my emission guarantees in appendix e")
+
+    assert ranked
+    assert ranked[0].chunk_id == "appendix_e_emissions"
+
+
+def test_specific_appendix_scope_does_not_collapse_to_any_appendix() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "appendix_aa_noise",
+                "AA",
+                "APPENDIX AA - Air Permit",
+                "Opacity of emissions from the combustion sources shall not exceed 5 percent.",
+                300,
+                chunk_type="exhibit",
+            ),
+            _chunk(
+                "appendix_e",
+                "E",
+                "APPENDIX E - Facility Guarantees",
+                "Facility Guarantees.",
+                100,
+                chunk_type="exhibit",
+            ),
+            _chunk(
+                "appendix_e_emissions",
+                "1.9",
+                "Auxiliary Boiler Emissions Guarantees",
+                "NOx shall not exceed 0.036 lb/mmbtu HHV and CO shall not exceed 50 ppmvd corrected to 3% O2.",
+                102,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what are my emission guarantees in appendix e")
+
+    assert ranked
+    assert ranked[0].chunk_id == "appendix_e_emissions"
+
+
+def test_retrieve_trace_prefers_semantic_system_clause_over_heading_only_noise() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "ccw_heading_only",
+                "3",
+                "Closed Cooling Water Pump",
+                "3",
+                1485,
+            ),
+            _chunk(
+                "ccw_system",
+                "5.18",
+                "Closed Cooling Water",
+                "The Closed Cooling Water System major components include two 100% capacity, horizontal, closed cooling water pumps.",
+                261,
+            ),
+        ]
+    )
+
+    trace = retriever.retrieve_trace("what is the closed cooling water pump configuration")
+
+    assert trace.selected_bundle is not None
+    assert trace.selected_bundle.ranked_chunks[0].chunk_id == "ccw_system"
+    assert any(chunk.chunk_id == "ccw_heading_only" for chunk in trace.recall_sources["raw_fts"])
+    assert any(chunk.chunk_id == "ccw_system" for chunk in trace.recall_sources["semantic"])
+
+
+def test_retrieve_trace_can_use_gemma_to_break_close_bundle_ties() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "candidate_a",
+                "9.1",
+                "Selected Turbine",
+                "The selected turbine model shall be Siemens SGT6-5000F for the project.",
+                18,
+            ),
+            _chunk(
+                "candidate_b",
+                "9.2",
+                "Selected Turbine Generator",
+                "The selected turbine model shall be Mitsubishi M701F for the project.",
+                19,
+            ),
+        ]
+    )
+
+    class FakeGemma:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str]] = []
+
+        def ask(self, question: str, context: str, **kwargs):
+            self.calls.append({"question": question, "context": context, **kwargs})
+            return '{"candidate_id":"candidate_b","supporting_quote":"Mitsubishi M701F","insufficient_support":false}'
+
+    fake_gemma = FakeGemma()
+    retriever._should_use_gemma_disambiguation = lambda bundles: True  # type: ignore[method-assign]
+
+    trace = retriever.retrieve_trace("What is the turbine we are using?", gemma_client=fake_gemma)
+
+    assert trace.used_gemma_disambiguation is True
+    assert trace.selected_bundle is not None
+    assert trace.selected_bundle.bundle_id == "candidate_b"
+    assert trace.selected_bundle.supporting_quote == "Mitsubishi M701F"
+    assert fake_gemma.calls[0]["response_style"] == "candidate_select"
+    assert "Candidate ID: candidate_a" in fake_gemma.calls[0]["context"]
+    assert "Candidate ID: candidate_b" in fake_gemma.calls[0]["context"]
+
+
+def test_broad_topic_environmental_requirements_prefers_requirement_clause_over_appendix_header() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "appendix_header",
+                "AA",
+                "APPENDIX AA",
+                "Appendix AA contains administrative materials and reference exhibits for the project.",
+                9,
+                chunk_type="exhibit",
+            ),
+            _chunk(
+                "definition_only",
+                "1.2",
+                "Applicable Legal Requirements",
+                '"Applicable Legal Requirements" means all laws, Environmental Laws, permits, approvals, and similar legal requirements.',
+                10,
+                chunk_type="definition",
+            ),
+            _chunk(
+                "env_requirements",
+                "7.4",
+                "Environmental Requirements",
+                "Contractor shall obtain required environmental permits, maintain compliance with permit conditions, and submit testing results that demonstrate emissions compliance.",
+                11,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("do we have any environmental requirements?")
+
+    assert ranked
+    assert ranked[0].chunk_id == "env_requirements"
+
+
+def test_broad_topic_air_permits_prefers_operational_clause_over_acronyms() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "acronyms",
+                "A.1",
+                "Common Acronyms in Air Permits",
+                "APD = Air Permits. AMOC = alternate means of control. acfm = actual cubic feet per minute.",
+                14,
+                chunk_type="definition",
+            ),
+            _chunk(
+                "permit_clause",
+                "8.5",
+                "Air Permit Compliance",
+                "Contractor shall obtain air permits, perform required emissions testing, and demonstrate ongoing compliance with air permit conditions.",
+                15,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("give me information about air permits")
+
+    assert ranked
+    assert ranked[0].chunk_id == "permit_clause"
 
 
 def test_deep_profile_prefers_specific_clause_over_generic_match() -> None:
@@ -349,6 +882,7 @@ def _chunk(
     page_num: int,
     *,
     chunk_type: str = "section",
+    parent_chunk_id: str | None = None,
 ) -> ChunkRecord:
     return ChunkRecord(
         chunk_id=chunk_id,
@@ -359,6 +893,6 @@ def _chunk(
         full_text=full_text,
         page_start=page_num,
         page_end=page_num,
-        parent_chunk_id=None,
+        parent_chunk_id=parent_chunk_id,
         ordinal_in_document=page_num,
     )

@@ -10,10 +10,22 @@ from epc_smart_search.search_features import (
     expand_query_phrases,
     normalize_text,
 )
+from epc_smart_search.system_vocabulary import SystemVocabulary, system_significant_terms
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-]{1,}")
 SECTION_QUERY_RE = re.compile(r"\b(?:section|sec\.?)\s*(\d+(?:\.\d+){0,5})\b", re.IGNORECASE)
 BARE_SECTION_RE = re.compile(r"^\s*(\d+(?:\.\d+){0,5})\s*$")
+SCOPE_TERM_RE = re.compile(r"\b(?:appendix|exhibit|attachment)(?:\s+[A-Za-z0-9.\-]+)?\b", re.IGNORECASE)
+
+REQUEST_SHAPE_SCALAR = "scalar"
+REQUEST_SHAPE_GROUPED_LIST = "grouped_list"
+REQUEST_SHAPE_REFERENCE_LOOKUP = "reference_lookup"
+REQUEST_SHAPE_DEFINITION = "definition"
+REQUEST_SHAPE_RESPONSIBILITY = "responsibility"
+REQUEST_SHAPE_DIRECT_TEXT = "direct_text"
+REQUEST_SHAPE_BROAD_TOPIC = "broad_topic"
+
+ANSWER_FAMILY_GUARANTEE_OR_LIMIT = "guarantee_or_limit"
 
 
 @dataclass(slots=True, frozen=True)
@@ -22,21 +34,47 @@ class QueryPlan:
     normalized_query: str
     content_query: str
     intent: str
+    request_shape: str
     section_number: str | None
     count_question: bool
     direct_text_question: bool
     focus_terms: tuple[str, ...]
+    concept_terms: tuple[str, ...]
+    scope_terms: tuple[str, ...]
     actor_terms: tuple[str, ...]
     action_terms: tuple[str, ...]
     topic_terms: tuple[str, ...]
     expansion_terms: tuple[str, ...]
+    aggregate_requested: bool = False
+    answer_family: str | None = None
+    system_phrase: str = ""
+    system_terms: tuple[str, ...] = ()
+    system_aliases: tuple[str, ...] = ()
+    attribute_label: str | None = None
+    attribute_terms: tuple[str, ...] = ()
+    system_significant_terms: tuple[str, ...] = ()
 
     @property
     def all_terms(self) -> tuple[str, ...]:
-        return _dedupe(self.focus_terms + self.actor_terms + self.action_terms + self.topic_terms + self.expansion_terms)
+        return _dedupe(
+            self.concept_terms
+            + self.scope_terms
+            + self.system_terms
+            + self.attribute_terms
+            + self.focus_terms
+            + self.actor_terms
+            + self.action_terms
+            + self.topic_terms
+            + self.expansion_terms
+        )
 
 
 QUERY_PREFIXES = (
+    "give me information about ",
+    "information about ",
+    "give me details about ",
+    "details about ",
+    "overview of ",
     "what does the contract say about ",
     "what does it say about ",
     "does the contract mention ",
@@ -54,20 +92,27 @@ STOPWORDS = {
     "a",
     "an",
     "about",
+    "any",
+    "all",
     "and",
     "are",
     "by",
     "contract",
     "does",
+    "details",
     "exact",
     "for",
     "from",
+    "give",
     "how",
+    "information",
     "in",
     "is",
     "it",
     "many",
     "me",
+    "my",
+    "list",
     "mention",
     "provide",
     "provided",
@@ -82,12 +127,79 @@ STOPWORDS = {
     "that",
     "the",
     "this",
+    "overview",
+    "your",
     "to",
     "what",
 }
 
+SYSTEM_FILLER = STOPWORDS | {
+    "current",
+    "do",
+    "does",
+    "did",
+    "we",
+    "our",
+    "using",
+    "use",
+    "used",
+    "work",
+    "works",
+}
 
-def plan_query(query: str) -> QueryPlan:
+ATTRIBUTE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("design_conditions", ("design conditions", "design condition", "operating conditions", "operating condition", "design basis")),
+    ("configuration", ("configuration", "configured", "arrangement", "arranged")),
+    ("size", ("size", "sizes", "diameter", "rating", "dimensions")),
+    ("capacity", ("capacity", "capacities", "output", "duty", "throughput")),
+    ("power", ("horsepower", "horse power", "hp", "kw", "kilowatt", "kilowatts", "motor power")),
+    ("pressure", ("pressure", "pressures", "psig", "psi")),
+    ("temperature", ("temperature", "temperatures")),
+    ("flow", ("flow", "flows", "flowrate", "flow rate", "throughput")),
+    ("type", ("type", "kind", "model", "selected", "selection")),
+    ("definition", ("defined", "definition", "means", "meaning")),
+)
+
+QUESTION_TAIL_PATTERNS = (
+    r"\bdo we have$",
+    r"\bdo we use$",
+    r"\bare we using$",
+    r"\bis used$",
+    r"\bare there$",
+    r"\bis there$",
+    r"\bdo we need$",
+    r"\bdo we require$",
+)
+
+ATTRIBUTE_LABEL_TERMS: dict[str, tuple[str, ...]] = {
+    "configuration": ("configuration", "configured", "arrangement"),
+    "design_conditions": ("design conditions", "design condition", "design basis", "operating conditions"),
+    "type": ("type", "kind", "model", "selected", "manufacturer"),
+    "size": ("size", "diameter", "rating", "dimension"),
+    "capacity": ("capacity", "output", "duty", "throughput"),
+    "power": ("horsepower", "horse power", "hp", "kw", "kilowatt", "motor power"),
+    "pressure": ("pressure", "pressures", "psi", "psig"),
+    "temperature": ("temperature", "temperatures"),
+    "flow": ("flow", "flow rate", "flowrate", "throughput"),
+    "responsibility": ("responsible", "provide", "provided", "supply", "furnish"),
+    "definition": ("means", "defined", "definition"),
+    "function": ("work", "works", "operate", "operation", "process"),
+}
+
+GENERIC_SYSTEM_HEADS = {
+    "system",
+    "systems",
+    "equipment",
+    "package",
+    "packages",
+    "module",
+    "modules",
+    "unit",
+    "units",
+}
+
+
+def plan_query(query: str, system_vocabulary: SystemVocabulary | None = None) -> QueryPlan:
     normalized = normalize_text(query)
     content_query = _extract_content_query(normalized)
     section_number = _extract_section_number(query)
@@ -100,13 +212,39 @@ def plan_query(query: str) -> QueryPlan:
     topic_terms = _match_labels(content_query, TOPIC_LEXICON)
     expansion_terms = tuple(expand_query_phrases(normalized))
     focus_terms = _focus_terms(content_query)
+    scope_terms = _detect_scope_terms(normalized, content_query)
+    attribute_label, attribute_terms = _detect_attribute(normalized, content_query)
+    answer_family = _detect_answer_family(normalized, content_query, focus_terms)
+    aggregate_requested = _detect_aggregate_request(normalized, attribute_label, answer_family, focus_terms)
+    extracted_system_phrase = _extract_system_phrase(content_query, attribute_terms, attribute_label)
+    matched_system = system_vocabulary.match(content_query, extracted_system_phrase) if system_vocabulary and extracted_system_phrase else None
+    broad_topic_requested = _detect_broad_topic_request(
+        normalized,
+        content_query,
+        extracted_system_phrase,
+        matched_system.canonical_phrase if matched_system is not None else "",
+        attribute_label,
+        count_question,
+        direct_text_question,
+        aggregate_requested,
+        answer_family,
+        focus_terms,
+    )
 
     intent = "general_topic"
     if section_number:
         intent = "section_lookup"
     elif count_question or direct_text_question:
         intent = "direct_text"
-    elif normalized.startswith(("what is ", "what are ", "define ", "meaning of ")) or " definition" in normalized:
+    elif attribute_label == "definition" or (
+        attribute_label is None
+        and (
+            normalized.startswith(("what is ", "define ", "meaning of "))
+            or " definition" in normalized
+            or " defined as " in normalized
+            or " means " in normalized
+        )
+    ):
         intent = "definition"
     elif "responsible for" in normalized or normalized.startswith("who "):
         intent = "responsibility"
@@ -118,20 +256,53 @@ def plan_query(query: str) -> QueryPlan:
         intent = "delay_schedule"
 
     topic_terms = _refine_topic_terms(normalized, content_query, topic_terms, intent)
+    request_shape = _determine_request_shape(
+        intent,
+        section_number,
+        count_question,
+        direct_text_question,
+        aggregate_requested,
+        answer_family,
+        broad_topic_requested,
+    )
+    concept_terms = _detect_concept_terms(content_query, scope_terms, attribute_terms, focus_terms, request_shape)
+
+    bind_system_phrase = request_shape not in {REQUEST_SHAPE_GROUPED_LIST, REQUEST_SHAPE_BROAD_TOPIC}
+    extracted_system_phrase = extracted_system_phrase if bind_system_phrase else ""
+    matched_system = matched_system if bind_system_phrase else None
+    system_phrase = matched_system.canonical_phrase if matched_system is not None else extracted_system_phrase
+    system_terms = matched_system.terms if matched_system is not None else _focus_terms(system_phrase)
+    system_aliases = (
+        _dedupe(((extracted_system_phrase,) if extracted_system_phrase else ()) + matched_system.aliases)
+        if matched_system is not None
+        else _system_aliases(system_phrase, system_terms)
+    )
+    system_significant = system_significant_terms(system_terms)
 
     return QueryPlan(
         raw_query=query,
         normalized_query=normalized,
         content_query=content_query,
         intent=intent,
+        request_shape=request_shape,
         section_number=section_number,
         count_question=count_question,
         direct_text_question=direct_text_question,
         focus_terms=focus_terms,
+        concept_terms=concept_terms,
+        scope_terms=scope_terms,
         actor_terms=actor_terms,
         action_terms=action_terms,
         topic_terms=topic_terms,
         expansion_terms=expansion_terms,
+        aggregate_requested=aggregate_requested,
+        answer_family=answer_family,
+        system_phrase=system_phrase,
+        system_terms=system_terms,
+        system_aliases=system_aliases,
+        attribute_label=attribute_label,
+        attribute_terms=attribute_terms,
+        system_significant_terms=system_significant,
     )
 
 
@@ -139,10 +310,10 @@ def build_match_queries(plan: QueryPlan) -> list[str]:
     queries: list[str] = []
     if plan.section_number:
         queries.append(f'section_number : "{plan.section_number}"')
-    heading_terms = list((plan.topic_terms + plan.action_terms + plan.expansion_terms)[:5])
+    heading_terms = list((plan.scope_terms + plan.concept_terms + plan.topic_terms + plan.action_terms + plan.expansion_terms)[:6])
     if heading_terms:
         heading_parts = [f'heading : "{term}"' for term in heading_terms]
-        heading_parts.extend(f'parent_heading : "{term}"' for term in heading_terms[:2])
+        heading_parts.extend(f'parent_heading : "{term}"' for term in heading_terms[:3])
         queries.append(" OR ".join(heading_parts))
     tag_parts: list[str] = []
     tag_parts.extend(f'actor_tags : "{term}"' for term in plan.actor_terms)
@@ -160,6 +331,14 @@ def build_match_queries(plan: QueryPlan) -> list[str]:
 
 
 def build_like_fallback(plan: QueryPlan) -> str:
+    if plan.system_phrase and plan.attribute_terms:
+        return " ".join([plan.system_phrase, *plan.attribute_terms[:3]]).strip()
+    if plan.concept_terms and plan.scope_terms:
+        return " ".join([*plan.scope_terms[:2], *plan.concept_terms[:4]]).strip()
+    if plan.concept_terms:
+        return " ".join(plan.concept_terms[:6]).strip()
+    if plan.system_phrase:
+        return plan.system_phrase
     tokens = list(_token_terms(plan))
     if not tokens:
         return plan.content_query
@@ -191,6 +370,8 @@ def _extract_content_query(normalized_query: str) -> str:
             content = content[len(prefix):]
             break
     content = content.strip(" ?.!")
+    for pattern in QUESTION_TAIL_PATTERNS:
+        content = re.sub(pattern, "", content).strip()
     return content or normalized_query
 
 
@@ -201,6 +382,186 @@ def _focus_terms(content_query: str) -> tuple[str, ...]:
         if len(token) > 2 and normalize_text(token) not in STOPWORDS and normalize_text(token) not in ACTOR_LEXICON
     ]
     return _dedupe(tuple(tokens))
+
+
+def _detect_attribute(normalized_query: str, content_query: str) -> tuple[str | None, tuple[str, ...]]:
+    content = f" {content_query} "
+    normalized = f" {normalized_query} "
+    if normalized_query.startswith(("how does ", "how do ")) or content_query.endswith((" work", " works")):
+        return "function", ATTRIBUTE_LABEL_TERMS["function"]
+    if re.search(r"\bwe (?:are )?using\b", normalized_query) or re.search(r"\b(?:using|used)\b", content_query):
+        return "type", ATTRIBUTE_LABEL_TERMS["type"]
+    if re.search(
+        r"\b(who is responsible|who provides|who furnishes|who supplies|provided by|responsible for|required to provide|required to furnish|required to supply)\b",
+        normalized_query,
+    ):
+        return "responsibility", ATTRIBUTE_LABEL_TERMS["responsibility"]
+    for label, patterns in ATTRIBUTE_PATTERNS:
+        if any(f" {normalize_text(pattern)} " in normalized or f" {normalize_text(pattern)} " in content for pattern in patterns):
+            return label, ATTRIBUTE_LABEL_TERMS[label]
+    return None, ()
+
+
+def _detect_scope_terms(normalized_query: str, content_query: str) -> tuple[str, ...]:
+    candidates = list(SCOPE_TERM_RE.findall(normalized_query))
+    candidates.extend(SCOPE_TERM_RE.findall(content_query))
+    normalized_candidates: list[str] = []
+    for candidate in candidates:
+        cleaned = normalize_text(candidate)
+        if not cleaned:
+            continue
+        normalized_candidates.append(cleaned)
+        normalized_candidates.append(cleaned.split()[0])
+    return _dedupe(tuple(normalized_candidates))
+
+
+def _detect_answer_family(normalized_query: str, content_query: str, focus_terms: tuple[str, ...]) -> str | None:
+    combined = f" {normalized_query} {content_query} "
+    markers = ("guarantee", "guarantees", "guaranteed", "limit", "limits")
+    if any(f" {marker} " in combined for marker in markers):
+        return ANSWER_FAMILY_GUARANTEE_OR_LIMIT
+    if "shall not exceed" in combined and any(term in focus_terms for term in ("emission", "emissions", "nox", "co")):
+        return ANSWER_FAMILY_GUARANTEE_OR_LIMIT
+    return None
+
+
+def _detect_aggregate_request(
+    normalized_query: str,
+    attribute_label: str | None,
+    answer_family: str | None,
+    focus_terms: tuple[str, ...],
+) -> bool:
+    if attribute_label is not None:
+        return False
+    wrapped = f" {normalized_query} "
+    if any(phrase in wrapped for phrase in (" all ", " list ", " show me all ", " give me all ")):
+        return True
+    if normalized_query.startswith("what are ") and answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT:
+        return True
+    return any(term in {"guarantees", "limits", "requirements", "values"} for term in focus_terms)
+
+
+def _determine_request_shape(
+    intent: str,
+    section_number: str | None,
+    count_question: bool,
+    direct_text_question: bool,
+    aggregate_requested: bool,
+    answer_family: str | None,
+    broad_topic_requested: bool,
+) -> str:
+    if section_number:
+        return REQUEST_SHAPE_REFERENCE_LOOKUP
+    if aggregate_requested and answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT:
+        return REQUEST_SHAPE_GROUPED_LIST
+    if broad_topic_requested:
+        return REQUEST_SHAPE_BROAD_TOPIC
+    if count_question or direct_text_question:
+        return REQUEST_SHAPE_DIRECT_TEXT
+    if intent == "definition":
+        return REQUEST_SHAPE_DEFINITION
+    if intent == "responsibility":
+        return REQUEST_SHAPE_RESPONSIBILITY
+    return REQUEST_SHAPE_SCALAR
+
+
+def _detect_concept_terms(
+    content_query: str,
+    scope_terms: tuple[str, ...],
+    attribute_terms: tuple[str, ...],
+    focus_terms: tuple[str, ...],
+    request_shape: str,
+) -> tuple[str, ...]:
+    scope_tokens = {normalize_text(token) for scope in scope_terms for token in TOKEN_RE.findall(scope)}
+    attribute_tokens = {normalize_text(token) for phrase in attribute_terms for token in TOKEN_RE.findall(phrase)}
+    content_tokens = [
+        normalize_text(token)
+        for token in TOKEN_RE.findall(content_query)
+        if normalize_text(token) not in STOPWORDS and normalize_text(token) not in scope_tokens
+    ]
+    if request_shape == REQUEST_SHAPE_GROUPED_LIST:
+        return _dedupe(tuple(token for token in content_tokens if token not in attribute_tokens))
+    return _dedupe(tuple(token for token in focus_terms if token not in attribute_tokens and token not in scope_tokens))
+
+
+def _detect_broad_topic_request(
+    normalized_query: str,
+    content_query: str,
+    extracted_system_phrase: str,
+    matched_system_phrase: str,
+    attribute_label: str | None,
+    count_question: bool,
+    direct_text_question: bool,
+    aggregate_requested: bool,
+    answer_family: str | None,
+    focus_terms: tuple[str, ...],
+) -> bool:
+    if count_question or direct_text_question or attribute_label is not None:
+        return False
+    if aggregate_requested and answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT:
+        return False
+    normalized = f" {normalized_query} "
+    broad_prefixes = (
+        "give me information about ",
+        "information about ",
+        "give me details about ",
+        "details about ",
+        "overview of ",
+        "what do we have about ",
+    )
+    if normalized_query.startswith(broad_prefixes):
+        return True
+    if normalized_query.startswith(("do we have any ", "do we have ")) and len(focus_terms) >= 2:
+        return True
+    broad_markers = {"requirements", "requirement", "permits", "permit", "permitting", "environmental", "compliance"}
+    if not any(marker in focus_terms for marker in broad_markers):
+        return False
+    canonical_system = matched_system_phrase or extracted_system_phrase
+    if canonical_system and len(TOKEN_RE.findall(canonical_system)) >= 3:
+        return False
+    if " environmental requirements " in normalized or " air permits " in normalized or " permit requirements " in normalized:
+        return True
+    return any(marker in focus_terms for marker in broad_markers)
+
+
+def _extract_system_phrase(content_query: str, attribute_terms: tuple[str, ...], attribute_label: str | None) -> str:
+    if not content_query:
+        return ""
+    attribute_words = {
+        word
+        for phrase in attribute_terms
+        for word in TOKEN_RE.findall(phrase)
+    }
+    if attribute_label == "function":
+        attribute_words.update({"work", "works", "operate", "operation"})
+    tokens = [
+        normalize_text(token)
+        for token in TOKEN_RE.findall(content_query)
+        if normalize_text(token) not in SYSTEM_FILLER and normalize_text(token) not in attribute_words
+    ]
+    if not tokens:
+        return ""
+    return " ".join(tokens)
+
+
+def _system_aliases(system_phrase: str, system_terms: tuple[str, ...]) -> tuple[str, ...]:
+    if not system_phrase:
+        return ()
+    aliases: list[str] = []
+    singularized = _singularize_phrase(system_phrase)
+    if singularized != system_phrase:
+        aliases.append(singularized)
+    return _dedupe(tuple(alias for alias in aliases if alias and alias != system_phrase))
+
+
+def _singularize_phrase(phrase: str) -> str:
+    terms = list(_focus_terms(phrase))
+    if not terms:
+        return phrase
+    tail = terms[-1]
+    if len(tail) > 3 and tail.endswith("s") and not tail.endswith("ss"):
+        terms[-1] = tail[:-1]
+    return " ".join(terms)
 
 
 def _refine_topic_terms(

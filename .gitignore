@@ -10,6 +10,7 @@ venv/
 .eggs/
 dist/
 build/
+release/
 *.spec
 
 # Tests / coverage
@@ -18,9 +19,11 @@ build/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+pytest-cache-files-*/
 
 # Local test artifacts
 .tmp_test/
+/LOW_SPEC_AI_CODEX_PROMPT.md
 
 # Local app data (workspace fallback under repo root; see app_paths.get_app_data_root)
 .epc_smart_search/

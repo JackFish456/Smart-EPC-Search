@@ -2,14 +2,23 @@ from __future__ import annotations
 
 import atexit
 import json
+import os
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
 
-from epc_smart_search.app_paths import APP_DATA_ROOT, GEMMA_TEST_PYTHON, WORKSPACE_ROOT
+from epc_smart_search.app_paths import APP_DATA_ROOT, INSTALL_ROOT, MODEL_DIR_OVERRIDE_ENV_VAR, WORKSPACE_ROOT, resolve_gemma_launch_spec
 from epc_smart_search.config import GEMMA_SERVICE_HOST, GEMMA_SERVICE_PORT
+
+
+@dataclass(slots=True, frozen=True)
+class GemmaAvailability:
+    available: bool
+    message: str
+    mode: str
 
 
 class GemmaServiceClient:
@@ -24,26 +33,47 @@ class GemmaServiceClient:
         self.stderr_log_path = APP_DATA_ROOT / "gemma_service.stderr.log"
         atexit.register(self.stop)
 
+    def get_availability(self) -> GemmaAvailability:
+        launch_spec = resolve_gemma_launch_spec()
+        if launch_spec.available:
+            if launch_spec.tier == "ai_high":
+                return GemmaAvailability(True, "AI-High mode is available on this machine.", launch_spec.mode)
+            if launch_spec.tier == "ai_min":
+                return GemmaAvailability(True, "AI-Min mode is available on this machine.", launch_spec.mode)
+            if launch_spec.mode == "bundled_service":
+                return GemmaAvailability(True, "AI mode is available in this build.", launch_spec.mode)
+            return GemmaAvailability(True, "AI mode is available from the local Gemma environment.", launch_spec.mode)
+        return GemmaAvailability(
+            False,
+            launch_spec.reason or "AI mode unavailable on this machine; citation mode is active.",
+            launch_spec.mode,
+        )
+
+    def is_available(self) -> bool:
+        return self.get_availability().available
+
     def ensure_running(self) -> None:
         if self._is_healthy():
             return
-        if not GEMMA_TEST_PYTHON.exists():
-            raise RuntimeError(
-                f"Gemma Python not found: {GEMMA_TEST_PYTHON}\n"
-                "Set EPC_GEMMA_PYTHON or EPC_GEMMA_TEST_ROOT to your Gemma environment."
-            )
+        launch_spec = resolve_gemma_launch_spec()
+        if not launch_spec.available or launch_spec.service_path is None:
+            raise RuntimeError(launch_spec.reason or "AI mode unavailable on this machine; citation mode is active.")
 
         self._stdout_handle = self.stdout_log_path.open("a", encoding="utf-8")
         self._stderr_handle = self.stderr_log_path.open("a", encoding="utf-8")
         self._write_launch_banner()
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        launch_env = self._build_launch_env(launch_spec.selected_model_dir)
+        command = self._build_launch_command(launch_spec, self.port)
+        launch_cwd = launch_spec.service_path.parent if launch_spec.mode == "bundled_service" else WORKSPACE_ROOT
         self._process = subprocess.Popen(
-            [str(GEMMA_TEST_PYTHON), str(WORKSPACE_ROOT / "gemma_service.py"), "--port", str(self.port)],
-            cwd=str(WORKSPACE_ROOT),
+            command,
+            cwd=str(launch_cwd if launch_cwd.exists() else INSTALL_ROOT),
             stdout=self._stdout_handle,
             stderr=self._stderr_handle,
             text=True,
             creationflags=creation_flags,
+            env=launch_env,
         )
 
         deadline = time.time() + 90
@@ -136,3 +166,16 @@ class GemmaServiceClient:
         if not path.exists():
             return ""
         return path.read_text(encoding="utf-8", errors="replace")[-limit:].strip()
+
+    @staticmethod
+    def _build_launch_command(launch_spec, port: int) -> list[str]:
+        if launch_spec.mode == "bundled_service":
+            return [str(launch_spec.service_path), "--port", str(port)]
+        return [str(launch_spec.service_path), str(WORKSPACE_ROOT / "gemma_service.py"), "--port", str(port)]
+
+    @staticmethod
+    def _build_launch_env(model_dir: Path | None) -> dict[str, str]:
+        launch_env = dict(os.environ)
+        if model_dir is not None:
+            launch_env[MODEL_DIR_OVERRIDE_ENV_VAR] = str(model_dir)
+        return launch_env
