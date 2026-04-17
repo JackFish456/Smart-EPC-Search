@@ -119,17 +119,28 @@ class AnswerPolicy:
         effective_question = self.resolve_question(question, history)
         grounded_question = self.normalize_grounded_question(effective_question)
         plan = self._plan_query(grounded_question)
-        fact_answer = None if deep_think or expand_answer else self.build_fact_answer(grounded_question, plan=plan)
+        trace = None
+        if not deep_think and not expand_answer and plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP:
+            trace = self._retrieve_trace(grounded_question, gemma_client, deep_think=deep_think)
+        fact_answer = None if deep_think or expand_answer else self.build_fact_answer(grounded_question, plan=plan, trace=trace)
         if fact_answer is not None:
             return fact_answer
         exact_hits = self.retriever.find_exact_page_hits(grounded_question)
         exact_answer = None if expand_answer else self.build_exact_answer(grounded_question, exact_hits)
-        if exact_answer is not None and not deep_think:
+        if (
+            exact_answer is not None
+            and not deep_think
+            and not (
+                plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
+                and exact_answer.text.startswith("Direct contract text:\n")
+            )
+        ):
             return exact_answer
 
         broad_topic_request = plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
         summary_request = broad_topic_request or self.prefers_generated_answer(question)
-        trace = self._retrieve_trace(grounded_question, gemma_client, deep_think=deep_think)
+        if trace is None:
+            trace = self._retrieve_trace(grounded_question, gemma_client, deep_think=deep_think)
         if broad_topic_request and trace is not None:
             ranked = list(trace.merged_ranked)
             citations = self.citations_from_ranked(ranked, grounded_question)
@@ -313,11 +324,18 @@ class AnswerPolicy:
         question: str,
         *,
         plan: QueryPlan | None = None,
+        trace=None,
     ) -> AssistantAnswer | None:
         if self.store is None or self.retriever is None:
             return None
         plan = plan or self._plan_query(question)
         if plan.retrieval_mode != RETRIEVAL_MODE_FACT_LOOKUP or not plan.system_phrase or not plan.attribute_label:
+            return None
+        if trace is not None:
+            fact = getattr(trace, "fact_hit", None)
+            if fact is not None:
+                chunk_row = self.store.fetch_chunk(fact.source_chunk_id)
+                return self._fact_answer_from_row(fact, chunk_row)
             return None
         resolve_document_id = getattr(self.retriever, "resolve_document_id", None)
         if not callable(resolve_document_id):
@@ -331,23 +349,28 @@ class AnswerPolicy:
         assessment = self.assess_fact_answer(plan, rows)
         if not assessment.direct_answer_allowed or assessment.candidate is None:
             return None
-        fact = assessment.candidate.fact
-        chunk_row = assessment.candidate.chunk_row
+        return self._fact_answer_from_row(assessment.candidate.fact, assessment.candidate.chunk_row)
+
+    def _fact_answer_from_row(self, fact: object, chunk_row: object | None) -> AssistantAnswer:
         section_number = str(self.fact_chunk_value(chunk_row, "section_number", "") or "") or None
         heading = " ".join(str(self.fact_chunk_value(chunk_row, "heading", "Contract evidence")).split())
         citation = Citation(
-            chunk_id=fact.source_chunk_id,
+            chunk_id=str(getattr(fact, "source_chunk_id", "")),
             section_number=section_number,
             heading=heading,
             attachment=None,
-            page_start=fact.page_start,
-            page_end=fact.page_end,
-            quote=fact.evidence_text,
+            page_start=int(getattr(fact, "page_start", 0) or 0),
+            page_end=int(getattr(fact, "page_end", 0) or 0),
+            quote=str(getattr(fact, "evidence_text", "") or ""),
         )
+        page_start = int(getattr(fact, "page_start", 0) or 0)
+        page_end = int(getattr(fact, "page_end", 0) or 0)
+        value = str(getattr(fact, "value", "") or "")
+        evidence = str(getattr(fact, "evidence_text", "") or "")
         section_label = section_number or "Unnumbered clause"
-        pages_label = f"{fact.page_start}" if fact.page_start == fact.page_end else f"{fact.page_start}-{fact.page_end}"
+        pages_label = f"{page_start}" if page_start == page_end else f"{page_start}-{page_end}"
         return AssistantAnswer(
-            f'"{fact.value}"\nSection {section_label} - {heading}\nPages: {pages_label}\nEvidence: "{fact.evidence_text}"',
+            f'"{value}"\nSection {section_label} - {heading}\nPages: {pages_label}\nEvidence: "{evidence}"',
             [citation],
             False,
         )
@@ -811,15 +834,23 @@ class AnswerPolicy:
     def exact_attribute_kind(cls, question: str, *, plan: QueryPlan | None = None) -> str | None:
         normalized = " ".join(question.lower().split())
         plan = plan or plan_query(question)
-        if re.search(r"\bquantity\b|\bnumber of\b", normalized):
+        if plan.attribute_label == "quantity" or re.search(r"\bquantity\b|\bnumber of\b", normalized):
             return "quantity"
+        if re.search(r"\bduty\b|\bservice\b", normalized):
+            return "duty"
+        if re.search(r"\bmodel\b|\bmanufacturer\b|\bvendor\b", normalized):
+            return "model"
+        if re.search(r"\brating\b|\bhorse power\b|\bhorsepower\b|\bhp\b|\bkw\b", normalized):
+            return "rating"
         if plan.attribute_label == "configuration":
             return "configuration"
         if plan.attribute_label == "capacity":
             return "capacity"
-        if plan.attribute_label == "type" or re.search(r"\bmodel\b", normalized):
+        if plan.attribute_label == "service":
+            return "duty"
+        if plan.attribute_label == "type":
             return "model"
-        if plan.attribute_label == "size" and re.search(r"\brating\b", normalized):
+        if plan.attribute_label in {"size", "power"}:
             return "rating"
         return None
 
@@ -835,8 +866,13 @@ class AnswerPolicy:
         if not subject_terms:
             return None
         for hit in hits:
+            hit_lower = " ".join(hit.page_text.lower().split())
             for label, value in cls.extract_fact_row_entries(hit.page_text):
-                if not cls.matches_attribute_row_label(label, subject_terms):
+                label_matches_subject = cls.matches_attribute_row_label(label, subject_terms)
+                label_matches_attribute = cls.matches_requested_attribute_label(label, plan, kind)
+                if not label_matches_subject and not (
+                    label_matches_attribute and cls.matches_attribute_sentence(hit_lower, subject_terms)
+                ):
                     continue
                 compact_value = cls.extract_value_from_text(value, plan, kind)
                 if compact_value is not None:
@@ -934,6 +970,21 @@ class AnswerPolicy:
         required = max(1, min(len(subject_terms), 2))
         return hits >= required
 
+    @staticmethod
+    def matches_requested_attribute_label(label: str, plan: QueryPlan, kind: str) -> bool:
+        lowered = label.lower()
+        if any(term in lowered for term in plan.attribute_terms):
+            return True
+        kind_terms = {
+            "configuration": ("configuration", "arrangement"),
+            "capacity": ("capacity", "output"),
+            "duty": ("duty", "service"),
+            "model": ("model", "type", "manufacturer", "vendor"),
+            "rating": ("rating", "rated", "power", "horsepower", "hp", "kw", "size"),
+            "quantity": ("quantity", "number", "count"),
+        }.get(kind, ())
+        return any(term in lowered for term in kind_terms)
+
     @classmethod
     def extract_value_from_text(
         cls,
@@ -971,6 +1022,19 @@ class AnswerPolicy:
                 re.compile(r"\brated\s+at\s+(\d+(?:\.\d+)?\s*(?:kv|v|volt(?:s)?|a|amp(?:s)?|ka|kva|mva|mw|kw|hp|psi|psig|psia|inch(?:es)?|mm|ft|%))\b", re.IGNORECASE),
             )
             value = cls.extract_first_pattern_match(compact, patterns)
+            return cls.normalize_exact_value(value)
+        if kind == "duty":
+            patterns = (
+                re.compile(r"\b(?:duty|service)(?:\s+of|\s+is|:)?\s*((?:standby|continuous|intermittent|lead/lag|lead-lag|lead lag|duplex|simplex|primary|backup|spare|fire water|cooling water|startup|shutdown)[A-Za-z0-9 /&()%-]*)\b", re.IGNORECASE),
+                re.compile(r"\b((?:standby|continuous|intermittent|lead/lag|lead-lag|lead lag|duplex|simplex|primary|backup|spare)\s+(?:duty|service))\b", re.IGNORECASE),
+            )
+            value = cls.extract_first_pattern_match(compact, patterns)
+            if value is None and re.fullmatch(
+                r"(?:standby|continuous|intermittent|lead/lag|lead-lag|lead lag|duplex|simplex|primary|backup|spare|fire water|cooling water|startup|shutdown)(?:\s+[A-Za-z0-9/&()%-]+){0,3}",
+                compact,
+                re.IGNORECASE,
+            ):
+                value = compact
             return cls.normalize_exact_value(value)
         if kind == "quantity":
             count_token = r"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)(?:\s*\(\d+\))?|\(?\d+\)?)"
@@ -1579,12 +1643,19 @@ class AnswerPolicy:
     @classmethod
     def extract_compact_attribute_value(cls, text: str, plan: QueryPlan) -> str:
         label = plan.attribute_label or ""
-        if label != "configuration":
-            return ""
-        for pattern in cls.configuration_value_patterns():
-            match = pattern.search(text)
+        if label == "configuration":
+            for pattern in cls.configuration_value_patterns():
+                match = pattern.search(text)
+                if match:
+                    return " ".join(match.group(0).split())
+        if label == "service":
+            match = re.search(
+                r"\b((?:standby|continuous|intermittent|lead/lag|lead-lag|lead lag|duplex|simplex|primary|backup|spare)\s+(?:duty|service))\b",
+                text,
+                re.IGNORECASE,
+            )
             if match:
-                return " ".join(match.group(0).split())
+                return " ".join(match.group(1).split())
         return ""
 
     @staticmethod
@@ -1703,6 +1774,9 @@ class AnswerPolicy:
                 score += 1.9
                 if cls.numeric_value_count(sentence) >= 3:
                     score -= 0.55
+        elif label == "service":
+            if cls.matches_duty_text(normalized):
+                score += 1.9
         elif label == "responsibility":
             if re.search(r"\b(shall|must|required|responsible|provide|furnish|supply|perform|deliver)\b", normalized):
                 score += 2.0
@@ -1749,7 +1823,7 @@ class AnswerPolicy:
             return True
         if plan.answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT:
             return True
-        if plan.attribute_label in {"design_conditions", "size", "capacity", "power", "pressure", "temperature", "flow"}:
+        if plan.attribute_label in {"design_conditions", "size", "capacity", "power", "pressure", "temperature", "flow", "service"}:
             return True
         markers = (
             "how much",
@@ -1938,6 +2012,8 @@ class AnswerPolicy:
             return bool(re.search(r"\bhorse\s*power\b|\bhp\b|\bkw\b|\bkilowatt", lowered))
         if label == "capacity":
             return bool(re.search(r"\bcapacity\b|\boutput\b|\bduty\b|\bthroughput\b", lowered))
+        if label == "service":
+            return AnswerPolicy.matches_duty_text(lowered)
         if label == "pressure":
             return bool(re.search(r"\bpressure\b|\bpsig\b|\bpsi\b", lowered))
         if label == "temperature":
@@ -2052,6 +2128,8 @@ class AnswerPolicy:
             return bool(re.search(r"\bsize\b|\bdiameter\b|\brating\b|\b(?:inch|inches|mm|ft)\b", lowered_excerpt) or re.search(r"\d", lowered_excerpt))
         if label == "power":
             return bool(any(term in lowered_excerpt for term in plan.attribute_terms) or re.search(r"\b\d+(?:\.\d+)?\s*(?:hp|kw|kilowatt(?:s)?)\b", lowered_excerpt))
+        if label == "service":
+            return AnswerPolicy.matches_duty_text(lowered_excerpt)
         if label in {"capacity", "pressure", "temperature", "flow"}:
             return bool(any(term in lowered_excerpt for term in plan.attribute_terms) or re.search(r"\d", lowered_excerpt))
         if label == "responsibility":
@@ -2152,6 +2230,13 @@ class AnswerPolicy:
             or re.search(r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s*(?:x\s*)?\d+%\s*capacity\b", text)
             or re.search(r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+full\s+capacity\b", text)
             or re.search(r"\b(?:duty|standby|lead|lag)\b", text)
+        )
+
+    @staticmethod
+    def matches_duty_text(text: str) -> bool:
+        return bool(
+            re.search(r"\b(?:duty|duties|service|services)\b", text)
+            or re.search(r"\b(?:standby|continuous|intermittent|lead/lag|lead-lag|lead lag|primary|backup|spare)\b", text)
         )
 
     @staticmethod

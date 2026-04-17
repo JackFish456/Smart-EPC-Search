@@ -35,6 +35,9 @@ REQUEST_SHAPE_BROAD_TOPIC = "broad_topic"
 ANSWER_FAMILY_GUARANTEE_OR_LIMIT = "guarantee_or_limit"
 RETRIEVAL_MODE_FACT_LOOKUP = "fact_lookup"
 RETRIEVAL_MODE_TOPIC_SUMMARY = "topic_summary"
+RETRIEVAL_MODE_GROUPED_LIST = "grouped_list"
+RETRIEVAL_MODE_SECTION_LOOKUP = "section_lookup"
+RETRIEVAL_MODE_DIRECT_TEXT = "direct_text"
 RETRIEVAL_MODE_FALLBACK = "fallback"
 EXACT_VALUE_ATTRIBUTE_LABELS = (
     "configuration",
@@ -93,6 +96,9 @@ class QueryPlan:
 
 
 QUERY_PREFIXES = (
+    "summarize the ",
+    "summarize ",
+    "summary of ",
     "give me information about ",
     "information about ",
     "give me details about ",
@@ -146,6 +152,8 @@ STOPWORDS = {
     "required",
     "say",
     "show",
+    "summary",
+    "summarize",
     "tell",
     "that",
     "the",
@@ -277,6 +285,15 @@ def plan_query(query: str, system_vocabulary: SystemVocabulary | None = None) ->
         else _system_aliases(extracted_system_phrase or system_phrase, system_terms)
     )
     system_significant = system_significant_terms(system_terms)
+    if _is_attribute_value_lookup(
+        request_shape=request_shape,
+        attribute_label=attribute_label,
+        system_phrase=system_phrase,
+        count_question=count_question,
+        direct_text_question=direct_text_question,
+        intent=intent,
+    ):
+        intent = "attribute_value"
     retrieval_mode = _determine_retrieval_mode(
         request_shape=request_shape,
         attribute_label=attribute_label,
@@ -483,18 +500,43 @@ def _determine_retrieval_mode(
     direct_text_question: bool,
     intent: str,
 ) -> str:
+    if request_shape == REQUEST_SHAPE_REFERENCE_LOOKUP:
+        return RETRIEVAL_MODE_SECTION_LOOKUP
+    if request_shape == REQUEST_SHAPE_GROUPED_LIST:
+        return RETRIEVAL_MODE_GROUPED_LIST
     if request_shape == REQUEST_SHAPE_BROAD_TOPIC:
         return RETRIEVAL_MODE_TOPIC_SUMMARY
-    if (
-        request_shape == REQUEST_SHAPE_SCALAR
-        and attribute_label in EXACT_VALUE_ATTRIBUTE_LABELS
-        and bool(system_phrase)
-        and not count_question
-        and not direct_text_question
-        and intent not in {"definition", "responsibility"}
+    if request_shape == REQUEST_SHAPE_DIRECT_TEXT:
+        return RETRIEVAL_MODE_DIRECT_TEXT
+    if _is_attribute_value_lookup(
+        request_shape=request_shape,
+        attribute_label=attribute_label,
+        system_phrase=system_phrase,
+        count_question=count_question,
+        direct_text_question=direct_text_question,
+        intent=intent,
     ):
         return RETRIEVAL_MODE_FACT_LOOKUP
     return RETRIEVAL_MODE_FALLBACK
+
+
+def _is_attribute_value_lookup(
+    *,
+    request_shape: str,
+    attribute_label: str | None,
+    system_phrase: str,
+    count_question: bool,
+    direct_text_question: bool,
+    intent: str,
+) -> bool:
+    return bool(
+        request_shape == REQUEST_SHAPE_SCALAR
+        and attribute_label in EXACT_VALUE_ATTRIBUTE_LABELS
+        and system_phrase
+        and not count_question
+        and not direct_text_question
+        and intent not in {"definition", "responsibility"}
+    )
 
 
 def _detect_concept_terms(
@@ -534,6 +576,9 @@ def _detect_broad_topic_request(
         return False
     normalized = f" {normalized_query} "
     broad_prefixes = (
+        "summarize the ",
+        "summarize ",
+        "summary of ",
         "give me information about ",
         "information about ",
         "give me details about ",

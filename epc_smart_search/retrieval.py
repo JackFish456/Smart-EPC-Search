@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 from epc_smart_search.config import MAX_EMBEDDING_DIM, MAX_SEARCH_RESULTS, MAX_SEMANTIC_SCAN
@@ -110,28 +110,59 @@ class RetrievalTrace:
     normalized_system: str = ""
     normalized_attribute: str = ""
     fact_lookup_attempted: bool = False
+    fact_rows: list[ContractFactRow] = field(default_factory=list)
+    fact_hit: ContractFactRow | None = None
     fact_rows_returned: int = 0
     fallback_reason: str | None = None
+
+    @property
+    def retrieval_mode(self) -> str:
+        return self.plan.retrieval_mode
+
+    @property
+    def fact_fallback_reason(self) -> str | None:
+        return self.fallback_reason
 
     def to_debug_dict(self) -> dict[str, object]:
         return {
             "query": self.query,
-            "retrieval_mode": self.plan.retrieval_mode,
+            "retrieval_mode": self.retrieval_mode,
             "request_shape": self.plan.request_shape,
             "normalized_system": self.normalized_system,
             "normalized_attribute": self.normalized_attribute,
             "fact_lookup_attempted": self.fact_lookup_attempted,
+            "fact_rows": [self._fact_row_to_debug_dict(row) for row in self.fact_rows],
+            "fact_hit": self._fact_row_to_debug_dict(self.fact_hit) if self.fact_hit is not None else None,
             "fact_rows_returned": self.fact_rows_returned,
+            "fact_fallback_reason": self.fact_fallback_reason,
             "fallback_reason": self.fallback_reason,
             "selected_bundle_id": self.selected_bundle.bundle_id if self.selected_bundle is not None else None,
             "recall_source_counts": {name: len(rows) for name, rows in self.recall_sources.items()},
         }
 
+    @staticmethod
+    def _fact_row_to_debug_dict(row: ContractFactRow | None) -> dict[str, object] | None:
+        if row is None:
+            return None
+        return {
+            "fact_rowid": row.fact_rowid,
+            "system": row.system,
+            "system_normalized": row.system_normalized,
+            "attribute": row.attribute,
+            "attribute_normalized": row.attribute_normalized,
+            "value": row.value,
+            "source_chunk_id": row.source_chunk_id,
+            "page_start": row.page_start,
+            "page_end": row.page_end,
+        }
+
 
 @dataclass(slots=True, frozen=True)
 class FactLookupOutcome:
+    rows: list[ContractFactRow]
     rows_returned: int
     confident: bool
+    fact_hit: ContractFactRow | None = None
     fallback_reason: str | None = None
 
 
@@ -248,6 +279,8 @@ class HybridRetriever:
                 normalized_system=normalize_system_name(plan.system_phrase),
                 normalized_attribute=normalize_attribute_name(plan.attribute_label or ""),
                 fact_lookup_attempted=False,
+                fact_rows=[],
+                fact_hit=None,
                 fact_rows_returned=0,
                 fallback_reason="missing_document",
             )
@@ -277,6 +310,8 @@ class HybridRetriever:
         normalized_system = normalize_system_name(plan.system_phrase)
         normalized_attribute = normalize_attribute_name(plan.attribute_label or "")
         fact_lookup_attempted = False
+        fact_rows: list[ContractFactRow] = []
+        fact_hit: ContractFactRow | None = None
         fact_rows_returned = 0
         fallback_reason: str | None = None
         if plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP:
@@ -289,6 +324,8 @@ class HybridRetriever:
             )
             recall_sources.update(fact_sources)
             combined.update(fact_candidates)
+            fact_rows = list(fact_outcome.rows)
+            fact_hit = fact_outcome.fact_hit
             fact_rows_returned = fact_outcome.rows_returned
             fallback_reason = fact_outcome.fallback_reason
             if not fact_outcome.confident:
@@ -318,7 +355,7 @@ class HybridRetriever:
         bundles = self._build_ranked_bundles(document_id, query_vector, plan, merged, active_profile)
         selected_bundle = bundles[0] if bundles else None
         used_gemma_disambiguation = False
-        if gemma_client is not None and bundles:
+        if gemma_client is not None and bundles and fact_hit is None:
             gemma_bundle = self._select_bundle_with_gemma(query, bundles, gemma_client)
             if gemma_bundle is not None:
                 selected_bundle = gemma_bundle
@@ -351,6 +388,8 @@ class HybridRetriever:
             normalized_system=normalized_system,
             normalized_attribute=normalized_attribute,
             fact_lookup_attempted=fact_lookup_attempted,
+            fact_rows=fact_rows,
+            fact_hit=fact_hit,
             fact_rows_returned=fact_rows_returned,
             fallback_reason=fallback_reason,
         )
@@ -465,10 +504,11 @@ class HybridRetriever:
     ) -> tuple[dict[str, list[RankedChunk]], dict[str, SearchCandidate], FactLookupOutcome]:
         combined: dict[str, SearchCandidate] = {}
         recall_sources: dict[str, list[RankedChunk]] = {"fact_lookup": []}
+        fact_rows = self._lookup_fact_rows_for_plan(document_id, plan)
         best_match_score = 0.0
-        facts = self._candidate_facts_for_plan(document_id, plan)
-        fallback_reason = "no_fact_rows" if not facts else "fact_lookup_miss"
-        for fact in facts:
+        scored_facts: list[tuple[ContractFactRow, float]] = []
+        fallback_reason = "no_fact_rows" if not fact_rows else "fact_lookup_miss"
+        for fact in fact_rows:
             match_score = self._fact_match_score(plan, fact)
             if match_score <= 0.0:
                 continue
@@ -487,32 +527,95 @@ class HybridRetriever:
             recall_sources["fact_lookup"].append(self._ranked_from_candidate(candidate))
             self._merge_recall_candidate(combined, candidate)
             best_match_score = max(best_match_score, match_score)
-        confident = best_match_score >= 2.0
-        if best_match_score > 0.0 and not confident:
-            fallback_reason = "low_confidence_fact_match"
-        elif confident:
+            scored_facts.append((fact, match_score))
+        fact_hit, confidence_reason = self._select_fact_hit(plan, scored_facts)
+        confident = fact_hit is not None
+        if confident:
             fallback_reason = None
+        elif confidence_reason is not None:
+            fallback_reason = confidence_reason
+        elif best_match_score > 0.0:
+            fallback_reason = "low_confidence_fact_match"
         recall_sources["fact_lookup"] = sorted(
             recall_sources["fact_lookup"],
             key=lambda item: item.total_score,
             reverse=True,
         )[:LEXICAL_RECALL_KEEP]
         return recall_sources, combined, FactLookupOutcome(
-            rows_returned=len(facts),
+            rows=list(fact_rows),
+            rows_returned=len(fact_rows),
             confident=confident,
+            fact_hit=fact_hit,
             fallback_reason=fallback_reason,
         )
 
-    def _candidate_facts_for_plan(self, document_id: str, plan: QueryPlan) -> list[ContractFactRow]:
+    def _lookup_fact_rows_for_plan(self, document_id: str, plan: QueryPlan) -> list[ContractFactRow]:
         if plan.attribute_label not in EXACT_VALUE_ATTRIBUTE_LABELS or not plan.system_phrase:
             return []
+        rows: list[ContractFactRow] = []
+        seen: set[tuple[object | None, str, int, int, str]] = set()
         for system_name in (plan.system_phrase, *plan.system_aliases):
             if not system_name:
                 continue
-            direct = self.store.lookup_facts_by_system_attribute(document_id, system_name, plan.attribute_label)
-            if direct:
-                return direct
-        return self.store.lookup_facts_by_attribute(document_id, plan.attribute_label)
+            for row in self.store.lookup_facts_by_system_attribute(document_id, system_name, plan.attribute_label):
+                key = (
+                    row.fact_rowid,
+                    row.source_chunk_id,
+                    row.page_start,
+                    row.page_end,
+                    normalize_attribute_name(row.attribute_normalized or row.attribute),
+                    " ".join(str(row.value).lower().split()),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
+        return rows
+
+    @staticmethod
+    def _select_fact_hit(
+        plan: QueryPlan,
+        scored_facts: Sequence[tuple[ContractFactRow, float]],
+    ) -> tuple[ContractFactRow | None, str | None]:
+        if not scored_facts:
+            return None, "fact_lookup_miss"
+        plan_systems = {
+            normalize_system_name(alias)
+            for alias in (plan.system_phrase, *plan.system_aliases, *build_system_aliases(plan.system_phrase))
+            if alias
+        }
+        plan_systems.discard("")
+        unique_systems = {
+            normalize_system_name(fact.system_normalized or fact.system)
+            for fact, _score in scored_facts
+            if normalize_system_name(fact.system_normalized or fact.system) in plan_systems
+        }
+        unique_attributes = {
+            normalize_attribute_name(fact.attribute_normalized or fact.attribute)
+            for fact, _score in scored_facts
+        }
+        unique_values = {
+            " ".join(str(fact.value).lower().split())
+            for fact, _score in scored_facts
+            if str(fact.value).strip()
+        }
+        best_fact, best_score = max(
+            scored_facts,
+            key=lambda item: (
+                item[1],
+                len(str(item[0].evidence_text or "")),
+                len(str(item[0].value or "")),
+            ),
+        )
+        if best_score < 2.0:
+            return None, "low_confidence_fact_match"
+        if len(unique_systems) != 1:
+            return None, "ambiguous_fact_system"
+        if len(unique_attributes) != 1:
+            return None, "ambiguous_fact_attribute"
+        if len(unique_values) != 1:
+            return None, "conflicting_fact_values"
+        return best_fact, None
 
     @staticmethod
     def _fact_match_score(plan: QueryPlan, fact: ContractFactRow) -> float:

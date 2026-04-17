@@ -4,6 +4,8 @@ from epc_smart_search.ocr_support import PageText
 from epc_smart_search.query_planner import (
     REQUEST_SHAPE_BROAD_TOPIC,
     RETRIEVAL_MODE_FACT_LOOKUP,
+    RETRIEVAL_MODE_GROUPED_LIST,
+    RETRIEVAL_MODE_SECTION_LOOKUP,
     RETRIEVAL_MODE_TOPIC_SUMMARY,
     build_like_fallback,
     plan_query,
@@ -52,6 +54,7 @@ def test_direct_section_lookup_wins() -> None:
         dimension=embedder.dimension,
     )
     retriever = HybridRetriever(store, embedder)
+    assert retriever.plan_query("section 14.2.1").retrieval_mode == RETRIEVAL_MODE_SECTION_LOOKUP
     ranked = retriever.retrieve("section 14.2.1")
     assert ranked
     assert ranked[0].section_number == "14.2.1"
@@ -241,6 +244,7 @@ def test_query_plan_tracks_appendix_scope_for_grouped_guarantee_question() -> No
     plan = plan_query("show me all emission guarantees in Appendix E")
 
     assert plan.request_shape == "grouped_list"
+    assert plan.retrieval_mode == RETRIEVAL_MODE_GROUPED_LIST
     assert plan.scope_terms == ("appendix e", "appendix")
     assert plan.concept_terms == ("emission", "guarantees")
 
@@ -259,6 +263,14 @@ def test_query_plan_marks_air_permits_prompt_as_broad_topic() -> None:
     assert plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
     assert plan.content_query == "air permits"
     assert plan.retrieval_mode == RETRIEVAL_MODE_TOPIC_SUMMARY
+
+
+def test_query_plan_marks_system_summary_prompt_as_broad_topic() -> None:
+    plan = plan_query("Summarize the closed cooling water system")
+
+    assert plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
+    assert plan.retrieval_mode == RETRIEVAL_MODE_TOPIC_SUMMARY
+    assert plan.system_phrase == ""
 
 
 def test_direct_text_phrasing_prefers_equipment_heading_over_generic_match() -> None:
@@ -752,20 +764,104 @@ def test_fact_lookup_uses_shared_system_and_attribute_normalization() -> None:
     assert trace.normalized_system == "closed cooling water"
     assert trace.normalized_attribute == "configuration"
     assert trace.fact_lookup_attempted is True
+    assert [row.value for row in trace.fact_rows] == ["2 x 100%"]
+    assert trace.fact_hit is not None
+    assert trace.fact_hit.value == "2 x 100%"
     assert trace.fact_rows_returned == 1
+    assert trace.fact_fallback_reason is None
     assert trace.fallback_reason is None
-    assert trace.to_debug_dict() == {
-        "query": "What is the CCW configuration?",
-        "retrieval_mode": "fact_lookup",
-        "request_shape": "scalar",
-        "normalized_system": "closed cooling water",
-        "normalized_attribute": "configuration",
-        "fact_lookup_attempted": True,
-        "fact_rows_returned": 1,
-        "fallback_reason": None,
-        "selected_bundle_id": "ccw_fact",
-        "recall_source_counts": {"fact_lookup": 1},
-    }
+    debug = trace.to_debug_dict()
+    assert debug["query"] == "What is the CCW configuration?"
+    assert debug["retrieval_mode"] == "fact_lookup"
+    assert debug["request_shape"] == "scalar"
+    assert debug["normalized_system"] == "closed cooling water"
+    assert debug["normalized_attribute"] == "configuration"
+    assert debug["fact_lookup_attempted"] is True
+    assert debug["fact_rows_returned"] == 1
+    assert debug["fact_fallback_reason"] is None
+    assert debug["fallback_reason"] is None
+    assert debug["selected_bundle_id"] == "ccw_fact"
+    assert debug["recall_source_counts"] == {"fact_lookup": 1}
+    assert len(debug["fact_rows"]) == 1
+    assert debug["fact_rows"][0]["system_normalized"] == "closed cooling water"
+    assert debug["fact_rows"][0]["attribute_normalized"] == "configuration"
+    assert debug["fact_rows"][0]["value"] == "2 x 100%"
+    assert debug["fact_hit"]["value"] == "2 x 100%"
+
+
+def test_exact_attribute_fact_lookup_returns_direct_fact_hit_for_dew_point_configuration() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "dew_point_fact",
+                "7.4.2",
+                "Dew Point Heaters",
+                "Dew point heaters shall be furnished in a 4 x 50% configuration.",
+                41,
+            ),
+            _chunk(
+                "dew_point_overview",
+                "7.4",
+                "Fuel Gas Heating",
+                "The fuel gas heating system shall maintain gas temperature ahead of the conditioning package.",
+                40,
+            ),
+        ],
+        facts=[
+            ContractFactRow(
+                document_id="doc1",
+                system="Dew Point Heaters",
+                system_normalized="dew point heater",
+                attribute="Configuration / Arrangement",
+                attribute_normalized="configuration",
+                value="4 x 50%",
+                evidence_text="Dew point heaters shall be furnished in a 4 x 50% configuration.",
+                source_chunk_id="dew_point_fact",
+                page_start=41,
+                page_end=41,
+            )
+        ],
+    )
+
+    trace = retriever.retrieve_trace("What is the configuration of the dew point heaters?")
+
+    assert trace.plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
+    assert list(trace.recall_sources) == ["fact_lookup"]
+    assert trace.fact_hit is not None
+    assert trace.fact_hit.value == "4 x 50%"
+    assert trace.selected_bundle is not None
+    assert trace.selected_bundle.primary_chunk_id == "dew_point_fact"
+
+
+def test_topic_summary_keeps_bundle_path_for_closed_cooling_water_summary() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "ccw_summary",
+                "5.18",
+                "Closed Cooling Water",
+                "The closed cooling water system includes pumps, air coolers, and glycol-water circulation for unit cooling.",
+                261,
+            ),
+            _chunk(
+                "ccw_support",
+                "5.18.1",
+                "Closed Cooling Water Pumps",
+                "Closed cooling water pumps circulate coolant through the unitized closed cooling water system.",
+                262,
+                parent_chunk_id="ccw_summary",
+            ),
+        ]
+    )
+
+    trace = retriever.retrieve_trace("Summarize the closed cooling water system")
+
+    assert trace.plan.request_shape == REQUEST_SHAPE_BROAD_TOPIC
+    assert trace.plan.retrieval_mode == RETRIEVAL_MODE_TOPIC_SUMMARY
+    assert "fact_lookup" not in trace.recall_sources
+    assert trace.fact_lookup_attempted is False
+    assert trace.selected_bundle is not None
+    assert trace.selected_bundle.primary_chunk_id == "ccw_summary"
 
 
 def test_retrieve_trace_can_use_gemma_to_break_close_bundle_ties() -> None:
@@ -844,7 +940,7 @@ def test_fact_lookup_short_circuits_generic_recall_for_exact_value_questions() -
         ],
     )
 
-    trace = retriever.retrieve_trace("What model turbine is selected?")
+    trace = retriever.retrieve_trace("What model turbine generator is selected?")
 
     assert trace.plan.retrieval_mode == RETRIEVAL_MODE_FACT_LOOKUP
     assert list(trace.recall_sources) == ["fact_lookup"]
@@ -909,8 +1005,8 @@ def test_low_confidence_fact_lookup_falls_back_to_generic_recall() -> None:
         facts=[
             ContractFactRow(
                 document_id="doc1",
-                system="startup water header",
-                system_normalized="startup water header",
+                system="service water tank",
+                system_normalized="service water tank",
                 attribute="capacity",
                 attribute_normalized="capacity",
                 value="startup water",
@@ -918,7 +1014,19 @@ def test_low_confidence_fact_lookup_falls_back_to_generic_recall() -> None:
                 source_chunk_id="service_water_overview",
                 page_start=10,
                 page_end=10,
-            )
+            ),
+            ContractFactRow(
+                document_id="doc1",
+                system="service water tank",
+                system_normalized="service water tank",
+                attribute="capacity",
+                attribute_normalized="capacity",
+                value="500000 gallons",
+                evidence_text="The service water tank capacity shall be 500000 gallons.",
+                source_chunk_id="service_water_capacity",
+                page_start=11,
+                page_end=11,
+            ),
         ],
     )
 
@@ -932,11 +1040,15 @@ def test_low_confidence_fact_lookup_falls_back_to_generic_recall() -> None:
     assert trace.normalized_system == "service water tank"
     assert trace.normalized_attribute == "capacity"
     assert trace.fact_lookup_attempted is True
-    assert trace.fact_rows_returned == 1
-    assert trace.fallback_reason == "fact_lookup_miss"
+    assert trace.fact_rows_returned == 2
+    assert trace.fact_hit is None
+    assert trace.fact_fallback_reason == "conflicting_fact_values"
+    assert trace.fallback_reason == "conflicting_fact_values"
     debug = trace.to_debug_dict()
-    assert debug["fallback_reason"] == "fact_lookup_miss"
-    assert debug["recall_source_counts"]["fact_lookup"] == 0
+    assert debug["fact_fallback_reason"] == "conflicting_fact_values"
+    assert debug["fallback_reason"] == "conflicting_fact_values"
+    assert len(debug["fact_rows"]) == 2
+    assert debug["recall_source_counts"]["fact_lookup"] == 2
     assert debug["recall_source_counts"]["planner_hints"] > 0
 
 

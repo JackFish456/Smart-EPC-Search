@@ -320,6 +320,88 @@ def test_build_exact_answer_returns_fact_row_capacity_value() -> None:
     assert answer.citations[0].page_start == 261
 
 
+def test_build_exact_answer_returns_fact_row_duty_value() -> None:
+    policy = AnswerPolicy(None, None)
+    hits = [
+        ExactPageHit(
+            page_num=41,
+            snippet="Dew Point Heaters",
+            page_text=(
+                "Equipment: Dew Point Heaters\n"
+                "Duty: Standby\n"
+                "Configuration: 4 x 50%\n"
+            ),
+        )
+    ]
+
+    answer = policy.build_exact_answer("What is the duty of the dew point heaters?", hits)
+
+    assert answer is not None
+    assert answer.text.startswith("Answer: Standby")
+    assert "Direct contract text:" in answer.text
+    assert answer.citations[0].page_start == 41
+
+
+def test_answer_policy_uses_retrieval_trace_fact_hit_before_page_search() -> None:
+    fact = ContractFactRow(
+        document_id="doc1",
+        system="dew point heater",
+        system_normalized="dew point heater",
+        attribute="configuration",
+        attribute_normalized="configuration",
+        value="4 x 50%",
+        evidence_text="Dew point heaters shall be furnished in a 4 x 50% configuration.",
+        source_chunk_id="chunk_fact",
+        page_start=41,
+        page_end=41,
+        fact_rowid=1,
+    )
+
+    class FakeStore:
+        def fetch_chunk(self, chunk_id: str):
+            if chunk_id != "chunk_fact":
+                return None
+            return {
+                "section_number": "7.4.2",
+                "heading": "Dew Point Heaters",
+            }
+
+    class FakeRetriever:
+        def retrieve_trace(self, question: str, profile: str = "normal", gemma_client=None):
+            return RetrievalTrace(
+                query=question,
+                plan=plan_query(question),
+                recall_sources={"fact_lookup": []},
+                merged_ranked=[],
+                bundles=[],
+                selected_bundle=None,
+                used_gemma_disambiguation=False,
+                normalized_system="dew point heater",
+                normalized_attribute="configuration",
+                fact_lookup_attempted=True,
+                fact_rows=[fact],
+                fact_hit=fact,
+                fact_rows_returned=1,
+                fallback_reason=None,
+            )
+
+        def find_exact_page_hits(self, question: str):
+            raise AssertionError("Exact page search should not run when retrieval trace already carries a fact hit.")
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called for a traced fact hit.")
+
+    policy = AnswerPolicy(FakeStore(), FakeRetriever())
+
+    answer = policy.answer("What is the configuration of the dew point heaters?", None, FakeGemma())
+
+    assert answer.refused is False
+    assert answer.text.startswith('"4 x 50%"')
+    assert "Section 7.4.2 - Dew Point Heaters" in answer.text
+    assert answer.citations[0].chunk_id == "chunk_fact"
+
+
 def test_answer_policy_returns_store_backed_fact_answer_before_page_search() -> None:
     class FakeStore:
         def lookup_facts_by_system_attribute(self, document_id: str, system: str, attribute: str):
