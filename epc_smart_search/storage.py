@@ -538,6 +538,29 @@ class ContractStore:
                 (parent_chunk_id,),
             ).fetchone()
 
+    def fetch_children(self, chunk_id: str | None, *, limit: int = 6) -> list[sqlite3.Row]:
+        if not chunk_id:
+            return []
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT
+                    c.*,
+                    f.parent_heading,
+                    f.clause_type,
+                    f.actor_tags,
+                    f.action_tags,
+                    f.topic_tags,
+                    f.noise_flags
+                FROM contract_chunks c
+                LEFT JOIN chunk_search_features f ON f.chunk_id = c.chunk_id
+                WHERE c.parent_chunk_id = ?
+                ORDER BY c.ordinal_in_document
+                LIMIT ?
+                """,
+                (chunk_id, limit),
+            ).fetchall()
+
     def fetch_chunk(self, chunk_id: str | None) -> sqlite3.Row | None:
         if not chunk_id:
             return None
@@ -628,10 +651,28 @@ class ContractStore:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT c.chunk_id, c.heading, c.section_number, c.page_start, c.page_end, c.full_text, c.ordinal_in_document,
-                       e.vector_blob, e.dimension
+                SELECT
+                    c.chunk_id,
+                    c.document_id,
+                    c.chunk_type,
+                    c.section_number,
+                    c.heading,
+                    c.full_text,
+                    c.page_start,
+                    c.page_end,
+                    c.parent_chunk_id,
+                    c.ordinal_in_document,
+                    f.parent_heading,
+                    f.clause_type,
+                    f.actor_tags,
+                    f.action_tags,
+                    f.topic_tags,
+                    f.noise_flags,
+                    e.vector_blob,
+                    e.dimension
                 FROM chunk_embeddings e
                 JOIN contract_chunks c ON c.chunk_id = e.chunk_id
+                LEFT JOIN chunk_search_features f ON f.chunk_id = c.chunk_id
                 WHERE c.document_id = ?
                 ORDER BY c.ordinal_in_document
                 """,

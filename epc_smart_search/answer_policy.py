@@ -24,14 +24,14 @@ class AssistantAnswer:
 
 SUMMARY_MAX_NEW_TOKENS = 224
 SUMMARY_ENABLE_THINKING = False
-SUMMARY_CONTEXT_MAX_SECTIONS = 4
+SUMMARY_CONTEXT_MAX_SECTIONS = 5
 SUMMARY_EXCERPT_LIMIT = 520
 EXPAND_MAX_NEW_TOKENS = 320
 DEEP_MAX_NEW_TOKENS = 384
 DEEP_ENABLE_THINKING = True
-DEEP_CONTEXT_MAX_SECTIONS = 5
+DEEP_CONTEXT_MAX_SECTIONS = 6
 DEEP_CONTEXT_EXACT_HITS = 2
-DEEP_PAGE_CONTEXT_SECTIONS = 1
+DEEP_PAGE_CONTEXT_SECTIONS = 3
 GENERIC_SYSTEM_TERMS = {
     "system",
     "systems",
@@ -54,6 +54,22 @@ GENERIC_SYSTEM_TERMS = {
     "equipment",
     "package",
     "packages",
+}
+GENERIC_SUBJECT_TERMS = {
+    "design",
+    "designs",
+    "operating",
+    "operation",
+    "operations",
+    "condition",
+    "conditions",
+    "basis",
+    "pressure",
+    "pressures",
+    "temperature",
+    "temperatures",
+    "value",
+    "values",
 }
 
 
@@ -80,84 +96,69 @@ class AnswerPolicy:
             return exact_answer
 
         summary_request = self.prefers_generated_answer(question)
-        ranked = (
-            self.retriever.retrieve(effective_question, profile="deep")
-            if deep_think
-            else self.retriever.retrieve(effective_question)
-        )
-        citations = self.retriever.expand_with_context(ranked) if ranked else []
+        trace = self._retrieve_trace(effective_question, gemma_client, deep_think=deep_think)
+        if trace is not None and trace.selected_bundle is not None:
+            ranked = list(trace.selected_bundle.ranked_chunks)
+            citations = list(trace.selected_bundle.citations)
+        else:
+            ranked = (
+                self.retriever.retrieve(effective_question, profile="deep")
+                if deep_think
+                else self.retriever.retrieve(effective_question)
+            )
+            citations = self.retriever.expand_with_context(ranked) if ranked else []
         citations = self.limit_citations(citations) if citations else []
 
         if not deep_think and not ranked:
             return AssistantAnswer("I can't verify that from the contract.", [], True)
-        if not deep_think and not citations:
-            return AssistantAnswer("I can't verify that from the contract.", [], True)
 
-        best = ranked[0] if ranked else None
-        strict_gate_active = (
-            not summary_request
-            and not deep_think
-            and not expand_answer
-            and self.reference_lookup_kind(effective_question) is None
-        )
-        evidence_is_weak = (
-            best is None
-            or (best.total_score < 0.16 and best.lexical_score < 0.05)
-            or (
-                strict_gate_active
-                and self.requires_strict_grounding(plan)
-                and not (
-                    self.has_strong_grouped_evidence(plan, ranked, citations)
-                    if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST
-                    else self.is_strong_question_match(plan, best)
-                )
-            )
-        )
-        if evidence_is_weak and not deep_think:
-            return AssistantAnswer("I can't verify that from the contract.", citations, True)
-
+        strong_ranked_evidence = self.has_strong_ranked_evidence(plan, ranked)
+        evidence_is_weak = not citations or not strong_ranked_evidence
+        refusal_citations = citations if not evidence_is_weak else []
         reference_answer = self.build_reference_answer(effective_question, ranked, citations)
+        grouped_answer = self.build_grouped_answer(effective_question, ranked, citations)
+        compact_answer = self.build_compact_answer(effective_question, ranked, citations)
+        extractive_answer = self.build_extractive_answer(effective_question, ranked, citations)
+        grounded_compact_answer = None if evidence_is_weak else compact_answer
+        grounded_extractive_answer = None if evidence_is_weak else extractive_answer
+
         if reference_answer is not None and not summary_request and not deep_think and not expand_answer:
             return reference_answer
-
-        grouped_answer = self.build_grouped_answer(effective_question, ranked, citations)
         if grouped_answer is not None and not summary_request and not deep_think and not expand_answer:
             return grouped_answer
-
-        compact_answer = self.build_compact_answer(effective_question, ranked, citations)
-        if compact_answer is not None and not summary_request and not deep_think and not expand_answer:
-            return compact_answer
-
-        extractive_answer = self.build_extractive_answer(effective_question, ranked, citations)
-        if extractive_answer is not None and not summary_request and not deep_think and not expand_answer:
-            return extractive_answer
+        if grounded_compact_answer is not None and not summary_request and not deep_think and not expand_answer:
+            return grounded_compact_answer
+        if grounded_extractive_answer is not None and not summary_request and not deep_think and not expand_answer:
+            return grounded_extractive_answer
 
         if deep_think:
             prompt_context = self.build_deep_prompt_context(effective_question, ranked, exact_hits)
+            if not prompt_context and grounded_extractive_answer is not None:
+                return grounded_extractive_answer
             if evidence_is_weak and not exact_hits:
-                if extractive_answer is not None:
-                    return extractive_answer
-                return AssistantAnswer("I can't verify that from the contract.", citations, True)
-            if not prompt_context:
-                if extractive_answer is not None:
-                    return extractive_answer
-                return AssistantAnswer("I can't verify that from the contract.", citations, True)
+                if grounded_extractive_answer is not None:
+                    return grounded_extractive_answer
+                return AssistantAnswer("I can't verify that from the contract.", refusal_citations, True)
         elif expand_answer:
             prompt_context = self.build_expand_prompt_context(effective_question, ranked, previous_answer)
             if not prompt_context:
-                if extractive_answer is not None:
-                    return extractive_answer
-                return AssistantAnswer("I can't verify that from the contract.", citations, True)
+                if grounded_extractive_answer is not None:
+                    return grounded_extractive_answer
+                return AssistantAnswer("I can't verify that from the contract.", refusal_citations, True)
         else:
             prompt_context = (
                 self.build_summary_prompt_context(effective_question, ranked)
                 if summary_request
-                else self.retriever.build_evidence_pack(effective_question, ranked, citations)
+                else self._build_standard_prompt_context(effective_question, ranked, citations, trace)
             )
             if summary_request and not prompt_context:
-                if extractive_answer is not None:
-                    return extractive_answer
-                return AssistantAnswer("I can't verify that from the contract.", citations, True)
+                if grounded_extractive_answer is not None:
+                    return grounded_extractive_answer
+                return AssistantAnswer("I can't verify that from the contract.", refusal_citations, True)
+            if not summary_request and not prompt_context:
+                if grounded_extractive_answer is not None:
+                    return grounded_extractive_answer
+                return AssistantAnswer("I can't verify that from the contract.", refusal_citations, True)
 
         gemma_kwargs: dict[str, object] = {
             "enable_thinking": DEEP_ENABLE_THINKING if deep_think else (SUMMARY_ENABLE_THINKING if summary_request else None),
@@ -170,16 +171,39 @@ class AnswerPolicy:
         try:
             answer_text = gemma_client.ask(question, prompt_context, **gemma_kwargs)
         except Exception:
-            if extractive_answer is not None:
-                return extractive_answer
+            if grounded_extractive_answer is not None:
+                return grounded_extractive_answer
             answer_text = "I can't verify that from the contract."
 
         answer_text = answer_text.strip() or "I can't verify that from the contract."
         refused = answer_text == "I can't verify that from the contract."
         if (summary_request or deep_think or expand_answer) and (refused or not answer_text):
-            if extractive_answer is not None:
-                return extractive_answer
-        return AssistantAnswer(answer_text, citations, refused)
+            if grounded_extractive_answer is not None:
+                return grounded_extractive_answer
+        return AssistantAnswer(answer_text, refusal_citations if refused and evidence_is_weak else citations, refused)
+
+    def _retrieve_trace(self, effective_question: str, gemma_client, *, deep_think: bool) -> object | None:
+        retrieve_trace = getattr(self.retriever, "retrieve_trace", None)
+        if not callable(retrieve_trace):
+            return None
+        try:
+            return retrieve_trace(
+                effective_question,
+                profile="deep" if deep_think else "normal",
+                gemma_client=gemma_client,
+            )
+        except TypeError:
+            return retrieve_trace(effective_question, profile="deep" if deep_think else "normal")
+
+    def _build_standard_prompt_context(self, effective_question: str, ranked, citations, trace) -> str:
+        if trace is not None and trace.selected_bundle is not None:
+            build_bundle = getattr(self.retriever, "build_bundle_evidence_pack", None)
+            if callable(build_bundle):
+                return build_bundle(trace.selected_bundle)
+        build_evidence = getattr(self.retriever, "build_evidence_pack", None)
+        if callable(build_evidence):
+            return build_evidence(effective_question, ranked, citations)
+        return ""
 
     @classmethod
     def resolve_question(cls, question: str, history: Sequence[dict[str, str]] | None = None) -> str:
@@ -196,14 +220,6 @@ class AnswerPolicy:
         if normalized_anchor and normalized_anchor in normalized:
             return question
         stem = question.rstrip(" ?.!")
-        if normalized.startswith(("what section", "which section")):
-            return f"what section talks about {anchor}"
-        if normalized.startswith(("what page", "which page")):
-            return f"which page mentions {anchor}"
-        if normalized.startswith(("quote that", "show me that")):
-            return f"show me {anchor}"
-        if normalized.startswith(("where ", "who ", "when ", "how many ", "how much ")):
-            return f"{stem} for {anchor}"
         return f"{stem} regarding {anchor}"
 
     @classmethod
@@ -381,7 +397,7 @@ class AnswerPolicy:
         return None
 
     @staticmethod
-    def limit_citations(citations: list[Citation], limit: int = 3) -> list[Citation]:
+    def limit_citations(citations: list[Citation], limit: int = 5) -> list[Citation]:
         limited: list[Citation] = []
         seen_pages: set[int] = set()
         for citation in citations:
@@ -458,7 +474,14 @@ class AnswerPolicy:
         if not lines:
             return None
         primary = ranked[0]
-        location_citation = next((citation for citation in citations if citation.attachment), citations[0] if citations else None)
+        location_citation = next(
+            (
+                citation
+                for citation in citations
+                if citation.attachment and re.match(r"^(appendix|attachment|exhibit)\b", citation.heading, re.IGNORECASE)
+            ),
+            next((citation for citation in citations if citation.attachment), citations[0] if citations else None),
+        )
         if location_citation is not None:
             label = location_citation.section_number or "Unnumbered clause"
             heading = " ".join(location_citation.heading.split())
@@ -752,6 +775,9 @@ class AnswerPolicy:
         return (
             re.compile(r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten)\s+\(?\d+\)?\s*[xX]\s*\d+%", re.IGNORECASE),
             re.compile(r"\b\(?\d+\)?\s*[xX]\s*\d+%", re.IGNORECASE),
+            re.compile(r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+\d+%\s+capacity\b", re.IGNORECASE),
+            re.compile(r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+full\s+capacity\b", re.IGNORECASE),
+            re.compile(r"\b(?:duty|standby|lead|lag)(?:\s*[/,-]?\s*(?:duty|standby|lead|lag))+\b", re.IGNORECASE),
         )
 
     @classmethod
@@ -834,8 +860,10 @@ class AnswerPolicy:
             if re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", normalized):
                 score += 2.4
             score += min(2.0, cls.numeric_value_count(sentence) * 0.4)
+            if cls.is_generic_attribute_question(plan) and cls.has_attribute_guidance_marker(normalized):
+                score += 2.2
         elif label == "configuration":
-            if re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b|\bduplex\b|\bredun", normalized):
+            if cls.matches_configuration_text(normalized):
                 score += 2.1
         elif label == "type":
             if re.search(r"\bmodel\b|\btype\b|\bselected\b|\bvendor\b|\bmanufacturer\b|\buse\b|\busing\b", normalized):
@@ -854,6 +882,10 @@ class AnswerPolicy:
             score += min(1.8, cls.numeric_value_count(sentence) * 0.35)
             if any(term in normalized for term in plan.attribute_terms):
                 score += 1.6
+            if label in {"pressure", "temperature"} and cls.is_generic_attribute_question(plan) and cls.has_attribute_guidance_marker(normalized):
+                score += 1.9
+                if cls.numeric_value_count(sentence) >= 3:
+                    score -= 0.55
         elif label == "responsibility":
             if re.search(r"\b(shall|must|required|responsible|provide|furnish|supply|perform|deliver)\b", normalized):
                 score += 2.0
@@ -973,6 +1005,10 @@ class AnswerPolicy:
         return len(lines) >= 1
 
     @classmethod
+    def has_strong_ranked_evidence(cls, plan: QueryPlan, ranked: list[RankedChunk]) -> bool:
+        return any(cls.is_strong_question_match(plan, chunk) for chunk in ranked[:3])
+
+    @classmethod
     def is_strong_question_match(cls, plan: QueryPlan, chunk: RankedChunk) -> bool:
         minimum_score = 0.42
         if plan.attribute_label or plan.count_question or cls.is_value_or_requirement_question(plan):
@@ -1027,7 +1063,15 @@ class AnswerPolicy:
     def matches_scope(plan: QueryPlan, text: str) -> bool:
         if not plan.scope_terms:
             return True
+        specific_scope_terms = AnswerPolicy.specific_scope_terms(plan.scope_terms)
+        if specific_scope_terms:
+            return any(has_term_overlap(text, (term,)) for term in specific_scope_terms)
         return any(has_term_overlap(text, (term,)) for term in plan.scope_terms)
+
+    @staticmethod
+    def specific_scope_terms(scope_terms: tuple[str, ...]) -> tuple[str, ...]:
+        generic = {"appendix", "appendices", "attachment", "attachments", "exhibit", "exhibits"}
+        return tuple(term for term in scope_terms if term.strip().lower() and term.strip().lower() not in generic)
 
     @staticmethod
     def matches_attribute(plan: QueryPlan, text: str) -> bool:
@@ -1042,7 +1086,7 @@ class AnswerPolicy:
         if label == "design_conditions":
             return bool(re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", lowered))
         if label == "configuration":
-            return bool(re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b", lowered))
+            return AnswerPolicy.matches_configuration_text(lowered)
         if label == "type":
             return bool(re.search(r"\bmodel\b|\btype\b|\bselected\b|\bmanufacturer\b|\bvendor\b", lowered) or re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b", text))
         if label == "size":
@@ -1158,7 +1202,7 @@ class AnswerPolicy:
         if label == "design_conditions":
             return bool(re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", lowered_excerpt) or re.search(r"\d", lowered_excerpt))
         if label == "configuration":
-            return bool(re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b|\bduplex\b|\bredun", lowered_excerpt))
+            return AnswerPolicy.matches_configuration_text(lowered_excerpt)
         if label == "type":
             return bool(re.search(r"\bmodel\b|\btype\b|\bselected\b|\bvendor\b|\bmanufacturer\b", lowered_excerpt) or re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b", lowered_excerpt))
         if label == "size":
@@ -1188,6 +1232,37 @@ class AnswerPolicy:
         if cleaned_excerpt.lower().startswith("section ") and "agreement" in cleaned_excerpt.lower() and len(cleaned_excerpt) < 110:
             return False
         return cls.is_useful_extractive_block(chunk.heading, excerpt, plan)
+
+    @staticmethod
+    def has_attribute_guidance_marker(text: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(different|var(?:y|ies|ied)|based on|depends on|determined|established|same basis|basis as|all components)\b",
+                text,
+            )
+        )
+
+    @classmethod
+    def is_generic_attribute_question(cls, plan: QueryPlan) -> bool:
+        if plan.attribute_label not in {"design_conditions", "pressure", "temperature"}:
+            return False
+        subject_terms = [
+            term
+            for term in plan.system_terms + plan.concept_terms + plan.scope_terms
+            if term
+            and term not in GENERIC_SUBJECT_TERMS
+            and term not in plan.attribute_terms
+        ]
+        return not subject_terms
+
+    @staticmethod
+    def matches_configuration_text(text: str) -> bool:
+        return bool(
+            re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b|\bduplex\b|\bredun", text)
+            or re.search(r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s*(?:x\s*)?\d+%\s*capacity\b", text)
+            or re.search(r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+full\s+capacity\b", text)
+            or re.search(r"\b(?:duty|standby|lead|lag)\b", text)
+        )
 
     @staticmethod
     def focus_phrases(focus_terms: tuple[str, ...]) -> tuple[str, ...]:

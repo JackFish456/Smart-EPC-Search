@@ -172,3 +172,47 @@ def test_generate_accepts_expand_answer_overrides(monkeypatch) -> None:
     assert "Earlier answer already shown to the user:" in calls[0]["user_text"]
     assert "Keep it compact, and include the most relevant section/page location" in calls[0]["user_text"]
     assert "explicitly asked for more detail" in calls[0]["system_prompt"]
+
+
+def test_generate_candidate_select_uses_structured_json_prompt(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeRuntime:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def load(self) -> None:
+            return None
+
+        def generate(self, *, user_text: str, system_prompt: str, enable_thinking=None, max_new_tokens=None):
+            calls.append(
+                {
+                    "user_text": user_text,
+                    "system_prompt": system_prompt,
+                    "enable_thinking": enable_thinking,
+                    "max_new_tokens": max_new_tokens,
+                }
+            )
+            return SimpleNamespace(text='{"candidate_id":"candidate_b","supporting_quote":"quote","insufficient_support":false}')
+
+    monkeypatch.setattr(gemma_service, "GemmaChatRuntime", FakeRuntime)
+
+    app = gemma_service.create_app()
+    client = app.test_client()
+    response = client.post(
+        "/generate",
+        json={
+            "question": "What is the turbine we are using?",
+            "context": "Candidate ID: candidate_a\nCandidate ID: candidate_b",
+            "response_style": "candidate_select",
+            "max_new_tokens": 192,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["answer"] == '{"candidate_id":"candidate_b","supporting_quote":"quote","insufficient_support":false}'
+    assert calls[0]["max_new_tokens"] == 192
+    assert calls[0]["enable_thinking"] is None
+    assert "Choose the single best candidate that directly answers the question." in calls[0]["user_text"]
+    assert '"candidate_id"' in calls[0]["user_text"]
+    assert "return json only with keys candidate_id, supporting_quote, insufficient_support" in calls[0]["system_prompt"].lower()

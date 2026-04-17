@@ -4,6 +4,7 @@ import hashlib
 import math
 import re
 from dataclasses import dataclass
+from typing import Sequence
 
 from epc_smart_search.config import MAX_EMBEDDING_DIM, MAX_SEARCH_RESULTS, MAX_SEMANTIC_SCAN
 from epc_smart_search.query_planner import (
@@ -59,6 +60,7 @@ class SearchCandidate:
     total_score: float
     lexical_score: float
     semantic_score: float
+    source_names: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -78,6 +80,30 @@ class RetrievalProfile:
     use_query_expansion: bool = False
 
 
+@dataclass(slots=True)
+class EvidenceBundle:
+    bundle_id: str
+    primary_chunk_id: str
+    ranked_chunks: tuple[RankedChunk, ...]
+    citations: tuple[Citation, ...]
+    bundle_score: float
+    confidence: float
+    source_names: tuple[str, ...]
+    gemma_selected: bool = False
+    supporting_quote: str = ""
+
+
+@dataclass(slots=True)
+class RetrievalTrace:
+    query: str
+    plan: QueryPlan
+    recall_sources: dict[str, list[RankedChunk]]
+    merged_ranked: list[RankedChunk]
+    bundles: list[EvidenceBundle]
+    selected_bundle: EvidenceBundle | None
+    used_gemma_disambiguation: bool = False
+
+
 DEFAULT_RETRIEVAL_PROFILE = RetrievalProfile(
     name="normal",
     result_limit=MAX_SEARCH_RESULTS,
@@ -93,6 +119,13 @@ DEEP_RETRIEVAL_PROFILE = RetrievalProfile(
     semantic_limit=36,
     use_query_expansion=True,
 )
+SEMANTIC_RECALL_KEEP = 20
+LEXICAL_RECALL_KEEP = 20
+MERGED_RECALL_KEEP = 24
+GROUPED_MERGED_RECALL_KEEP = 40
+DEFAULT_FINAL_RANKED_KEEP = 8
+DEEP_FINAL_RANKED_KEEP = 10
+GEMMA_DISAMBIGUATION_TOP_K = 3
 
 
 class HashingEmbedder:
@@ -158,76 +191,496 @@ class HybridRetriever:
         limit: int | None = None,
         profile: str = "normal",
     ) -> list[RankedChunk]:
+        trace = self.retrieve_trace(query, limit=limit, profile=profile)
+        return trace.merged_ranked
+
+    def retrieve_trace(
+        self,
+        query: str,
+        *,
+        limit: int | None = None,
+        profile: str = "normal",
+        gemma_client=None,
+    ) -> RetrievalTrace:
         document_id = self.resolve_document_id()
         if not document_id:
-            return []
+            return RetrievalTrace(query, self.plan_query(query), {}, [], [], None, False)
         plan = self.plan_query(query)
         active_profile = self._resolve_profile(profile, limit)
         if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST:
             active_profile = RetrievalProfile(
                 name=active_profile.name,
-                result_limit=max(active_profile.result_limit, 6),
+                result_limit=max(active_profile.result_limit, DEFAULT_FINAL_RANKED_KEEP),
                 fts_limit=max(active_profile.fts_limit, 36),
                 keyword_limit=max(active_profile.keyword_limit, 24),
-                semantic_limit=max(active_profile.semantic_limit, 24),
+                semantic_limit=max(active_profile.semantic_limit, MAX_SEMANTIC_SCAN),
                 use_query_expansion=active_profile.use_query_expansion,
             )
-        semantic_query = plan.content_query or query
+        query_vector = self.embedder.embed(query)
+        recall_sources, combined = self._collect_recall_candidates(document_id, query, query_vector, plan, active_profile)
+        merged_limit = GROUPED_MERGED_RECALL_KEEP if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST else MERGED_RECALL_KEEP
+        merged = sorted(combined.values(), key=lambda item: item.total_score, reverse=True)[:merged_limit]
+        bundles = self._build_ranked_bundles(document_id, query_vector, plan, merged, active_profile)
+        selected_bundle = bundles[0] if bundles else None
+        used_gemma_disambiguation = False
+        if gemma_client is not None and bundles:
+            gemma_bundle = self._select_bundle_with_gemma(query, bundles, gemma_client)
+            if gemma_bundle is not None:
+                selected_bundle = gemma_bundle
+                used_gemma_disambiguation = True
+                selected_bundle.gemma_selected = True
+        merged_ranked: list[RankedChunk] = []
+        seen_chunk_ids: set[str] = set()
+        max_depth = max((len(bundle.ranked_chunks) for bundle in bundles), default=0)
+        for depth in range(max_depth):
+            for bundle in bundles:
+                if depth >= len(bundle.ranked_chunks):
+                    continue
+                chunk = bundle.ranked_chunks[depth]
+                if chunk.chunk_id in seen_chunk_ids:
+                    continue
+                seen_chunk_ids.add(chunk.chunk_id)
+                merged_ranked.append(chunk)
+                if len(merged_ranked) >= active_profile.result_limit:
+                    break
+            if len(merged_ranked) >= active_profile.result_limit:
+                break
+        return RetrievalTrace(
+            query=query,
+            plan=plan,
+            recall_sources=recall_sources,
+            merged_ranked=merged_ranked,
+            bundles=bundles,
+            selected_bundle=selected_bundle,
+            used_gemma_disambiguation=used_gemma_disambiguation,
+        )
+
+    def _collect_recall_candidates(
+        self,
+        document_id: str,
+        query: str,
+        query_vector: list[float],
+        plan: QueryPlan,
+        profile: RetrievalProfile,
+    ) -> tuple[dict[str, list[RankedChunk]], dict[str, SearchCandidate]]:
         combined: dict[str, SearchCandidate] = {}
+        recall_sources: dict[str, list[RankedChunk]] = {}
 
         if plan.section_number:
-            for row in self.store.section_lookup(document_id, plan.section_number):
-                candidate = self._score_row(plan, row, lexical_score=1.0, semantic_score=0.85, bonus=0.9)
-                combined[str(row["chunk_id"])] = candidate
+            rows = self.store.section_lookup(document_id, plan.section_number)
+            recall_sources["section_lookup"] = []
+            for row in rows:
+                candidate = self._make_recall_candidate(
+                    query,
+                    plan,
+                    row,
+                    lexical_score=1.0,
+                    semantic_score=0.85,
+                    bonus=0.9,
+                    source_name="section_lookup",
+                )
+                recall_sources["section_lookup"].append(self._ranked_from_candidate(candidate))
+                self._merge_recall_candidate(combined, candidate)
 
-        for search_pass in self._search_passes_for_profile(plan, active_profile):
-            for row in self.store.search_chunk_feature_fts(document_id, search_pass.query, limit=active_profile.fts_limit):
+        raw_match_query = build_match_query(query)
+        if raw_match_query:
+            rows = self.store.search_chunk_feature_fts(document_id, raw_match_query, limit=LEXICAL_RECALL_KEEP)
+            recall_sources["raw_fts"] = []
+            for row in rows:
                 lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
-                semantic_score = self._semantic_for_row(semantic_query, row)
-                candidate = self._score_row(
+                semantic_score = self._semantic_for_row(query_vector, row)
+                candidate = self._make_recall_candidate(
+                    query,
                     plan,
                     row,
                     lexical_score=lexical_score,
                     semantic_score=semantic_score,
-                    bonus=search_pass.bonus,
+                    source_name="raw_fts",
+                )
+                recall_sources["raw_fts"].append(self._ranked_from_candidate(candidate))
+                self._merge_recall_candidate(combined, candidate)
+
+        recall_sources["planner_hints"] = []
+        for search_pass in self._search_passes_for_profile(plan, profile):
+            rows = self.store.search_chunk_feature_fts(document_id, search_pass.query, limit=profile.fts_limit)
+            for row in rows:
+                lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
+                semantic_score = self._semantic_for_row(query_vector, row)
+                candidate = self._make_recall_candidate(
+                    query,
+                    plan,
+                    row,
+                    lexical_score=lexical_score,
+                    semantic_score=semantic_score,
+                    bonus=min(search_pass.bonus, 0.8) * 0.2,
+                    source_name=f"hint:{search_pass.name}",
                     search_pass_name=search_pass.name,
                 )
-                self._merge_candidate(combined, candidate)
+                recall_sources["planner_hints"].append(self._ranked_from_candidate(candidate))
+                self._merge_recall_candidate(combined, candidate)
 
-        if not combined:
-            for fallback_query in self._fallback_queries_for_profile(plan, active_profile):
-                for row in self.store.keyword_like_search(document_id, fallback_query, limit=active_profile.keyword_limit):
-                    lexical_score = 1.0 / (1.0 + max(float(row["bm25_score"]), 0.0))
-                    semantic_score = self._semantic_for_row(semantic_query, row)
-                    candidate = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
-                    self._merge_candidate(combined, candidate)
+        recall_sources["keyword"] = []
+        for fallback_query in self._fallback_queries_for_profile(plan, profile):
+            rows = self.store.keyword_like_search(document_id, fallback_query, limit=profile.keyword_limit)
+            for row in rows:
+                semantic_score = self._semantic_for_row(query_vector, row)
+                candidate = self._make_recall_candidate(
+                    query,
+                    plan,
+                    row,
+                    lexical_score=0.2,
+                    semantic_score=semantic_score,
+                    source_name="keyword",
+                )
+                recall_sources["keyword"].append(self._ranked_from_candidate(candidate))
+                self._merge_recall_candidate(combined, candidate)
 
-        if not combined:
-            query_vector = self.embedder.embed(semantic_query)
-            for row, semantic_score in self._semantic_candidates(
-                document_id,
-                query_vector,
-                limit=active_profile.semantic_limit,
-            ):
-                candidate = self._score_row(plan, row, lexical_score=0.0, semantic_score=semantic_score)
-                self._merge_candidate(combined, candidate)
-
-        ranked = [
-            RankedChunk(
-                chunk_id=str(candidate.row["chunk_id"]),
-                section_number=candidate.row["section_number"],
-                heading=str(candidate.row["heading"]),
-                full_text=str(candidate.row["full_text"]),
-                page_start=int(candidate.row["page_start"]),
-                page_end=int(candidate.row["page_end"]),
-                ordinal_in_document=int(candidate.row["ordinal_in_document"]),
-                total_score=candidate.total_score,
-                lexical_score=candidate.lexical_score,
-                semantic_score=candidate.semantic_score,
+        recall_sources["semantic"] = []
+        for row, semantic_score in self._semantic_candidates(
+            document_id,
+            query_vector,
+            limit=max(profile.semantic_limit, MAX_SEMANTIC_SCAN),
+        ):
+            candidate = self._make_recall_candidate(
+                query,
+                plan,
+                row,
+                lexical_score=0.0,
+                semantic_score=semantic_score,
+                source_name="semantic",
             )
-            for candidate in sorted(combined.values(), key=lambda item: item.total_score, reverse=True)[: active_profile.result_limit]
+            recall_sources["semantic"].append(self._ranked_from_candidate(candidate))
+            self._merge_recall_candidate(combined, candidate)
+
+        for source_name, rows in list(recall_sources.items()):
+            recall_sources[source_name] = sorted(rows, key=lambda item: item.total_score, reverse=True)[:LEXICAL_RECALL_KEEP]
+        return recall_sources, combined
+
+    def _build_ranked_bundles(
+        self,
+        document_id: str,
+        query_vector: list[float],
+        plan: QueryPlan,
+        merged: Sequence[SearchCandidate],
+        profile: RetrievalProfile,
+    ) -> list[EvidenceBundle]:
+        bundles = [
+            self._build_bundle(document_id, query_vector, plan, candidate)
+            for candidate in merged
         ]
+        bundles = [bundle for bundle in bundles if bundle.ranked_chunks]
+        bundles.sort(key=lambda item: item.bundle_score, reverse=True)
+        limit = DEEP_FINAL_RANKED_KEEP if profile.name == "deep" else DEFAULT_FINAL_RANKED_KEEP
+        return bundles[:limit]
+
+    def _build_bundle(
+        self,
+        document_id: str,
+        query_vector: list[float],
+        plan: QueryPlan,
+        candidate: SearchCandidate,
+    ) -> EvidenceBundle:
+        rows = self._bundle_rows_for_candidate(document_id, candidate.row)
+        ranked_chunks = self._rank_bundle_rows(query_vector, plan, rows, candidate)
+        citations = self._citations_from_rows(rows)
+        bundle_text = "\n".join(" ".join(str(row["full_text"]).split()) for row in rows if str(row["full_text"]).strip())
+        bundle_semantic = cosine_similarity(query_vector, self.embedder.embed(bundle_text)) if bundle_text else 0.0
+        primary_chunk_score = ranked_chunks[0].total_score if ranked_chunks else 0.0
+        bundle_lower = (
+            " "
+            + " ".join(f"{row['heading']} {row['full_text']}" for row in rows)
+            + " "
+        ).lower()
+        system_binding = self._bundle_system_binding(plan, bundle_lower)
+        attribute_binding = self._bundle_attribute_binding(plan, bundle_lower)
+        support_binding = self._bundle_support_binding(plan, rows)
+        attachment_bonus = 0.15 if any(str(row["chunk_type"]).lower() == "exhibit" for row in rows) else 0.0
+        thin_penalty = 0.4 if self._is_low_content_body(str(candidate.row["full_text"]), str(candidate.row["section_number"] or "")) else 0.0
+        bundle_score = (
+            primary_chunk_score * 0.22
+            + candidate.total_score * 0.18
+            + bundle_semantic * 1.35
+            + system_binding
+            + attribute_binding
+            + support_binding
+            + attachment_bonus
+            - thin_penalty
+        )
+        confidence = max(0.0, min(1.0, 0.46 + bundle_semantic * 0.35 + system_binding * 0.08 + attribute_binding * 0.08 + support_binding * 0.05))
+        return EvidenceBundle(
+            bundle_id=str(candidate.row["chunk_id"]),
+            primary_chunk_id=str(candidate.row["chunk_id"]),
+            ranked_chunks=tuple(ranked_chunks),
+            citations=tuple(citations),
+            bundle_score=bundle_score,
+            confidence=confidence,
+            source_names=candidate.source_names,
+        )
+
+    def _bundle_rows_for_candidate(self, document_id: str, row: dict) -> list[dict]:
+        rows: list[dict] = [row]
+        parent_chunk_id = self._row_value(row, "parent_chunk_id")
+        parent = self.store.fetch_parent(parent_chunk_id)
+        if parent is not None:
+            rows.append(parent)
+        page_start = int(self._row_value(row, "page_start", 0) or 0)
+        page_end = int(self._row_value(row, "page_end", 0) or 0)
+        is_exhibit_anchor = str(self._row_value(row, "chunk_type", "")).lower() == "exhibit" or bool(
+            re.match(r"^(appendix|attachment|exhibit)\b", str(self._row_value(row, "heading", "")), flags=re.IGNORECASE)
+        )
+        rows.extend(self.store.fetch_children(str(self._row_value(row, "chunk_id", "")), limit=4))
+        rows.extend(self.store.fetch_context_neighbors(document_id, int(self._row_value(row, "ordinal_in_document", 0) or 0)))
+        rows.extend(
+            self.store.fetch_chunks_on_pages(
+                document_id,
+                page_start,
+                page_end + (4 if is_exhibit_anchor else 0),
+                limit=12 if is_exhibit_anchor else 6,
+            )
+        )
+        deduped: list[dict] = []
+        seen_ids: set[str] = set()
+        for candidate_row in rows:
+            chunk_id = str(candidate_row["chunk_id"])
+            if chunk_id in seen_ids:
+                continue
+            seen_ids.add(chunk_id)
+            deduped.append(candidate_row)
+        return deduped
+
+    def _rank_bundle_rows(
+        self,
+        query_vector: list[float],
+        plan: QueryPlan,
+        rows: Sequence[dict],
+        primary_candidate: SearchCandidate,
+    ) -> list[RankedChunk]:
+        ranked: list[RankedChunk] = []
+        primary_id = str(primary_candidate.row["chunk_id"])
+        for row in rows:
+            chunk_id = str(row["chunk_id"])
+            lexical_score = primary_candidate.lexical_score if chunk_id == primary_id else 0.0
+            semantic_score = self._semantic_for_row(query_vector, row)
+            scored = self._score_row(plan, row, lexical_score=lexical_score, semantic_score=semantic_score)
+            ranked.append(self._ranked_from_candidate(scored))
+        ranked.sort(
+            key=lambda item: (
+                item.total_score,
+                item.semantic_score,
+                1 if item.chunk_id == primary_id else 0,
+            ),
+            reverse=True,
+        )
         return ranked
+
+    def _select_bundle_with_gemma(
+        self,
+        query: str,
+        bundles: Sequence[EvidenceBundle],
+        gemma_client,
+    ) -> EvidenceBundle | None:
+        if not self._should_use_gemma_disambiguation(bundles):
+            return None
+        prompt_context = self._build_disambiguation_context(query, bundles[:GEMMA_DISAMBIGUATION_TOP_K])
+        try:
+            raw = gemma_client.ask(query, prompt_context, response_style="candidate_select", max_new_tokens=192)
+        except Exception:
+            return None
+        bundle_id, supporting_quote = self._parse_gemma_bundle_selection(raw)
+        if not bundle_id:
+            return None
+        for bundle in bundles[:GEMMA_DISAMBIGUATION_TOP_K]:
+            if bundle.bundle_id == bundle_id:
+                bundle.supporting_quote = supporting_quote
+                return bundle
+        return None
+
+    @staticmethod
+    def _should_use_gemma_disambiguation(bundles: Sequence[EvidenceBundle]) -> bool:
+        if len(bundles) < 2:
+            return False
+        top = bundles[0]
+        second = bundles[1]
+        return (top.bundle_score - second.bundle_score) < 0.35 or top.confidence < 0.62
+
+    def _build_disambiguation_context(self, query: str, bundles: Sequence[EvidenceBundle]) -> str:
+        blocks: list[str] = []
+        for bundle in bundles:
+            section = bundle.ranked_chunks[0].section_number if bundle.ranked_chunks else ""
+            heading = bundle.ranked_chunks[0].heading if bundle.ranked_chunks else ""
+            pages = self._format_page_range(bundle.ranked_chunks[0].page_start, bundle.ranked_chunks[0].page_end) if bundle.ranked_chunks else ""
+            excerpts = [f"- {self._short_quote(chunk.full_text, limit=220)}" for chunk in bundle.ranked_chunks[:3] if chunk.full_text]
+            blocks.append(
+                f"Candidate ID: {bundle.bundle_id}\n"
+                f"Section: {section or 'Unnumbered clause'}\n"
+                f"Heading: {heading}\n"
+                f"Pages: {pages}\n"
+                f"Evidence:\n" + "\n".join(excerpts)
+            )
+        return (
+            "Select the single best-supported candidate that directly answers the user question.\n"
+            "Return JSON only in this format: "
+            '{"candidate_id":"...", "supporting_quote":"...", "insufficient_support":false}\n\n'
+            f"User question:\n{query}\n\n"
+            "Candidates:\n" + "\n\n".join(blocks)
+        )
+
+    @staticmethod
+    def _parse_gemma_bundle_selection(raw: str) -> tuple[str, str]:
+        compact = str(raw or "").strip()
+        match = re.search(r'"candidate_id"\s*:\s*"([^"]+)"', compact)
+        quote_match = re.search(r'"supporting_quote"\s*:\s*"([^"]*)"', compact)
+        insufficient_match = re.search(r'"insufficient_support"\s*:\s*(true|false)', compact, re.IGNORECASE)
+        if insufficient_match and insufficient_match.group(1).lower() == "true":
+            return "", ""
+        return (match.group(1).strip() if match else "", quote_match.group(1).strip() if quote_match else "")
+
+    def _make_recall_candidate(
+        self,
+        query: str,
+        plan: QueryPlan,
+        row: dict,
+        *,
+        lexical_score: float,
+        semantic_score: float,
+        bonus: float = 0.0,
+        source_name: str,
+        search_pass_name: str = "",
+    ) -> SearchCandidate:
+        recall_score = self._recall_score(plan, row, lexical_score=lexical_score, semantic_score=semantic_score, bonus=bonus)
+        candidate = self._score_row(
+            plan,
+            row,
+            lexical_score=lexical_score,
+            semantic_score=semantic_score,
+            bonus=bonus,
+            search_pass_name=search_pass_name,
+        )
+        candidate.total_score = recall_score
+        candidate.source_names = (source_name,)
+        return candidate
+
+    @staticmethod
+    def _recall_score(
+        plan: QueryPlan,
+        row: dict,
+        *,
+        lexical_score: float,
+        semantic_score: float,
+        bonus: float = 0.0,
+    ) -> float:
+        score = semantic_score * 0.62 + lexical_score * 0.38 + bonus
+        section_number = str(HybridRetriever._row_value(row, "section_number", "") or "")
+        full_text = str(HybridRetriever._row_value(row, "full_text", "") or "")
+        if plan.section_number and section_number == plan.section_number:
+            score += 0.75
+        if HybridRetriever._is_low_content_body(full_text, section_number):
+            score -= 0.15
+        return score
+
+    @staticmethod
+    def _merge_recall_candidate(combined: dict[str, SearchCandidate], candidate: SearchCandidate) -> None:
+        chunk_id = str(candidate.row["chunk_id"])
+        existing = combined.get(chunk_id)
+        if existing is None:
+            combined[chunk_id] = candidate
+            return
+        source_names = tuple(sorted(set(existing.source_names + candidate.source_names)))
+        if candidate.total_score > existing.total_score:
+            candidate.source_names = source_names
+            combined[chunk_id] = candidate
+            return
+        existing.source_names = source_names
+
+    def _citations_from_rows(self, rows: Sequence[dict], *, limit: int = 8) -> list[Citation]:
+        citations: list[Citation] = []
+        seen_ids: set[str] = set()
+        for row in rows:
+            chunk_id = str(row["chunk_id"])
+            if chunk_id in seen_ids:
+                continue
+            seen_ids.add(chunk_id)
+            citations.append(
+                Citation(
+                    chunk_id=chunk_id,
+                    section_number=row["section_number"],
+                    heading=self._compact_heading(str(row["heading"])),
+                    attachment=self._attachment_label(chunk_id),
+                    page_start=int(row["page_start"]),
+                    page_end=int(row["page_end"]),
+                    quote=self._short_quote(str(row["full_text"])),
+                )
+            )
+            if len(citations) >= limit:
+                break
+        return citations
+
+    @staticmethod
+    def _bundle_system_binding(plan: QueryPlan, bundle_text: str) -> float:
+        if not plan.system_phrase and not plan.system_terms:
+            return 0.0
+        score = 0.0
+        if plan.system_phrase and plan.system_phrase in bundle_text:
+            score += 0.55
+        score += 0.12 * sum(1 for term in plan.system_terms if term and term in bundle_text)
+        score += 0.18 * sum(1 for term in plan.system_significant_terms if term and term in bundle_text)
+        return score
+
+    @staticmethod
+    def _bundle_attribute_binding(plan: QueryPlan, bundle_text: str) -> float:
+        if not plan.attribute_terms and not plan.attribute_label:
+            return 0.0
+        score = 0.1 * sum(1 for term in plan.attribute_terms if term and term in bundle_text)
+        label = plan.attribute_label or ""
+        if label == "design_conditions" and re.search(r"\bdesign conditions?\b|\bdesign basis\b|\boperating conditions?\b", bundle_text):
+            score += 0.45
+        elif label == "configuration" and re.search(r"\bconfiguration\b|\bconfigured\b|\barrangement\b|\bduplex\b|\bredun|\bstandby\b|\blead\b|\blag\b", bundle_text):
+            score += 0.42
+        elif label == "type" and re.search(r"\bmodel\b|\btype\b|\bselected\b|\bmanufacturer\b|\bvendor\b", bundle_text):
+            score += 0.42
+        elif label in {"pressure", "temperature", "flow", "size", "capacity", "power"} and re.search(r"\b\d", bundle_text):
+            score += 0.3
+        elif label == "function" and re.search(r"\b(receives|supplies|provides|distributes|conditions|transports|serves|operates)\b", bundle_text):
+            score += 0.35
+        return score
+
+    @staticmethod
+    def _bundle_support_binding(plan: QueryPlan, rows: Sequence[dict]) -> float:
+        if not rows:
+            return 0.0
+        support = 0.0
+        if any(HybridRetriever._row_value(row, "parent_chunk_id") for row in rows):
+            support += 0.08
+        primary_chunk_id = str(HybridRetriever._row_value(rows[0], "chunk_id", ""))
+        if any(str(HybridRetriever._row_value(row, "parent_chunk_id", "") or "") == primary_chunk_id for row in rows[1:]):
+            support += 0.15
+        if len({int(HybridRetriever._row_value(row, "page_start", 0) or 0) for row in rows}) == 1 and len(rows) > 1:
+            support += 0.12
+        if plan.answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT:
+            normalized = " ".join(str(HybridRetriever._row_value(row, "full_text", "")) for row in rows).lower()
+            if re.search(r"\bguarantee\b|\bshall not exceed\b|\bnot exceed\b|\blimits?\b", normalized):
+                support += 0.18
+        return support
+
+    @staticmethod
+    def _format_page_range(page_start: int, page_end: int) -> str:
+        return f"{page_start}" if page_start == page_end else f"{page_start}-{page_end}"
+
+    @staticmethod
+    def _ranked_from_candidate(candidate: SearchCandidate) -> RankedChunk:
+        row = candidate.row
+        return RankedChunk(
+            chunk_id=str(row["chunk_id"]),
+            section_number=row["section_number"],
+            heading=str(row["heading"]),
+            full_text=str(row["full_text"]),
+            page_start=int(row["page_start"]),
+            page_end=int(row["page_end"]),
+            ordinal_in_document=int(row["ordinal_in_document"]),
+            total_score=candidate.total_score,
+            lexical_score=candidate.lexical_score,
+            semantic_score=candidate.semantic_score,
+        )
 
     def expand_with_context(self, ranked: list[RankedChunk]) -> list[Citation]:
         document_id = self.resolve_document_id()
@@ -235,12 +688,13 @@ class HybridRetriever:
             return []
         chosen_ids: set[str] = set()
         citations: list[Citation] = []
-        primary = ranked[0]
-        candidate_rows = list(self.store.fetch_context_neighbors(document_id, primary.ordinal_in_document))
+        primary = self._select_primary_ranked_chunk(ranked)
         primary_row = self.store.fetch_chunk(primary.chunk_id)
+        candidate_rows = [primary_row] if primary_row is not None else []
         parent = self.store.fetch_parent(primary_row["parent_chunk_id"]) if primary_row is not None else None
         if parent is not None:
-            candidate_rows.insert(0, parent)
+            candidate_rows.append(parent)
+        candidate_rows.extend(self.store.fetch_context_neighbors(document_id, primary.ordinal_in_document))
         candidate_rows.extend(self.store.fetch_chunks_on_pages(document_id, primary.page_start, primary.page_end, limit=4))
         for row in candidate_rows:
             if row["chunk_id"] in chosen_ids:
@@ -278,12 +732,29 @@ class HybridRetriever:
         document_id = self.resolve_document_id()
         if not document_id or not ranked:
             return self.build_prompt_context(citations)
-        primary = ranked[0]
+        primary = self._select_primary_ranked_chunk(ranked)
         pages = self.store.fetch_page_window(document_id, primary.page_start, primary.page_end, padding=0, limit=2)
         page_blocks = [
             f"Page {int(row['page_num'])}: {self._short_quote(str(row['page_text']), limit=500)}"
             for row in pages
         ]
+        return self.build_prompt_context(citations, page_blocks)
+
+    def build_bundle_evidence_pack(self, bundle: EvidenceBundle | None) -> str:
+        document_id = self.resolve_document_id()
+        if bundle is None:
+            return ""
+        citations = list(bundle.citations)
+        if not document_id or not bundle.ranked_chunks:
+            return self.build_prompt_context(citations)
+        primary = self._select_primary_ranked_chunk(list(bundle.ranked_chunks))
+        pages = self.store.fetch_page_window(document_id, primary.page_start, primary.page_end, padding=0, limit=3)
+        page_blocks = [
+            f"Page {int(row['page_num'])}: {self._short_quote(str(row['page_text']), limit=500)}"
+            for row in pages
+        ]
+        if bundle.supporting_quote:
+            page_blocks.insert(0, f"Selected support: {bundle.supporting_quote}")
         return self.build_prompt_context(citations, page_blocks)
 
     def find_exact_page_hits(self, query: str, limit: int = 8) -> list[ExactPageHit]:
@@ -370,6 +841,10 @@ class HybridRetriever:
         attribute_block = self._fts_term_block(plan.attribute_terms[:4])
         concept_block = self._fts_term_block(plan.concept_terms[:5])
         scope_block = self._fts_term_block(plan.scope_terms[:3])
+        guarantee_family_terms = tuple(
+            term for term in plan.expansion_terms if term in {"guarantee", "guarantees", "shall not exceed", "nox", "co", "ppmvd", "emissions"}
+        )
+        guarantee_family_block = self._fts_term_block(guarantee_family_terms[:6])
 
         if plan.request_shape == REQUEST_SHAPE_GROUPED_LIST and concept_block:
             heading_concept_phrase = " ".join(plan.concept_terms[:4])
@@ -407,6 +882,22 @@ class HybridRetriever:
                         1.95,
                     )
                 )
+            if plan.answer_family == ANSWER_FAMILY_GUARANTEE_OR_LIMIT and guarantee_family_block:
+                passes.append(
+                    SearchPass(
+                        "grouped_guarantee_family",
+                        guarantee_family_block,
+                        1.45,
+                    )
+                )
+                if scope_block:
+                    passes.append(
+                        SearchPass(
+                            "grouped_scope_guarantee_family",
+                            self._fts_and([guarantee_family_block, scope_block]),
+                            1.9,
+                        )
+                    )
 
         if plan.system_phrase and attribute_block:
             passes.append(
@@ -622,10 +1113,10 @@ class HybridRetriever:
             return f"Appendix {section_number.upper()}"
         return heading
 
-    def _semantic_for_row(self, query: str, row: dict) -> float:
+    def _semantic_for_row(self, query_vector: list[float], row: dict) -> float:
         vector = self._row_vector(row)
         if vector:
-            return cosine_similarity(self.embedder.embed(query), vector)
+            return cosine_similarity(query_vector, vector)
         return 0.0
 
     @staticmethod
@@ -645,13 +1136,13 @@ class HybridRetriever:
         bonus: float = 0.0,
         search_pass_name: str = "",
     ) -> SearchCandidate:
-        heading = str(row["heading"])
-        parent_heading = str(row["parent_heading"] or "")
-        full_text = str(row["full_text"])
-        actor_tags = str(row["actor_tags"] or "")
-        action_tags = str(row["action_tags"] or "")
-        topic_tags = str(row["topic_tags"] or "")
-        clause_type = str(row["clause_type"] or row["chunk_type"])
+        heading = str(self._row_value(row, "heading", ""))
+        parent_heading = str(self._row_value(row, "parent_heading", "") or "")
+        full_text = str(self._row_value(row, "full_text", ""))
+        actor_tags = str(self._row_value(row, "actor_tags", "") or "")
+        action_tags = str(self._row_value(row, "action_tags", "") or "")
+        topic_tags = str(self._row_value(row, "topic_tags", "") or "")
+        clause_type = str(self._row_value(row, "clause_type", self._row_value(row, "chunk_type", "")) or "")
         combined_text = " ".join([heading, parent_heading, full_text, actor_tags, action_tags, topic_tags])
         focus_phrases = self._focus_phrases(plan.focus_terms)
         system_score, exact_system_match = self._system_match_score(plan, heading, parent_heading, combined_text)
@@ -666,7 +1157,7 @@ class HybridRetriever:
         score += concept_score
         score += scope_score
         score += family_score
-        if row["section_number"] and row["section_number"] == plan.section_number:
+        if self._row_value(row, "section_number") and self._row_value(row, "section_number") == plan.section_number:
             score += 1.2
         if plan.content_query:
             if has_term_overlap(heading, (plan.content_query,)):
@@ -754,12 +1245,57 @@ class HybridRetriever:
             if "weather" in plan.normalized_query and not has_term_overlap(combined_text, ("weather",)):
                 score -= 0.6
         score -= self._noise_penalty(row)
+        if self._requires_meaningful_body(plan) and self._is_low_content_body(full_text, str(self._row_value(row, "section_number", "") or "")):
+            score -= 2.5
         return SearchCandidate(
             row=row,
             total_score=score,
             lexical_score=lexical_score,
             semantic_score=semantic_score,
         )
+
+    @staticmethod
+    def _row_value(row: dict, key: str, default=None):
+        if row is None:
+            return default
+        if isinstance(row, dict):
+            return row.get(key, default)
+        keys = getattr(row, "keys", None)
+        if callable(keys):
+            row_keys = keys()
+            if key in row_keys:
+                return row[key]
+            return default
+        try:
+            return row[key]
+        except Exception:
+            return default
+
+    @staticmethod
+    def _requires_meaningful_body(plan: QueryPlan) -> bool:
+        return bool(
+            plan.system_phrase
+            or plan.attribute_label
+            or plan.count_question
+            or plan.direct_text_question
+            or plan.request_shape == REQUEST_SHAPE_GROUPED_LIST
+        )
+
+    @staticmethod
+    def _is_low_content_body(full_text: str, section_number: str) -> bool:
+        compact = " ".join(full_text.split()).strip().strip(".")
+        if not compact:
+            return True
+        if section_number and compact == section_number.strip().strip("."):
+            return True
+        return len(TOKEN_RE.findall(compact)) <= 2
+
+    @classmethod
+    def _select_primary_ranked_chunk(cls, ranked: list[RankedChunk]) -> RankedChunk:
+        for chunk in ranked:
+            if not cls._is_low_content_body(chunk.full_text, chunk.section_number or ""):
+                return chunk
+        return ranked[0]
 
     @staticmethod
     def _system_match_score(plan: QueryPlan, heading: str, parent_heading: str, combined_text: str) -> tuple[float, bool]:
@@ -871,18 +1407,39 @@ class HybridRetriever:
     def _scope_match_score(plan: QueryPlan, heading: str, parent_heading: str, clause_type: str) -> tuple[float, bool]:
         if not plan.scope_terms:
             return 0.0, False
+        specific_scope_terms = HybridRetriever._specific_scope_terms(plan.scope_terms)
         score = 0.0
         matched = False
-        if has_term_overlap(heading, plan.scope_terms):
-            score += 1.2
-            matched = True
-        if has_term_overlap(parent_heading, plan.scope_terms):
-            score += 0.9
-            matched = True
+        if specific_scope_terms:
+            if has_term_overlap(heading, specific_scope_terms):
+                score += 1.25
+                matched = True
+            if has_term_overlap(parent_heading, specific_scope_terms):
+                score += 1.0
+                matched = True
+            if not matched and clause_type == "exhibit" and (has_term_overlap(heading, plan.scope_terms) or has_term_overlap(parent_heading, plan.scope_terms)):
+                score += 0.15
+        else:
+            if has_term_overlap(heading, plan.scope_terms):
+                score += 1.2
+                matched = True
+            if has_term_overlap(parent_heading, plan.scope_terms):
+                score += 0.9
+                matched = True
         if clause_type == "exhibit":
             score += 0.35
-            matched = True
+            matched = matched or not specific_scope_terms
         return score, matched
+
+    @staticmethod
+    def _specific_scope_terms(scope_terms: tuple[str, ...]) -> tuple[str, ...]:
+        generic = {"appendix", "appendices", "attachment", "attachments", "exhibit", "exhibits"}
+        specific: list[str] = []
+        for term in scope_terms:
+            normalized = term.strip().lower()
+            if normalized and normalized not in generic:
+                specific.append(term)
+        return tuple(specific)
 
     @staticmethod
     def _answer_family_score(plan: QueryPlan, full_text: str, heading: str, parent_heading: str) -> float:
@@ -906,18 +1463,18 @@ class HybridRetriever:
     @staticmethod
     def _noise_penalty(row: dict) -> float:
         penalty = 0.0
-        heading = str(row["heading"])
-        full_text = str(row["full_text"])
+        heading = str(HybridRetriever._row_value(row, "heading", "") or "")
+        full_text = str(HybridRetriever._row_value(row, "full_text", "") or "")
         if "...." in heading:
             penalty += 0.45
-        if full_text.count("....") >= 3 and int(row["page_start"]) <= 20:
+        if full_text.count("....") >= 3 and int(HybridRetriever._row_value(row, "page_start", 0) or 0) <= 20:
             penalty += 0.45
-        noise_flags = set(str(row["noise_flags"] or "").split())
+        noise_flags = set(str(HybridRetriever._row_value(row, "noise_flags", "") or "").split())
         if "date_heading" in noise_flags:
             penalty += 0.75
         if "thin" in noise_flags:
             penalty += 0.2
-        if str(row["section_number"] or "").strip() == "0":
+        if str(HybridRetriever._row_value(row, "section_number", "") or "").strip() == "0":
             penalty += 0.55
         return penalty
 

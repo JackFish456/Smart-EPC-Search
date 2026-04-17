@@ -112,6 +112,24 @@ def create_app() -> Flask:
                 "Use only the excerpts. If the excerpts do not fully support the expanded answer, "
                 "respond exactly with: I can't verify that from the contract."
             )
+        elif response_style == "candidate_select":
+            system_prompt = (
+                "You are selecting the best-supported contract candidate from a small provided set. "
+                "Use only the candidate evidence in the prompt. "
+                "Return JSON only with keys candidate_id, supporting_quote, insufficient_support. "
+                "Do not add explanation, markdown, or extra keys."
+            )
+            prompt = (
+                "Candidate evidence:\n"
+                f"{context}\n\n"
+                "User question:\n"
+                f"{question}\n\n"
+                "Choose the single best candidate that directly answers the question. "
+                "If none of the candidates directly support the answer, return "
+                '{"candidate_id":"", "supporting_quote":"", "insufficient_support":true}. '
+                "Otherwise return "
+                '{"candidate_id":"exact id from the prompt", "supporting_quote":"short direct quote from the winning evidence", "insufficient_support":false}.'
+            )
         else:
             prompt = (
                 "Contract excerpts:\n"

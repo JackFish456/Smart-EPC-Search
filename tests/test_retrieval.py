@@ -480,6 +480,33 @@ def test_grouped_question_prefers_appendix_guarantees_over_generic_emissions_cla
     assert ranked[0].chunk_id == "appendix_e"
 
 
+def test_grouped_question_prefers_performance_guarantee_wording_for_emissions() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "generic_environmental",
+                "13.2.7",
+                "Environmental",
+                "For emissions guarantees, refer to the Performance Guarantees tab of this proposal.",
+                1965,
+            ),
+            _chunk(
+                "performance_guarantees",
+                "H",
+                "EXHIBIT H - PERFORMANCE GUARANTEES",
+                "Seller guarantees as a Minimum Performance Guarantee that NOx emissions shall not exceed 2.0 ppmvd and CO emissions shall not exceed 4.0 ppmvd.",
+                3031,
+                chunk_type="exhibit",
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what are my emission guarantees")
+
+    assert ranked
+    assert ranked[0].chunk_id == "performance_guarantees"
+
+
 def test_grouped_question_returns_related_appendix_results_as_bundle_candidates() -> None:
     appendix = _chunk(
         "appendix_e",
@@ -503,6 +530,145 @@ def test_grouped_question_returns_related_appendix_results_as_bundle_candidates(
 
     assert ranked
     assert {ranked[0].chunk_id, ranked[1].chunk_id} == {"appendix_e", "appendix_e_limits"}
+
+
+def test_appendix_anchor_bundle_reaches_nearby_guarantee_sections_without_parent_links() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "appendix_e",
+                "E",
+                "APPENDIX E - Facility Guarantees",
+                "Facility Guarantees.",
+                100,
+                chunk_type="exhibit",
+            ),
+            _chunk(
+                "appendix_e_emissions",
+                "1.9",
+                "Auxiliary Boiler Emissions Guarantees",
+                "NOx shall not exceed 0.036 lb/mmbtu HHV and CO shall not exceed 50 ppmvd corrected to 3% O2.",
+                102,
+            ),
+            _chunk(
+                "generic_environmental",
+                "13.2.7",
+                "Environmental",
+                "For emissions guarantees, refer to the performance guarantees tab of this proposal.",
+                300,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what are my emission guarantees in appendix e")
+
+    assert ranked
+    assert ranked[0].chunk_id == "appendix_e_emissions"
+
+
+def test_specific_appendix_scope_does_not_collapse_to_any_appendix() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "appendix_aa_noise",
+                "AA",
+                "APPENDIX AA - Air Permit",
+                "Opacity of emissions from the combustion sources shall not exceed 5 percent.",
+                300,
+                chunk_type="exhibit",
+            ),
+            _chunk(
+                "appendix_e",
+                "E",
+                "APPENDIX E - Facility Guarantees",
+                "Facility Guarantees.",
+                100,
+                chunk_type="exhibit",
+            ),
+            _chunk(
+                "appendix_e_emissions",
+                "1.9",
+                "Auxiliary Boiler Emissions Guarantees",
+                "NOx shall not exceed 0.036 lb/mmbtu HHV and CO shall not exceed 50 ppmvd corrected to 3% O2.",
+                102,
+            ),
+        ]
+    )
+
+    ranked = retriever.retrieve("what are my emission guarantees in appendix e")
+
+    assert ranked
+    assert ranked[0].chunk_id == "appendix_e_emissions"
+
+
+def test_retrieve_trace_prefers_semantic_system_clause_over_heading_only_noise() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "ccw_heading_only",
+                "3",
+                "Closed Cooling Water Pump",
+                "3",
+                1485,
+            ),
+            _chunk(
+                "ccw_system",
+                "5.18",
+                "Closed Cooling Water",
+                "The Closed Cooling Water System major components include two 100% capacity, horizontal, closed cooling water pumps.",
+                261,
+            ),
+        ]
+    )
+
+    trace = retriever.retrieve_trace("what is the closed cooling water pump configuration")
+
+    assert trace.selected_bundle is not None
+    assert trace.selected_bundle.ranked_chunks[0].chunk_id == "ccw_system"
+    assert any(chunk.chunk_id == "ccw_heading_only" for chunk in trace.recall_sources["raw_fts"])
+    assert any(chunk.chunk_id == "ccw_system" for chunk in trace.recall_sources["semantic"])
+
+
+def test_retrieve_trace_can_use_gemma_to_break_close_bundle_ties() -> None:
+    retriever = _seed_retriever(
+        [
+            _chunk(
+                "candidate_a",
+                "9.1",
+                "Selected Turbine",
+                "The selected turbine model shall be Siemens SGT6-5000F for the project.",
+                18,
+            ),
+            _chunk(
+                "candidate_b",
+                "9.2",
+                "Selected Turbine Generator",
+                "The selected turbine model shall be Mitsubishi M701F for the project.",
+                19,
+            ),
+        ]
+    )
+
+    class FakeGemma:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str]] = []
+
+        def ask(self, question: str, context: str, **kwargs):
+            self.calls.append({"question": question, "context": context, **kwargs})
+            return '{"candidate_id":"candidate_b","supporting_quote":"Mitsubishi M701F","insufficient_support":false}'
+
+    fake_gemma = FakeGemma()
+    retriever._should_use_gemma_disambiguation = lambda bundles: True  # type: ignore[method-assign]
+
+    trace = retriever.retrieve_trace("What is the turbine we are using?", gemma_client=fake_gemma)
+
+    assert trace.used_gemma_disambiguation is True
+    assert trace.selected_bundle is not None
+    assert trace.selected_bundle.bundle_id == "candidate_b"
+    assert trace.selected_bundle.supporting_quote == "Mitsubishi M701F"
+    assert fake_gemma.calls[0]["response_style"] == "candidate_select"
+    assert "Candidate ID: candidate_a" in fake_gemma.calls[0]["context"]
+    assert "Candidate ID: candidate_b" in fake_gemma.calls[0]["context"]
 
 
 def test_deep_profile_prefers_specific_clause_over_generic_match() -> None:

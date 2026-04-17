@@ -103,6 +103,48 @@ def test_bad_question_benchmark_cases() -> None:
             expected_snippets=("1250 psig discharge pressure", "105 degF inlet temperature"),
         ),
         BenchmarkCase(
+            name="closed_cooling_water_pump_configuration_with_heading_only_noise",
+            question="what is the closed cooling water pump configuration",
+            chunks=(
+                _chunk(
+                    "ccw_heading_only",
+                    "3",
+                    "Closed Cooling Water Pump",
+                    "3",
+                    1485,
+                ),
+                _chunk(
+                    "ccw_system",
+                    "5.18",
+                    "Closed Cooling Water",
+                    "5.18 Closed Cooling Water Function The function of the Closed Cooling Water System is to transfer heat from the various plant equipment and fin fans to the atmosphere via the air cooler. Major Components Two 100% capacity, horizontal, closed cooling water pumps with piping valves and expansion joints. Two full capacity closed cooling water horizontal pumps with motors. One closed cooling water system head tank.",
+                    261,
+                ),
+            ),
+            expected_snippets=("Two 100% capacity", "Section 5.18"),
+        ),
+        BenchmarkCase(
+            name="generic_design_temperatures_prefers_general_guidance_over_random_values",
+            question="what are the design temperatures",
+            chunks=(
+                _chunk(
+                    "design_temp_general",
+                    "4.2.2.2",
+                    "Design Temperature and Pressure",
+                    "The design pressure and temperature for piping will be based on the operating pressures and temperatures established above with design margins as defined below. Note different segments of a system can have different design pressures and temperatures, therefore engineering analysis of different segments is required so the segments are not over designed, under designed, or over pressurized. The systems will be designed and specified based on the design pressures and temperatures determined.",
+                    181,
+                ),
+                _chunk(
+                    "design_temp_table",
+                    "4.2.2.2A",
+                    "Design Data",
+                    "HP Steam 1450 psig 1050 degF. LP Steam 220 psig 450 degF.",
+                    182,
+                ),
+            ),
+            expected_snippets=("design pressure and temperature for piping will be based on the operating pressures and temperatures", "Section 4.2.2.2"),
+        ),
+        BenchmarkCase(
             name="fire_water_pump_horsepower",
             question="what is the fire water pump horse power",
             chunks=(
