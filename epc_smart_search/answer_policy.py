@@ -26,6 +26,29 @@ DEEP_ENABLE_THINKING = True
 DEEP_CONTEXT_MAX_SECTIONS = 5
 DEEP_CONTEXT_EXACT_HITS = 2
 DEEP_PAGE_CONTEXT_SECTIONS = 1
+GENERIC_SYSTEM_TERMS = {
+    "system",
+    "systems",
+    "pump",
+    "pumps",
+    "valve",
+    "valves",
+    "motor",
+    "motors",
+    "turbine",
+    "turbines",
+    "compressor",
+    "compressors",
+    "fan",
+    "fans",
+    "module",
+    "modules",
+    "unit",
+    "units",
+    "equipment",
+    "package",
+    "packages",
+}
 
 
 class AnswerPolicy:
@@ -65,10 +88,16 @@ class AnswerPolicy:
             return AssistantAnswer("I can't verify that from the contract.", [], True)
 
         best = ranked[0] if ranked else None
+        strict_gate_active = (
+            not summary_request
+            and not deep_think
+            and not expand_answer
+            and self.reference_lookup_kind(effective_question) is None
+        )
         evidence_is_weak = (
             best is None
             or (best.total_score < 0.16 and best.lexical_score < 0.05)
-            or (self.requires_strict_grounding(plan) and not self.is_strong_question_match(plan, best))
+            or (strict_gate_active and self.requires_strict_grounding(plan) and not self.is_strong_question_match(plan, best))
         )
         if evidence_is_weak and not deep_think:
             return AssistantAnswer("I can't verify that from the contract.", citations, True)
@@ -795,17 +824,28 @@ class AnswerPolicy:
         return bool(
             plan.system_phrase
             or plan.attribute_label
+            or plan.count_question
+            or plan.direct_text_question
+            or cls.is_value_or_requirement_question(plan)
             or plan.intent in {"definition", "responsibility"}
         )
 
     @classmethod
     def is_strong_question_match(cls, plan: QueryPlan, chunk: RankedChunk) -> bool:
-        if chunk.total_score < 0.42 and cls.requires_strict_grounding(plan):
+        minimum_score = 0.42
+        if plan.attribute_label or plan.count_question or cls.is_value_or_requirement_question(plan):
+            minimum_score = 0.56
+        elif plan.direct_text_question or plan.system_phrase:
+            minimum_score = 0.48
+        if chunk.total_score < minimum_score and cls.requires_strict_grounding(plan):
             return False
         combined = " ".join([chunk.heading, chunk.full_text])
+        focus_hits = sum(1 for term in plan.focus_terms if has_term_overlap(combined, (term,)))
+        if plan.direct_text_question and len(plan.focus_terms) >= 2 and focus_hits < min(2, len(plan.focus_terms)):
+            return False
         if plan.system_phrase and not cls.matches_system(plan, combined):
             return False
-        if plan.attribute_label and not cls.matches_attribute(plan, combined):
+        if (plan.attribute_label or plan.count_question) and not cls.matches_attribute(plan, combined):
             return False
         if plan.intent == "definition" and not re.search(r"\bmeans\b|\bdefined as\b|\bdefinition\b", combined, re.IGNORECASE):
             return False
@@ -823,7 +863,11 @@ class AnswerPolicy:
             return True
         if plan.system_phrase and has_term_overlap(text, (plan.system_phrase,)):
             return True
-        if any(has_term_overlap(text, (alias,)) for alias in plan.system_aliases):
+        significant_terms = tuple(term for term in plan.system_terms if term not in GENERIC_SYSTEM_TERMS)
+        if significant_terms:
+            significant_hits = sum(1 for term in significant_terms if has_term_overlap(text, (term,)))
+            return significant_hits >= len(significant_terms)
+        elif any(has_term_overlap(text, (alias,)) for alias in plan.system_aliases):
             return True
         if plan.system_terms:
             hits = sum(1 for term in plan.system_terms if has_term_overlap(text, (term,)))
@@ -833,8 +877,10 @@ class AnswerPolicy:
     @staticmethod
     def matches_attribute(plan: QueryPlan, text: str) -> bool:
         if not plan.attribute_label and not plan.attribute_terms:
-            return True
+            return not plan.count_question
         lowered = text.lower()
+        if plan.count_question:
+            return bool(re.search(r"\b\d", lowered) or re.search(r"\b(one|two|three|four|five|six|seven|eight|nine|ten)\b", lowered))
         if any(has_term_overlap(text, (term,)) for term in plan.attribute_terms):
             return True
         label = plan.attribute_label or ""
@@ -846,6 +892,8 @@ class AnswerPolicy:
             return bool(re.search(r"\bmodel\b|\btype\b|\bselected\b|\bmanufacturer\b|\bvendor\b", lowered) or re.search(r"\b[A-Z]{2,}[A-Z0-9\-]*\d[A-Z0-9\-]*\b", text))
         if label == "size":
             return bool(re.search(r"\bsize\b|\bdiameter\b|\brating\b|\bdimension\b", lowered))
+        if label == "power":
+            return bool(re.search(r"\bhorse\s*power\b|\bhp\b|\bkw\b|\bkilowatt", lowered))
         if label == "capacity":
             return bool(re.search(r"\bcapacity\b|\boutput\b|\bduty\b|\bthroughput\b", lowered))
         if label == "pressure":

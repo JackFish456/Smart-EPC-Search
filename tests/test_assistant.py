@@ -298,6 +298,87 @@ def test_build_extractive_answer_rejects_system_overview_for_how_many_question_w
     assert answer is None
 
 
+def test_ask_refuses_wrong_but_related_power_clause() -> None:
+    wrong = RankedChunk(
+        chunk_id="random_schedule",
+        section_number="6.9",
+        heading="KV - 480 V",
+        full_text="Closed cooling water pump motor 1200 HP. Boiler feedwater pump motor 4750 HP.",
+        page_start=359,
+        page_end=359,
+        ordinal_in_document=1,
+        total_score=0.62,
+        lexical_score=0.3,
+        semantic_score=0.0,
+    )
+    citations = [Citation("random_schedule", "6.9", "KV - 480 V", None, 359, 359, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            return [wrong]
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called when the top clause fails grounding.")
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+    assistant.answer_policy = AnswerPolicy(None, assistant.retriever)
+
+    answer = assistant.ask("what is the fire water pump horse power")
+
+    assert answer.refused is True
+    assert answer.text == "I can't verify that from the contract."
+
+
+def test_ask_returns_compact_answer_for_strong_power_match() -> None:
+    correct = RankedChunk(
+        chunk_id="fire_water_pump",
+        section_number="8.4.2",
+        heading="Fire Water Pump",
+        full_text="Each fire water pump shall be rated at 350 HP for the project fire water service.",
+        page_start=412,
+        page_end=412,
+        ordinal_in_document=1,
+        total_score=1.2,
+        lexical_score=0.7,
+        semantic_score=0.0,
+    )
+    citations = [Citation("fire_water_pump", "8.4.2", "Fire Water Pump", None, 412, 412, "quote")]
+
+    class FakeRetriever:
+        def find_exact_page_hits(self, question: str):
+            return []
+
+        def retrieve(self, question: str, profile: str = "normal"):
+            return [correct]
+
+        def expand_with_context(self, incoming_ranked):
+            return citations
+
+    class FakeGemma:
+        def ask(self, *args, **kwargs):
+            raise AssertionError("Gemma should not be called for a strong compact answer.")
+
+    assistant = ContractAssistant.__new__(ContractAssistant)
+    assistant.retriever = FakeRetriever()
+    assistant.gemma = FakeGemma()
+    assistant.answer_policy = AnswerPolicy(None, assistant.retriever)
+
+    answer = assistant.ask("what is the fire water pump horse power")
+
+    assert answer.refused is False
+    assert "350 HP" in answer.text
+    assert answer.text.count("Section ") == 1
+
+
 def test_prefers_generated_answer_only_for_summary_style_prompts() -> None:
     assert not ContractAssistant._prefers_generated_answer("What does the contract say about fuel gas supply?")
     assert ContractAssistant._prefers_generated_answer("Summarize the fuel gas supply requirements in plain English.")
